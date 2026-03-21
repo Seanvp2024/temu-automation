@@ -1,0 +1,18 @@
+node_modules/
+dist/
+target/
+automation/dist/
+automation/node_modules/
+automation/data/user-data/
+*.db
+*.log
+.env
+
+# 测试/调试文件
+scrape_result.json
+test_*.json
+electron_*.log
+
+# Cookies 和用户数据
+cookies/
+debug/
