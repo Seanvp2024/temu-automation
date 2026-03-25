@@ -1,29 +1,35 @@
 import { Routes, Route, Navigate } from "react-router-dom";
 import AppLayout from "./components/Layout/AppLayout";
 import Dashboard from "./pages/Dashboard";
+import ShopOverview from "./pages/ShopOverview";
 import AccountManager from "./pages/AccountManager";
 import ProductList from "./pages/ProductList";
-import OrderList from "./pages/OrderList";
-import SalesManagement from "./pages/SalesManagement";
-import Analytics from "./pages/Analytics";
+import ProductDetail from "./pages/ProductDetail";
 import TaskManager from "./pages/TaskManager";
 import Settings from "./pages/Settings";
+import { CollectionProvider } from "./contexts/CollectionContext";
 
 function App() {
   return (
-    <Routes>
-      <Route path="/" element={<AppLayout />}>
-        <Route index element={<Navigate to="/dashboard" replace />} />
-        <Route path="dashboard" element={<Dashboard />} />
-        <Route path="accounts" element={<AccountManager />} />
-        <Route path="products" element={<ProductList />} />
-        <Route path="sales" element={<SalesManagement />} />
-        <Route path="orders" element={<OrderList />} />
-        <Route path="analytics" element={<Analytics />} />
-        <Route path="tasks" element={<TaskManager />} />
-        <Route path="settings" element={<Settings />} />
-      </Route>
-    </Routes>
+    <CollectionProvider>
+      <Routes>
+        <Route path="/" element={<AppLayout />}>
+          <Route index element={<Navigate to="/shop" replace />} />
+          <Route path="shop" element={<ShopOverview />} />
+          <Route path="products" element={<ProductList />} />
+          <Route path="products/:id" element={<ProductDetail />} />
+          <Route path="collect" element={<Dashboard />} />
+          <Route path="accounts" element={<AccountManager />} />
+          <Route path="tasks" element={<TaskManager />} />
+          <Route path="settings" element={<Settings />} />
+          {/* Legacy routes */}
+          <Route path="dashboard" element={<Navigate to="/shop" replace />} />
+          <Route path="sales" element={<Navigate to="/products" replace />} />
+          <Route path="orders" element={<Navigate to="/products" replace />} />
+          <Route path="analytics" element={<Navigate to="/shop" replace />} />
+        </Route>
+      </Routes>
+    </CollectionProvider>
   );
 }
 

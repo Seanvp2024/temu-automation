@@ -4,6 +4,15 @@ const { spawn } = require("child_process");
 const http = require("http");
 const fs = require("fs");
 
+// 全局捕获未处理异常，防止 EPIPE 等 pipe 错误崩溃 Electron
+process.on("uncaughtException", (err) => {
+  if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") return; // 忽略 pipe 错误
+  console.error("[Main] Uncaught exception:", err.message);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[Main] Unhandled rejection:", reason);
+});
+
 let mainWindow = null;
 let worker = null;
 let workerPort = 19280;
@@ -36,7 +45,7 @@ function httpPost(port, body) {
         port,
         method: "POST",
         headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) },
-        timeout: 600000,  // 10分钟超时（抓取大量商品需要较长时间）
+        timeout: 1800000,  // 30分钟超时（大量采集任务需要较长时间）
       },
       (res) => {
         let buf = "";
@@ -132,9 +141,15 @@ async function startWorker() {
     },
   });
 
-  // 只读 stderr 用于调试日志
+  // 只读 stderr 用于调试日志（安全处理 EPIPE）
   if (worker.stderr) {
-    worker.stderr.on("data", (d) => console.error("[Worker]", d.toString()));
+    worker.stderr.on("data", (d) => {
+      try { console.error("[Worker]", d.toString()); } catch {}
+    });
+    worker.stderr.on("error", () => {}); // 忽略 pipe 错误
+  }
+  if (worker.stdout) {
+    worker.stdout.on("error", () => {}); // 忽略 pipe 错误
   }
 
   worker.on("exit", (code) => {
@@ -144,7 +159,7 @@ async function startWorker() {
   });
 
   worker.on("error", (err) => {
-    console.error("[Main] Worker spawn error:", err.message);
+    try { console.error("[Main] Worker spawn error:", err.message); } catch {}
     worker = null;
     workerReady = false;
   });
@@ -191,30 +206,43 @@ async function createWindow() {
     },
   });
 
-  // 优先使用 Vite 开发服务器，不可用则加载 dist
+  // 开发模式：等待 Vite dev server 就绪（最多30秒）
   const devUrl = "http://localhost:1420";
-  const distPath = path.join(__dirname, "../dist/index.html");
-  let useDevServer = false;
-  try {
-    await new Promise((resolve, reject) => {
-      const req = http.get(devUrl, (res) => { res.resume(); resolve(true); });
-      req.on("error", reject);
-      req.setTimeout(2000, () => { req.destroy(); reject(new Error("timeout")); });
-    });
-    useDevServer = true;
-  } catch {}
+  const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
 
-  if (useDevServer) {
+  if (isDev) {
+    console.log("[Main] Dev mode: waiting for Vite server...");
+    const maxWait = 30000;
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+      try {
+        await new Promise((resolve, reject) => {
+          const req = http.get(devUrl, (res) => { res.resume(); resolve(true); });
+          req.on("error", reject);
+          req.setTimeout(2000, () => { req.destroy(); reject(new Error("timeout")); });
+        });
+        break;
+      } catch {
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
     console.log("[Main] Loading from Vite dev server");
     mainWindow.loadURL(devUrl);
-  } else if (fs.existsSync(distPath)) {
-    console.log("[Main] Loading from dist");
-    mainWindow.loadFile(distPath);
   } else {
-    console.log("[Main] Fallback to dev URL");
-    mainWindow.loadURL(devUrl);
+    const distPath = path.join(__dirname, "../dist/index.html");
+    if (fs.existsSync(distPath)) {
+      console.log("[Main] Loading from dist");
+      mainWindow.loadFile(distPath);
+    } else {
+      console.log("[Main] Fallback to dev URL");
+      mainWindow.loadURL(devUrl);
+    }
   }
 
+  // DevTools: 按 F12 手动打开，不自动打开（避免遮挡页面）
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (input.key === "F12") mainWindow.webContents.toggleDevTools();
+  });
   mainWindow.on("closed", () => { mainWindow = null; });
 }
 
@@ -250,6 +278,50 @@ ipcMain.handle("automation:scrape-orders", async () => {
 ipcMain.handle("automation:scrape-sales", async () => {
   return sendCmd("scrape_sales");
 });
+
+ipcMain.handle("automation:scrape-flux", async () => {
+  return sendCmd("scrape_flux");
+});
+
+ipcMain.handle("automation:scrape-dashboard", async () => {
+  return sendCmd("scrape_dashboard");
+});
+
+ipcMain.handle("automation:scrape-aftersales", async () => {
+  return sendCmd("scrape_aftersales");
+});
+
+ipcMain.handle("automation:scrape-soldout", async () => {
+  return sendCmd("scrape_soldout");
+});
+
+ipcMain.handle("automation:scrape-goods-data", async () => {
+  return sendCmd("scrape_goods_data");
+});
+
+ipcMain.handle("automation:scrape-activity", async () => {
+  return sendCmd("scrape_activity");
+});
+
+ipcMain.handle("automation:scrape-performance", async () => {
+  return sendCmd("scrape_performance");
+});
+
+ipcMain.handle("automation:scrape-all", async () => {
+  return sendCmd("scrape_all");
+});
+
+ipcMain.handle("automation:read-scrape-data", async (_e, key) => {
+  return sendCmd("read_scrape_data", { key });
+});
+
+ipcMain.handle("automation:scrape-lifecycle", async () => { return sendCmd("scrape_lifecycle"); });
+ipcMain.handle("automation:scrape-bidding", async () => { return sendCmd("scrape_bidding"); });
+ipcMain.handle("automation:scrape-price-compete", async () => { return sendCmd("scrape_price_compete"); });
+ipcMain.handle("automation:scrape-hot-plan", async () => { return sendCmd("scrape_hot_plan"); });
+ipcMain.handle("automation:scrape-checkup", async () => { return sendCmd("scrape_checkup"); });
+ipcMain.handle("automation:scrape-us-retrieval", async () => { return sendCmd("scrape_us_retrieval"); });
+ipcMain.handle("automation:scrape-delivery", async () => { return sendCmd("scrape_delivery"); });
 
 ipcMain.handle("automation:close", async () => {
   return sendCmd("close");

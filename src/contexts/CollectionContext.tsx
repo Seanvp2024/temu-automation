@@ -1,0 +1,254 @@
+import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from "react";
+import { message } from "antd";
+import { parseDashboardData, parseProductsData, parseOrdersData, parseSalesData, parseFluxData } from "../utils/parseRawApis";
+
+const api = window.electronAPI?.automation;
+const store = window.electronAPI?.store;
+
+const PARSED_TASK_KEYS = new Set(["dashboard", "products", "orders", "sales", "flux"]);
+
+export interface CollectTask {
+  key: string;
+  label: string;
+  storeKey: string;
+  category: string;
+}
+
+// 全部62个采集任务（不含 icon，icon 在 UI 层处理）
+export const COLLECT_TASKS: CollectTask[] = [
+  { key: "dashboard", label: "仪表盘概览", storeKey: "temu_dashboard", category: "核心数据" },
+  { key: "products", label: "商品列表", storeKey: "temu_products", category: "核心数据" },
+  { key: "orders", label: "备货单", storeKey: "temu_orders", category: "核心数据" },
+  { key: "sales", label: "销售数据", storeKey: "temu_sales", category: "核心数据" },
+  { key: "flux", label: "流量分析", storeKey: "temu_flux", category: "核心数据" },
+  { key: "goodsData", label: "商品数据", storeKey: "temu_raw_goodsData", category: "商品数据" },
+  { key: "lifecycle", label: "上新生命周期", storeKey: "temu_raw_lifecycle", category: "商品数据" },
+  { key: "imageTask", label: "商品图片任务", storeKey: "temu_raw_imageTask", category: "商品数据" },
+  { key: "sampleManage", label: "样品管理", storeKey: "temu_raw_sampleManage", category: "商品数据" },
+  { key: "activity", label: "活动数据", storeKey: "temu_raw_activity", category: "销售管理" },
+  { key: "activityLog", label: "活动日志", storeKey: "temu_raw_activityLog", category: "销售管理" },
+  { key: "activityUS", label: "美国活动", storeKey: "temu_raw_activityUS", category: "销售管理" },
+  { key: "activityEU", label: "欧盟活动", storeKey: "temu_raw_activityEU", category: "销售管理" },
+  { key: "chanceGoods", label: "机会商品", storeKey: "temu_raw_chanceGoods", category: "销售管理" },
+  { key: "marketingActivity", label: "营销活动", storeKey: "temu_raw_marketingActivity", category: "销售管理" },
+  { key: "urgentOrders", label: "紧急备货", storeKey: "temu_raw_urgentOrders", category: "订单物流" },
+  { key: "shippingDesk", label: "发货台", storeKey: "temu_raw_shippingDesk", category: "订单物流" },
+  { key: "shippingList", label: "发货单列表", storeKey: "temu_raw_shippingList", category: "订单物流" },
+  { key: "addressManage", label: "发退货地址", storeKey: "temu_raw_addressManage", category: "订单物流" },
+  { key: "returnOrders", label: "退货单", storeKey: "temu_raw_returnOrders", category: "退货管理" },
+  { key: "returnDetail", label: "退货详情", storeKey: "temu_raw_returnDetail", category: "退货管理" },
+  { key: "salesReturn", label: "销售退货", storeKey: "temu_raw_salesReturn", category: "退货管理" },
+  { key: "returnReceipt", label: "退货收据", storeKey: "temu_raw_returnReceipt", category: "退货管理" },
+  { key: "exceptionNotice", label: "收货异常", storeKey: "temu_raw_exceptionNotice", category: "退货管理" },
+  { key: "afterSales", label: "售后数据", storeKey: "temu_raw_afterSales", category: "售后质量" },
+  { key: "checkup", label: "体检中心", storeKey: "temu_raw_checkup", category: "售后质量" },
+  { key: "qualityDashboard", label: "质量看板", storeKey: "temu_raw_qualityDashboard", category: "售后质量" },
+  { key: "qualityDashboardEU", label: "欧盟质量看板", storeKey: "temu_raw_qualityDashboardEU", category: "售后质量" },
+  { key: "qcDetail", label: "质检详情", storeKey: "temu_raw_qcDetail", category: "售后质量" },
+  { key: "priceReport", label: "商品价格申报", storeKey: "temu_raw_priceReport", category: "价格管理" },
+  { key: "priceCompete", label: "竞价邀请", storeKey: "temu_raw_priceCompete", category: "价格管理" },
+  { key: "flowPrice", label: "商品流量视角", storeKey: "temu_raw_flowPrice", category: "价格管理" },
+  { key: "retailPrice", label: "建议零售价", storeKey: "temu_raw_retailPrice", category: "价格管理" },
+  { key: "mallFlux", label: "店铺流量", storeKey: "temu_raw_mallFlux", category: "流量分析" },
+  { key: "mallFluxEU", label: "欧盟店铺流量", storeKey: "temu_raw_mallFluxEU", category: "流量分析" },
+  { key: "mallFluxUS", label: "美国店铺流量", storeKey: "temu_raw_mallFluxUS", category: "流量分析" },
+  { key: "fluxEU", label: "欧盟流量", storeKey: "temu_raw_fluxEU", category: "流量分析" },
+  { key: "fluxUS", label: "美国流量", storeKey: "temu_raw_fluxUS", category: "流量分析" },
+  { key: "flowGrow", label: "流量增长", storeKey: "temu_raw_flowGrow", category: "流量分析" },
+  { key: "governDashboard", label: "合规看板", storeKey: "temu_raw_governDashboard", category: "合规中心" },
+  { key: "governProductQualification", label: "商品资质", storeKey: "temu_raw_governProductQualification", category: "合规中心" },
+  { key: "governQualificationAppeal", label: "资质上传申诉", storeKey: "temu_raw_governQualificationAppeal", category: "合规中心" },
+  { key: "governEprQualification", label: "EPR资质", storeKey: "temu_raw_governEprQualification", category: "合规中心" },
+  { key: "governProductPhoto", label: "商品实拍图", storeKey: "temu_raw_governProductPhoto", category: "合规中心" },
+  { key: "governComplianceInfo", label: "商品合规信息", storeKey: "temu_raw_governComplianceInfo", category: "合规中心" },
+  { key: "governResponsiblePerson", label: "生产者延伸责任", storeKey: "temu_raw_governResponsiblePerson", category: "合规中心" },
+  { key: "governManufacturer", label: "制造商信息", storeKey: "temu_raw_governManufacturer", category: "合规中心" },
+  { key: "governComplaint", label: "投诉处理", storeKey: "temu_raw_governComplaint", category: "合规中心" },
+  { key: "governViolationAppeal", label: "违规申诉", storeKey: "temu_raw_governViolationAppeal", category: "合规中心" },
+  { key: "governMerchantAppeal", label: "商家申诉", storeKey: "temu_raw_governMerchantAppeal", category: "合规中心" },
+  { key: "governTro", label: "临时限制令", storeKey: "temu_raw_governTro", category: "合规中心" },
+  { key: "governEprBilling", label: "EPR计费", storeKey: "temu_raw_governEprBilling", category: "合规中心" },
+  { key: "governComplianceReference", label: "合规性参考", storeKey: "temu_raw_governComplianceReference", category: "合规中心" },
+  { key: "governCustomsAttribute", label: "清关属性维护", storeKey: "temu_raw_governCustomsAttribute", category: "合规中心" },
+  { key: "governCategoryCorrection", label: "类目纠正", storeKey: "temu_raw_governCategoryCorrection", category: "合规中心" },
+  { key: "adsHome", label: "推广首页", storeKey: "temu_raw_adsHome", category: "广告推广" },
+  { key: "adsProduct", label: "商品推广", storeKey: "temu_raw_adsProduct", category: "广告推广" },
+  { key: "adsReport", label: "数据报表", storeKey: "temu_raw_adsReport", category: "广告推广" },
+  { key: "adsFinance", label: "财务管理", storeKey: "temu_raw_adsFinance", category: "广告推广" },
+  { key: "adsHelp", label: "帮助中心", storeKey: "temu_raw_adsHelp", category: "广告推广" },
+  { key: "adsNotification", label: "消息通知", storeKey: "temu_raw_adsNotification", category: "广告推广" },
+  { key: "usRetrieval", label: "美国召回", storeKey: "temu_raw_usRetrieval", category: "其他" },
+];
+
+export const TASK_CATEGORIES = Array.from(new Set(COLLECT_TASKS.map(t => t.category)));
+
+export type TaskStatus = "pending" | "running" | "success" | "error";
+
+export interface TaskState {
+  status: TaskStatus;
+  message?: string;
+  count?: number;
+  duration?: number;
+}
+
+interface CollectionContextType {
+  collecting: boolean;
+  taskStates: Record<string, TaskState>;
+  progress: number;
+  elapsed: number;
+  successCount: number;
+  errorCount: number;
+  startCollectAll: () => void;
+  startSyncDashboard: () => void;
+  syncingDashboard: boolean;
+}
+
+const CollectionContext = createContext<CollectionContextType>({
+  collecting: false,
+  taskStates: {},
+  progress: 0,
+  elapsed: 0,
+  successCount: 0,
+  errorCount: 0,
+  startCollectAll: () => {},
+  startSyncDashboard: () => {},
+  syncingDashboard: false,
+});
+
+export function useCollection() {
+  return useContext(CollectionContext);
+}
+
+export function CollectionProvider({ children }: { children: React.ReactNode }) {
+  const [collecting, setCollecting] = useState(false);
+  const [taskStates, setTaskStates] = useState<Record<string, TaskState>>({});
+  const [progress, setProgress] = useState(0);
+  const [startTime, setStartTime] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+  const [syncingDashboard, setSyncingDashboard] = useState(false);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // 计时器
+  useEffect(() => {
+    if (!collecting) {
+      if (timerRef.current) clearInterval(timerRef.current);
+      return;
+    }
+    timerRef.current = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [collecting, startTime]);
+
+  const successCount = Object.values(taskStates).filter(t => t.status === "success").length;
+  const errorCount = Object.values(taskStates).filter(t => t.status === "error").length;
+
+  const startCollectAll = useCallback(async () => {
+    if (!api || collecting) return;
+
+    setCollecting(true);
+    setStartTime(Date.now());
+    setElapsed(0);
+    setProgress(0);
+
+    const initStates: Record<string, TaskState> = {};
+    COLLECT_TASKS.forEach(t => { initStates[t.key] = { status: "running" }; });
+    setTaskStates(initStates);
+    setProgress(5);
+
+    const syncedAt = new Date().toLocaleString("zh-CN");
+
+    try {
+      const allResults: any = await api.scrapeAll();
+
+      let completed = 0;
+      for (const task of COLLECT_TASKS) {
+        const r = allResults[task.key];
+        if (r && r.success) {
+          try {
+            const data = await api.readScrapeData(task.key);
+            const count = data?.apis?.length || 0;
+
+            let storeData: any = data;
+            if (PARSED_TASK_KEYS.has(task.key)) {
+              if (task.key === "dashboard") storeData = parseDashboardData(data);
+              else if (task.key === "products") storeData = parseProductsData(data);
+              else if (task.key === "orders") storeData = parseOrdersData(data);
+              else if (task.key === "sales") storeData = parseSalesData(data);
+              else if (task.key === "flux") storeData = parseFluxData(data);
+
+              if (Array.isArray(storeData)) {
+                await store?.set(task.storeKey, storeData);
+              } else if (typeof storeData === "object" && storeData !== null) {
+                await store?.set(task.storeKey, { ...storeData, syncedAt });
+              } else {
+                await store?.set(task.storeKey, storeData);
+              }
+            } else {
+              await store?.set(task.storeKey, { ...data, syncedAt });
+            }
+
+            const displayCount = !PARSED_TASK_KEYS.has(task.key) ? count
+              : task.key === "products" ? (Array.isArray(storeData) ? storeData.length : count)
+              : task.key === "orders" ? (Array.isArray(storeData) ? storeData.length : count)
+              : task.key === "sales" ? (storeData?.items?.length || count)
+              : count;
+
+            setTaskStates(prev => ({ ...prev, [task.key]: {
+              status: "success", count: displayCount, duration: r.duration, message: `${displayCount} 条数据`
+            }}));
+          } catch {
+            setTaskStates(prev => ({ ...prev, [task.key]: {
+              status: "success", count: r.dataSize || 0, duration: r.duration, message: `已保存 (${Math.round((r.dataSize || 0) / 1024)}KB)`
+            }}));
+          }
+        } else if (r) {
+          setTaskStates(prev => ({ ...prev, [task.key]: {
+            status: "error", duration: r.duration, message: r.error?.substring(0, 50) || "未知错误"
+          }}));
+        }
+        completed++;
+        setProgress(Math.round((completed / COLLECT_TASKS.length) * 100));
+      }
+
+      message.success("一键采集完成!");
+    } catch (e: any) {
+      message.error("采集失败: " + e.message);
+      COLLECT_TASKS.forEach(t => {
+        setTaskStates(prev => ({ ...prev, [t.key]: { status: "error", message: e.message?.substring(0, 50) }}));
+      });
+      setProgress(100);
+    }
+
+    setCollecting(false);
+  }, [collecting]);
+
+  const startSyncDashboard = useCallback(async () => {
+    if (!api || syncingDashboard) return;
+    setSyncingDashboard(true);
+    try {
+      const res = await api.scrapeDashboard();
+      const raw = (res as any)?.dashboard || res;
+      const data = parseDashboardData(raw);
+      const syncedAt = new Date().toLocaleString("zh-CN");
+      await store?.set("temu_dashboard", { ...data, syncedAt });
+      message.success("仪表盘数据同步成功!");
+    } catch (e: any) {
+      message.error("同步失败: " + e.message);
+    } finally {
+      setSyncingDashboard(false);
+    }
+  }, [syncingDashboard]);
+
+  return (
+    <CollectionContext.Provider value={{
+      collecting, taskStates, progress, elapsed,
+      successCount, errorCount,
+      startCollectAll, startSyncDashboard, syncingDashboard,
+    }}>
+      {children}
+    </CollectionContext.Provider>
+  );
+}

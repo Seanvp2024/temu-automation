@@ -4,24 +4,103 @@
   box-sizing: border-box;
 }
 
+html, body, #root {
+  height: 100%;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial,
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  background: #f0f2f5;
+  color: #1a1a2e;
 }
 
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.2); }
+
+/* ============ Stat Cards ============ */
+.stat-card {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+  overflow: hidden;
+  position: relative;
+}
+.stat-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.1);
+}
+.stat-card .ant-statistic-title {
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  color: #666 !important;
+  margin-bottom: 8px !important;
+}
+.stat-card .ant-statistic-content-value {
+  font-size: 32px !important;
+  font-weight: 700 !important;
 }
 
-::-webkit-scrollbar-thumb {
-  background: #d9d9d9;
-  border-radius: 3px;
+/* Warning cards */
+.warn-card {
+  border: 1px solid #ffd6d6 !important;
+}
+.warn-card:hover {
+  border-color: #ff4d4f !important;
+  box-shadow: 0 8px 24px rgba(255, 77, 79, 0.12) !important;
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: #bfbfbf;
+/* ============ Section Titles ============ */
+.section-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #1a1a2e;
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
+.section-title::before {
+  content: "";
+  width: 4px;
+  height: 18px;
+  background: linear-gradient(180deg, #e55b00, #ff8534);
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+/* ============ Tables ============ */
+.ant-table-tbody > tr:hover > td {
+  background: #fff7f0 !important;
+}
+.ant-table-thead > tr > th {
+  font-weight: 600 !important;
+  color: #333 !important;
+}
+
+/* ============ Progress ============ */
+.ant-progress-bg {
+  transition: width 0.4s ease !important;
+}
+
+/* ============ Tags ============ */
+.ant-tag {
+  font-weight: 500;
+}
+
+/* ============ Menu ============ */
+.ant-menu-item-selected {
+  font-weight: 600 !important;
+}
+
+/* ============ Stat Colors Helpers ============ */
+.stat-orange { background: linear-gradient(135deg, #fff2e8, #ffe7d6) !important; }
+.stat-blue { background: linear-gradient(135deg, #e8f4ff, #d6eaff) !important; }
+.stat-green { background: linear-gradient(135deg, #e8fff0, #d6ffe5) !important; }
+.stat-purple { background: linear-gradient(135deg, #f3e8ff, #e8d6ff) !important; }
+.stat-red { background: linear-gradient(135deg, #fff0f0, #ffe0e0) !important; }
+.stat-gold { background: linear-gradient(135deg, #fffbe8, #fff1c2) !important; }

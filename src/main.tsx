@@ -12,8 +12,49 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       locale={zhCN}
       theme={{
         token: {
-          colorPrimary: "#f56a00",
-          borderRadius: 6,
+          colorPrimary: "#e55b00",
+          colorSuccess: "#00b96b",
+          colorWarning: "#faad14",
+          colorError: "#ff4d4f",
+          colorInfo: "#1677ff",
+          borderRadius: 8,
+          fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif',
+          fontSize: 14,
+          colorBgContainer: "#ffffff",
+          colorBgLayout: "#f0f2f5",
+          controlHeight: 36,
+        },
+        components: {
+          Card: {
+            paddingLG: 20,
+            borderRadiusLG: 12,
+          },
+          Table: {
+            borderRadiusLG: 10,
+            headerBg: "#fafafa",
+            headerColor: "#595959",
+            fontSize: 13,
+          },
+          Tag: {
+            borderRadiusSM: 4,
+          },
+          Button: {
+            borderRadius: 8,
+            controlHeight: 36,
+            controlHeightLG: 44,
+          },
+          Menu: {
+            itemBorderRadius: 8,
+            itemMarginInline: 8,
+            itemHeight: 44,
+          },
+          Statistic: {
+            titleFontSize: 13,
+            contentFontSize: 28,
+          },
+          Tabs: {
+            cardGutter: 4,
+          },
         },
       }}
     >
