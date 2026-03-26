@@ -3,8 +3,26 @@
  */
 import { chromium } from "playwright";
 import http from "http";
+import https from "https";
 import fs from "fs";
 import path from "path";
+
+// Load API keys from temu-claw .env
+const envFiles = [
+  path.join(process.env.APPDATA || "", "..", "temu-claw", ".env"),
+  "C:/Users/Administrator/temu-claw/.env",
+];
+for (const envFile of envFiles) {
+  try {
+    if (fs.existsSync(envFile)) {
+      for (const line of fs.readFileSync(envFile, "utf8").split("\n")) {
+        const m = line.match(/^([^#=]+)=(.+)$/);
+        if (m && !process.env[m[1].trim()]) process.env[m[1].trim()] = m[2].trim();
+      }
+      break;
+    }
+  } catch {}
+}
 
 let browser = null;
 let context = null;
@@ -1980,7 +1998,7 @@ async function batchCreateFromCSV(params) {
         title: productName,
         sourceImage: localImagePath,
         generateAI: params.generateAI !== false,
-        aiImageTypes: params.aiImageTypes || ["hero", "lifestyle", "closeup"],
+        aiImageTypes: params.aiImageTypes || ["hero", "lifestyle", "closeup", "infographic", "size_chart"],
         price: parseFloat(priceCNY),
         autoSubmit: params.autoSubmit || false,
         keepOpen: false, // 批量模式不保持打开
@@ -2114,11 +2132,10 @@ async function generateAIImages(sourceImagePath, productTitle, imageTypes = ["he
     }
 
     console.error(`[ai-image] Done! Generated ${generatedPaths.length} images`);
-    return generatedPaths;
+    return { images: generatedPaths, cnTitle: null };
   } catch (e) {
     console.error(`[ai-image] Error: ${e.message}`);
-    // 备用方案：直接用 http 模块
-    return [];
+    return { images: [], cnTitle: null };
   }
 }
 
@@ -2339,9 +2356,7 @@ async function autoCreateProduct(params) {
     await takeDebugScreenshot("04_basic_info_page");
     console.error("[create-product] Step 2 done: Category selected");
 
-    // ========== Step 3: 填写商品标题 ==========
-    console.error("[create-product] Step 3: Fill title");
-    // 等待页面完全加载（loading消失）
+    // ========== Step 3: 等待页面加载 ==========
     try {
       await page.waitForFunction(() => {
         const spinners = document.querySelectorAll('.ant-spin-spinning, [class*="loading"], [class*="Loading"]');
@@ -2352,63 +2367,49 @@ async function autoCreateProduct(params) {
     }
     await randomDelay(2000, 3000);
 
-    // 寻找标题输入框
-    const titleSelectors = [
-      'textarea[placeholder*="标题"]',
-      'textarea[placeholder*="商品名"]',
-      'input[placeholder*="标题"]',
-      'input[placeholder*="商品名"]',
-      'textarea[placeholder*="Title"]',
-      'textarea[placeholder*="title"]',
-    ];
-
-    let titleFilled = false;
-    for (const sel of titleSelectors) {
-      try {
-        const titleInput = page.locator(sel).first();
-        if (await titleInput.isVisible({ timeout: 1000 })) {
-          await titleInput.click();
-          await titleInput.fill("");
-          // 模拟真人输入
-          await titleInput.type(params.title, { delay: 20 + Math.random() * 30 });
-          titleFilled = true;
-          console.error("[create-product] Title filled");
-          break;
-        }
-      } catch {}
-    }
-
-    if (!titleFilled) {
-      // 备用方案：用 evaluate 直接填写
-      await page.evaluate((title) => {
-        const textareas = document.querySelectorAll("textarea");
-        for (const ta of textareas) {
-          if (ta.offsetParent !== null && ta.getBoundingClientRect().top < 800) {
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
-            nativeInputValueSetter?.call(ta, title);
-            ta.dispatchEvent(new Event("input", { bubbles: true }));
-            ta.dispatchEvent(new Event("change", { bubbles: true }));
-            break;
-          }
-        }
-      }, params.title);
-      console.error("[create-product] Title filled via evaluate");
-    }
-
-    await takeDebugScreenshot("05_title_filled");
-
-    // ========== Step 3.5: AI 图片生成（可选） ==========
+    // ========== Step 3: AI 图片生成（可选） ==========
     if (params.generateAI && params.sourceImage) {
-      console.error("[create-product] Step 3.5: Generate AI images");
+      console.error("[create-product] Step 3: Generate AI images");
       try {
-        const aiImages = await generateAIImages(
+        const aiResult = await generateAIImages(
           params.sourceImage,
           params.title,
           params.aiImageTypes || ["hero", "lifestyle", "closeup"]
         );
+        const aiImages = aiResult.images || aiResult;
         if (aiImages.length > 0) {
           params.images = [...(params.images || []), ...aiImages];
           console.error(`[create-product] AI generated ${aiImages.length} images`);
+        }
+        // 用 Claude API 翻译标题为中文
+        if (params.title && /[a-zA-Z]/.test(params.title)) {
+          console.error("[create-product] Translating title to Chinese...");
+          try {
+            const apiKey = process.env.ANTHROPIC_API_KEY;
+            if (apiKey) {
+              const cnTitle = await new Promise((resolve, reject) => {
+                // https is imported at top
+                const postBody = Buffer.from(JSON.stringify({
+                  model: "claude-sonnet-4-20250514",
+                  max_tokens: 200,
+                  messages: [{ role: "user", content: "Translate this e-commerce product title to Chinese (Temu style, concise with selling points). Return ONLY the Chinese title:\n\n" + params.title }]
+                }), "utf8");
+                const req = https.request({
+                  hostname: "api.anthropic.com", port: 443, path: "/v1/messages", method: "POST",
+                  headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json", "content-length": postBody.length }
+                }, res => {
+                  let data = ""; res.on("data", c => data += c);
+                  res.on("end", () => { try { resolve(JSON.parse(data).content?.[0]?.text?.trim()); } catch { resolve(null); } });
+                });
+                req.on("error", reject);
+                req.write(postBody); req.end();
+              });
+              if (cnTitle && cnTitle.length > 3) {
+                params.title = cnTitle;
+                console.error(`[create-product] Chinese title: ${cnTitle.slice(0, 40)}`);
+              }
+            }
+          } catch (e) { console.error("[create-product] Translation failed:", e.message); }
         }
       } catch (e) {
         console.error(`[create-product] AI image generation failed: ${e.message}`);
@@ -2776,6 +2777,64 @@ async function autoCreateProduct(params) {
       await takeDebugScreenshot("07_detail_images");
     }
 
+    // ========== Step 5.5: 填写商品名称（只中文，不填英文） ==========
+    console.error("[create-product] Step 5.5: Fill product name (Chinese only)");
+    if (params.title) {
+      // 找"商品名称"标签旁边的 textarea
+      const titleSelectors = [
+        'textarea[placeholder*="请输入"]',
+        'textarea[placeholder*="标题"]',
+        'textarea[placeholder*="商品名"]',
+      ];
+      let titleFilled = false;
+      for (const sel of titleSelectors) {
+        try {
+          const titleInput = page.locator(sel).first();
+          if (await titleInput.isVisible({ timeout: 1000 })) {
+            await titleInput.click();
+            await titleInput.fill("");
+            await titleInput.type(params.title, { delay: 20 + Math.random() * 30 });
+            titleFilled = true;
+            console.error("[create-product] Title filled: " + params.title.slice(0, 30));
+            break;
+          }
+        } catch {}
+      }
+      if (!titleFilled) {
+        await page.evaluate((title) => {
+          // 找第一个可见的 textarea（商品名称，不是英文名称）
+          const labels = document.querySelectorAll("span, label, div");
+          for (const label of labels) {
+            if (label.textContent?.trim()?.startsWith("商品名称") && label.offsetParent) {
+              const parent = label.closest("[class]")?.parentElement || label.parentElement;
+              const ta = parent?.querySelector("textarea");
+              if (ta) {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+                setter?.call(ta, title);
+                ta.dispatchEvent(new Event("input", { bubbles: true }));
+                ta.dispatchEvent(new Event("change", { bubbles: true }));
+                return;
+              }
+            }
+          }
+          // fallback: 第一个可见 textarea
+          const textareas = document.querySelectorAll("textarea");
+          for (const ta of textareas) {
+            if (ta.offsetParent !== null && ta.getBoundingClientRect().top < 800) {
+              const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+              setter?.call(ta, title);
+              ta.dispatchEvent(new Event("input", { bubbles: true }));
+              ta.dispatchEvent(new Event("change", { bubbles: true }));
+              break;
+            }
+          }
+        }, params.title);
+        console.error("[create-product] Title filled via evaluate");
+      }
+      await takeDebugScreenshot("05_title_filled");
+      await randomDelay(1000, 2000);
+    }
+
     // ========== Step 6: 智能填写所有必填字段 ==========
     console.error("[create-product] Step 6: Smart auto-fill required fields");
 
@@ -2793,15 +2852,15 @@ async function autoCreateProduct(params) {
       "Brand": null,
       "工作电压": null, // 非必填跳过
       // 包装
-      "外包装类型": "软包装+硬物",
+      "外包装类型": "硬包装",
       "外包装形状": "长方体",
       // 敏感属性
       "敏感属性": "非敏感品",
       // 体积重量
-      "最长边": params.dimensions?.length || "15",
-      "次长边": params.dimensions?.width || "10",
-      "最短边": params.dimensions?.height || "5",
-      "重量": params.weight || "200",
+      "最长边": params.dimensions?.length || "8",
+      "次长边": params.dimensions?.width || "7",
+      "最短边": params.dimensions?.height || "6",
+      "重量": params.weight || "50",
     };
 
     // 用户自定义属性覆盖默认值
@@ -2962,6 +3021,90 @@ async function autoCreateProduct(params) {
         }
       }
 
+      // ---- 6b2: 商品规格（父规格随机选，子规格随机字母）----
+      console.error("[create-product] 6b2: Setting product specs...");
+      try {
+        // 找"父规格1"下拉框
+        const specSet = await page.evaluate(() => {
+          const labels = document.querySelectorAll("span, label, div");
+          for (const label of labels) {
+            if (label.textContent?.trim()?.includes("父规格") && label.offsetParent) {
+              const parent = label.closest("[class]")?.parentElement || label.parentElement;
+              const select = parent?.querySelector('[class*="select"], [class*="Select"], [role="combobox"], input[readonly]');
+              if (select) {
+                select.click();
+                return "clicked";
+              }
+            }
+          }
+          return "not_found";
+        });
+
+        if (specSet === "clicked") {
+          await randomDelay(1500, 2500);
+          // 随机选一个选项
+          const specSelected = await page.evaluate(() => {
+            const options = document.querySelectorAll('[class*="option"], [class*="Option"], li[role="option"]');
+            const visibleOpts = Array.from(options).filter(o => o.offsetParent !== null && o.textContent?.trim()?.length > 0);
+            if (visibleOpts.length > 0) {
+              const randomIdx = Math.floor(Math.random() * visibleOpts.length);
+              const chosen = visibleOpts[randomIdx];
+              chosen.click();
+              return chosen.textContent?.trim();
+            }
+            return null;
+          });
+          if (specSelected) {
+            console.error(`[create-product] Parent spec selected: ${specSelected}`);
+            await randomDelay(2000, 3000);
+
+            // 等待弹窗（商品规格填写要求），等5秒再关闭
+            await new Promise(r => setTimeout(r, 5000));
+            try {
+              const knowBtn = page.locator('button:has-text("我知道了"), button:has-text("知道了")').first();
+              if (await knowBtn.isVisible({ timeout: 2000 })) {
+                await knowBtn.click();
+                console.error("[create-product] Closed spec format popup");
+                await randomDelay(1000, 2000);
+              }
+            } catch {}
+
+            // 填子规格：随机一个字母
+            const randomLetter = String.fromCharCode(65 + Math.floor(Math.random() * 26));
+            await page.evaluate((letter) => {
+              const inputs = document.querySelectorAll('input[type="text"], input:not([type])');
+              for (const input of inputs) {
+                if (input.offsetParent && !input.value && input.getBoundingClientRect().top > 400) {
+                  const placeholder = input.getAttribute("placeholder") || "";
+                  // 找规格表中的输入框（不是搜索框）
+                  if (!placeholder.includes("搜索") && !placeholder.includes("输入素材")) {
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+                    setter?.call(input, letter);
+                    input.dispatchEvent(new Event("input", { bubbles: true }));
+                    input.dispatchEvent(new Event("change", { bubbles: true }));
+                    return;
+                  }
+                }
+              }
+            }, randomLetter);
+            console.error(`[create-product] Child spec set: ${randomLetter}`);
+          }
+        }
+      } catch (e) {
+        console.error(`[create-product] Spec error: ${e.message?.slice(0, 50)}`);
+      }
+      await randomDelay(1000, 2000);
+
+      // ---- 6b3: 关闭外包装图示例弹窗 ----
+      try {
+        const knowBtn2 = page.locator('button:has-text("我知道了"), button:has-text("知道了")').first();
+        if (await knowBtn2.isVisible({ timeout: 3000 })) {
+          await knowBtn2.click();
+          console.error("[create-product] Closed packaging example popup");
+          await randomDelay(1000, 2000);
+        }
+      } catch {}
+
       // ---- 6c: 外包装类型和形状（单选按钮）----
       console.error("[create-product] 6c: Setting packaging info...");
       await page.evaluate(() => {
@@ -3090,34 +3233,120 @@ async function autoCreateProduct(params) {
       await takeDebugScreenshot("08_error");
     }
 
-    // ========== Step 7: SKU / 价格设置 ==========
-    console.error("[create-product] Step 7: Set SKU/price");
-    if (params.skus && params.skus.length > 0) {
-      // SKU 设置较复杂，需要根据实际页面结构调整
-      for (const sku of params.skus) {
-        try {
-          // 找到价格输入框
-          const priceInputs = page.locator('input[placeholder*="价格"], input[placeholder*="申报"], input[placeholder*="Price"]');
-          const priceCount = await priceInputs.count();
-          if (priceCount > 0) {
-            await priceInputs.first().fill(String(sku.price || params.price || ""));
-            console.error(`[create-product] Price set: ${sku.price || params.price}`);
+    // ========== Step 7: SKU 信息填写 ==========
+    console.error("[create-product] Step 7: Set SKU info");
+
+    // 7a: 点击"非定制商品"
+    try {
+      const nonCustom = page.locator('label:has-text("非定制商品"), span:has-text("非定制商品")').first();
+      if (await nonCustom.isVisible({ timeout: 2000 })) {
+        await nonCustom.click();
+        await randomDelay(500, 1000);
+      }
+    } catch {}
+
+    // 7b: 填写申报价格
+    const price = params.price || 9.99;
+    try {
+      await page.evaluate((p) => {
+        // 找所有带"请输入"placeholder的input，在"申报价格"附近的
+        const inputs = document.querySelectorAll('input[placeholder*="请输入"], input[placeholder*="价格"]');
+        for (const input of inputs) {
+          const row = input.closest("tr, [class*='row'], [class*='Row']") || input.parentElement?.parentElement;
+          if (row && input.offsetParent) {
+            const rect = input.getBoundingClientRect();
+            // 申报价格输入框通常在SKU信息表格中，前面有¥符号
+            const prev = input.previousElementSibling;
+            if (prev?.textContent?.includes("¥") || rect.top > 500) {
+              const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+              setter?.call(input, String(p));
+              input.dispatchEvent(new Event("input", { bubbles: true }));
+              input.dispatchEvent(new Event("change", { bubbles: true }));
+              return;
+            }
           }
-        } catch (e) {
-          console.error(`[create-product] SKU setup error: ${e.message}`);
+        }
+        // fallback: 找第一个空的数字输入框在SKU区域
+        const allInputs = document.querySelectorAll('input');
+        for (const input of allInputs) {
+          if (input.offsetParent && !input.value && input.getBoundingClientRect().top > 500) {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+            setter?.call(input, String(p));
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            break;
+          }
+        }
+      }, price);
+      console.error(`[create-product] Price set: ¥${price}`);
+    } catch (e) {
+      console.error(`[create-product] Price error: ${e.message?.slice(0, 50)}`);
+    }
+    await randomDelay(1000, 2000);
+
+    // 7c: SKU分类选"单品"
+    try {
+      const skuTypeSelect = page.locator('select, [class*="select"]').filter({ hasText: /单品|同款多件装|混合套装/ }).first();
+      if (await skuTypeSelect.isVisible({ timeout: 1000 })) {
+        await skuTypeSelect.click();
+        await randomDelay(500, 1000);
+        const singleOption = page.locator('[class*="option"], li').filter({ hasText: "单品" }).first();
+        if (await singleOption.isVisible({ timeout: 1000 })) {
+          await singleOption.click();
         }
       }
-    } else if (params.price) {
-      // 单一价格模式
-      try {
-        const priceInput = page.locator('input[placeholder*="价格"], input[placeholder*="申报"], input[placeholder*="Price"]').first();
-        if (await priceInput.isVisible({ timeout: 2000 })) {
-          await priceInput.fill(String(params.price));
-          console.error(`[create-product] Price set: ${params.price}`);
+    } catch {}
+
+    // 7d: SKU预览图 - 从素材中心选
+    try {
+      // 找SKU行中的"素材中心"按钮
+      const skuMaterialBtn = page.locator('tr >> text=素材中心, [class*="sku"] >> text=素材中心').first();
+      if (await skuMaterialBtn.isVisible({ timeout: 2000 })) {
+        await skuMaterialBtn.click();
+        await randomDelay(2000, 3000);
+        // 选第一张图
+        const imgs = page.locator('[class*="material"] img, [class*="image-list"] img, [class*="gallery"] img');
+        const imgCount = await imgs.count();
+        if (imgCount > 0) {
+          await imgs.first().click();
+          await randomDelay(500, 1000);
+          // 点确认
+          const confirmBtn = page.locator('button:has-text("确认"), button:has-text("确定")').last();
+          if (await confirmBtn.isVisible({ timeout: 2000 })) {
+            await confirmBtn.click();
+            console.error("[create-product] SKU preview image selected");
+          }
         }
-      } catch {}
-    }
-    await takeDebugScreenshot("09_price_set");
+        await randomDelay(1000, 2000);
+      }
+    } catch {}
+
+    // 7e: 建议零售价 = 申报价格 × 4
+    const retailPrice = Math.round(price * 4);
+    try {
+      await page.evaluate((rp) => {
+        // 找"建议零售价"附近的输入框
+        const labels = document.querySelectorAll("th, td, span, div");
+        for (const label of labels) {
+          if (label.textContent?.includes("建议零售价") && label.offsetParent) {
+            const row = label.closest("tr, [class*='row']") || label.parentElement;
+            const inputs = row?.querySelectorAll("input") || [];
+            for (const input of inputs) {
+              if (input.offsetParent && (!input.value || input.value === "0")) {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+                setter?.call(input, String(rp));
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+                return;
+              }
+            }
+          }
+        }
+      }, retailPrice);
+      console.error(`[create-product] Retail price set: ¥${retailPrice} (${price}×4)`);
+    } catch {}
+
+    await takeDebugScreenshot("09_sku_filled");
 
     // ========== Step 8: 提交核价 ==========
     console.error("[create-product] Step 8: Submit for pricing review");
