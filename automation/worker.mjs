@@ -1851,6 +1851,172 @@ async function scrapeGovernCategoryCorrection() {
 // ---- 上品核价自动化 ----
 
 /**
+ * 下载图片到本地
+ */
+async function downloadImage(url, outputPath) {
+  const proto = url.startsWith("https") ? await import("https") : await import("http");
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(outputPath);
+    proto.default.get(url, { timeout: 30000 }, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        // Follow redirect
+        downloadImage(res.headers.location, outputPath).then(resolve).catch(reject);
+        return;
+      }
+      res.pipe(file);
+      file.on("finish", () => { file.close(); resolve(outputPath); });
+    }).on("error", (e) => { fs.unlink(outputPath, () => {}); reject(e); });
+  });
+}
+
+/**
+ * 从 CSV 文件批量创建商品
+ * @param {Object} params
+ * @param {string} params.csvPath - CSV 文件路径
+ * @param {number} [params.startRow] - 开始行号（0-based，默认0）
+ * @param {number} [params.count] - 创建数量（默认5）
+ * @param {boolean} [params.generateAI] - 是否 AI 生成图片（默认true）
+ * @param {string[]} [params.aiImageTypes] - AI 图片类型
+ * @param {boolean} [params.autoSubmit] - 是否自动提交
+ */
+async function batchCreateFromCSV(params) {
+  const csvPath = params.csvPath;
+  if (!csvPath || !fs.existsSync(csvPath)) {
+    return { success: false, message: "CSV 文件不存在: " + csvPath };
+  }
+
+  // 解析 CSV
+  const csvContent = fs.readFileSync(csvPath, "utf8");
+  const lines = csvContent.split("\n").filter(l => l.trim());
+  const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
+  console.error(`[batch] CSV headers: ${headers.join(", ")}`);
+  console.error(`[batch] Total rows: ${lines.length - 1}`);
+
+  // 找到关键列的索引
+  const colIndex = (name) => headers.findIndex(h => h.includes(name));
+  const nameIdx = colIndex("商品名称");
+  const imageIdx = colIndex("商品原图");
+  const catCnIdx = colIndex("分类（中文）");
+  const catEnIdx = colIndex("分类（英文）");
+  const priceIdx = colIndex("美元价格");
+  const salesIdx = colIndex("总销量");
+  const linkIdx = colIndex("商品链接");
+  const ali1688Idx = colIndex("1688链接");
+
+  console.error(`[batch] Columns: name=${nameIdx}, image=${imageIdx}, catCn=${catCnIdx}, price=${priceIdx}`);
+
+  // 解析 CSV 行（处理引号内的逗号）
+  function parseCSVLine(line) {
+    const result = [];
+    let current = "";
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        inQuotes = !inQuotes;
+      } else if (ch === "," && !inQuotes) {
+        result.push(current.trim());
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    result.push(current.trim());
+    return result;
+  }
+
+  const startRow = params.startRow || 0;
+  const count = params.count || 5;
+  const results = [];
+
+  // 创建下载目录
+  const downloadDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "downloads");
+  fs.mkdirSync(downloadDir, { recursive: true });
+
+  for (let i = startRow; i < Math.min(startRow + count, lines.length - 1); i++) {
+    const row = parseCSVLine(lines[i + 1]); // +1 跳过 header
+    const productName = row[nameIdx] || "";
+    const imageUrl = row[imageIdx] || "";
+    const categoryCn = row[catCnIdx] || "";
+    const priceUSD = parseFloat(row[priceIdx] || "0");
+    const totalSales = parseInt(row[salesIdx] || "0");
+
+    console.error(`\n[batch] ===== Product ${i + 1}/${startRow + count} =====`);
+    console.error(`[batch] Name: ${productName.slice(0, 50)}`);
+    console.error(`[batch] Category: ${categoryCn}`);
+    console.error(`[batch] Price: $${priceUSD}, Sales: ${totalSales}`);
+
+    try {
+      // Step 1: 下载主图
+      let localImagePath = null;
+      if (imageUrl) {
+        const imgFileName = `product_${i}_${Date.now()}.jpg`;
+        localImagePath = path.join(downloadDir, imgFileName);
+        try {
+          await downloadImage(imageUrl, localImagePath);
+          console.error(`[batch] Downloaded image: ${imgFileName}`);
+        } catch (e) {
+          console.error(`[batch] Image download failed: ${e.message}`);
+          localImagePath = null;
+        }
+      }
+
+      // Step 2: 从中文分类提取搜索关键词（取最后一级分类）
+      const categoryParts = categoryCn.split("/").map(s => s.trim());
+      const categorySearch = categoryParts[categoryParts.length - 1] || categoryParts[0] || "商品";
+
+      // Step 3: 价格转人民币（粗略 * 7）
+      const priceCNY = priceUSD > 0 ? (priceUSD * 7).toFixed(2) : "9.99";
+
+      // Step 4: 调用 autoCreateProduct
+      const result = await autoCreateProduct({
+        categorySearch,
+        title: productName,
+        sourceImage: localImagePath,
+        generateAI: params.generateAI !== false,
+        aiImageTypes: params.aiImageTypes || ["hero", "lifestyle", "closeup"],
+        price: parseFloat(priceCNY),
+        autoSubmit: params.autoSubmit || false,
+        keepOpen: false, // 批量模式不保持打开
+      });
+
+      results.push({
+        index: i,
+        name: productName.slice(0, 40),
+        category: categorySearch,
+        price: priceCNY,
+        success: result.success,
+        message: result.message,
+      });
+
+      console.error(`[batch] Result: ${result.success ? "✅" : "❌"} ${result.message}`);
+
+      // 每个商品间隔
+      await randomDelay(3000, 5000);
+    } catch (e) {
+      console.error(`[batch] Error: ${e.message}`);
+      results.push({
+        index: i,
+        name: productName.slice(0, 40),
+        success: false,
+        message: e.message,
+      });
+    }
+  }
+
+  const successCount = results.filter(r => r.success).length;
+  console.error(`\n[batch] Done! ${successCount}/${results.length} succeeded`);
+
+  return {
+    success: true,
+    total: results.length,
+    successCount,
+    failCount: results.length - successCount,
+    results,
+  };
+}
+
+/**
  * 调用 AI 图片生成服务生成商品图片
  * @param {string} sourceImagePath - 原图路径（商品实拍图）
  * @param {string} productTitle - 商品标题（用于生成 prompt）
@@ -1858,7 +2024,7 @@ async function scrapeGovernCategoryCorrection() {
  * @returns {string[]} 生成的图片文件路径数组
  */
 async function generateAIImages(sourceImagePath, productTitle, imageTypes = ["hero", "lifestyle"]) {
-  const AI_SERVER = "http://localhost:3000";
+  const AI_SERVER = process.env.AI_IMAGE_SERVER || "http://localhost:3001";
   const outputDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "ai-images");
   fs.mkdirSync(outputDir, { recursive: true });
 
@@ -1895,9 +2061,10 @@ async function generateAIImages(sourceImagePath, productTitle, imageTypes = ["he
 
   parts.push(`--${boundary}--`);
 
-  // 使用 fetch API 发送（Node 18+ 内置）
+  // 使用 Node 内置 fetch + FormData
   try {
-    const formData = new (await import("undici")).FormData();
+    const { FormData: NodeFormData, File } = await import("node:buffer");
+    const formData = new globalThis.FormData();
     formData.append("plans", JSON.stringify(plans));
     formData.append("productMode", "single");
     formData.append("imageLanguage", "en");
@@ -1905,8 +2072,10 @@ async function generateAIImages(sourceImagePath, productTitle, imageTypes = ["he
 
     if (sourceImagePath && fs.existsSync(sourceImagePath)) {
       const fileBuffer = fs.readFileSync(sourceImagePath);
-      const blob = new Blob([fileBuffer]);
-      formData.append("files", blob, path.basename(sourceImagePath));
+      const ext = path.extname(sourceImagePath).toLowerCase();
+      const mimeType = ext === ".png" ? "image/png" : "image/jpeg";
+      const blob = new Blob([fileBuffer], { type: mimeType });
+      formData.append("images", blob, path.basename(sourceImagePath));
     }
 
     const response = await fetch(`${AI_SERVER}/api/generate`, {
@@ -2140,41 +2309,117 @@ async function autoCreateProduct(params) {
     // ========== Step 4: 上传主图 ==========
     console.error("[create-product] Step 4: Upload images");
     if (params.images && params.images.length > 0) {
-      // 验证文件存在
       const validImages = params.images.filter(img => fs.existsSync(img));
       if (validImages.length === 0) {
         console.error("[create-product] No valid image files found!");
         return { success: false, message: "图片文件不存在: " + params.images.join(", "), screenshots };
       }
 
-      // 找到 file input 元素
-      const fileInputs = page.locator('input[type="file"]');
-      const fileInputCount = await fileInputs.count();
-      console.error(`[create-product] Found ${fileInputCount} file inputs`);
-
-      if (fileInputCount > 0) {
-        // 第一个 file input 通常是主图
-        await fileInputs.first().setInputFiles(validImages);
-        console.error(`[create-product] Uploaded ${validImages.length} images`);
-        await randomDelay(3000, 5000); // 等待上传完成
-      } else {
-        // 备用：通过点击上传区域触发
-        console.error("[create-product] No file input found, trying click upload area");
-        const uploadArea = page.locator('[class*="upload"], [class*="Upload"], .ant-upload, [role="button"]:has-text("上传")').first();
-        if (await uploadArea.isVisible({ timeout: 2000 })) {
-          // 注入 file input
-          const inputId = await page.evaluate(() => {
-            const input = document.createElement("input");
-            input.type = "file";
-            input.multiple = true;
-            input.accept = "image/*";
-            input.id = "__auto_upload_input__";
-            input.style.display = "none";
-            document.body.appendChild(input);
-            return input.id;
-          });
-          await page.locator(`#${inputId}`).setInputFiles(validImages);
+      // 先滚动到图片上传区域
+      await page.evaluate(() => {
+        const labels = document.querySelectorAll("span, label, div");
+        for (const el of labels) {
+          if (el.textContent?.includes("商品轮播图") || el.textContent?.includes("商品主图") || el.textContent?.includes("素材图")) {
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+            break;
+          }
         }
+      });
+      await randomDelay(1000, 2000);
+
+      // 探测页面上所有 file input
+      const fileInputInfo = await page.evaluate(() => {
+        const inputs = document.querySelectorAll('input[type="file"]');
+        return Array.from(inputs).map((input, i) => ({
+          index: i,
+          id: input.id,
+          name: input.name,
+          accept: input.accept,
+          multiple: input.multiple,
+          visible: input.offsetParent !== null,
+          display: getComputedStyle(input).display,
+          parentClass: input.parentElement?.className?.slice(0, 60) || "",
+          rect: input.getBoundingClientRect(),
+        }));
+      });
+      console.error(`[create-product] File inputs found: ${fileInputInfo.length}`);
+      fileInputInfo.forEach(info => {
+        console.error(`  [${info.index}] id=${info.id} accept=${info.accept} visible=${info.visible} parent=${info.parentClass}`);
+      });
+
+      let uploaded = false;
+
+      // 方法1: 找到所有 file input，逐个尝试（包括隐藏的）
+      if (fileInputInfo.length > 0) {
+        for (let i = 0; i < fileInputInfo.length && !uploaded; i++) {
+          try {
+            const fileInput = page.locator('input[type="file"]').nth(i);
+            // Playwright 的 setInputFiles 可以操作隐藏的 file input
+            await fileInput.setInputFiles(validImages, { timeout: 5000 });
+            console.error(`[create-product] Uploaded via file input[${i}]`);
+            uploaded = true;
+            await randomDelay(5000, 8000); // 等待上传处理
+          } catch (e) {
+            console.error(`[create-product] File input[${i}] failed: ${e.message?.slice(0, 60)}`);
+          }
+        }
+      }
+
+      // 方法2: 通过 filechooser 事件拦截（点击上传按钮触发文件选择对话框）
+      if (!uploaded) {
+        console.error("[create-product] Trying filechooser approach...");
+        try {
+          // 找到上传按钮/区域
+          const uploadBtn = page.locator(
+            '[class*="upload"]:not(input), [class*="Upload"]:not(input), ' +
+            'div:has-text("展示真实使用场景"), div:has-text("商品主图"), ' +
+            'button:has-text("上传"), [role="button"]:has(svg)'
+          ).first();
+
+          if (await uploadBtn.isVisible({ timeout: 2000 })) {
+            // 注册 filechooser 事件监听，然后点击上传按钮
+            const [fileChooser] = await Promise.all([
+              page.waitForEvent("filechooser", { timeout: 5000 }),
+              uploadBtn.click(),
+            ]);
+            await fileChooser.setFiles(validImages);
+            uploaded = true;
+            console.error("[create-product] Uploaded via filechooser event");
+            await randomDelay(5000, 8000);
+          }
+        } catch (e) {
+          console.error(`[create-product] Filechooser approach failed: ${e.message?.slice(0, 60)}`);
+        }
+      }
+
+      // 方法3: 点击"展示真实使用场景"等具体上传区域 + filechooser
+      if (!uploaded) {
+        console.error("[create-product] Trying specific upload slots...");
+        const uploadSlots = [
+          '展示真实使用场景',
+          '使用公制和英制单位',
+          '展示产品真是尺寸大小',
+        ];
+        for (const slotText of uploadSlots) {
+          try {
+            const slot = page.locator(`div:has-text("${slotText}")`).first();
+            if (await slot.isVisible({ timeout: 1000 })) {
+              const [fileChooser] = await Promise.all([
+                page.waitForEvent("filechooser", { timeout: 5000 }),
+                slot.click(),
+              ]);
+              await fileChooser.setFiles(validImages);
+              uploaded = true;
+              console.error(`[create-product] Uploaded to slot: ${slotText}`);
+              await randomDelay(5000, 8000);
+              break;
+            }
+          } catch {}
+        }
+      }
+
+      if (!uploaded) {
+        console.error("[create-product] WARNING: All upload methods failed!");
       }
 
       await takeDebugScreenshot("06_images_uploaded");
@@ -3232,6 +3477,10 @@ async function handleRequest(body) {
     case "create_product": {
       await ensureBrowser();
       return await autoCreateProduct(params);
+    }
+    case "batch_create_from_csv": {
+      await ensureBrowser();
+      return await batchCreateFromCSV(params);
     }
     case "generate_ai_images": {
       const images = await generateAIImages(
