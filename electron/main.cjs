@@ -311,6 +311,10 @@ ipcMain.handle("automation:scrape-all", async () => {
   return sendCmd("scrape_all");
 });
 
+ipcMain.handle("automation:create-product", async (_e, params) => {
+  return sendCmd("create_product", params);
+});
+
 ipcMain.handle("automation:read-scrape-data", async (_e, key) => {
   return sendCmd("read_scrape_data", { key });
 });

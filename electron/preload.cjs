@@ -28,6 +28,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("automation:scrape-performance"),
     scrapeAll: () =>
       ipcRenderer.invoke("automation:scrape-all"),
+    createProduct: (params) =>
+      ipcRenderer.invoke("automation:create-product", params),
     readScrapeData: (key) =>
       ipcRenderer.invoke("automation:read-scrape-data", key),
     scrapeLifecycle: () =>

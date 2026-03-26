@@ -882,10 +882,124 @@ async function scrapeMainPages() {
   return scrapePageCaptureAll("/");
 }
 
-// ---- 抓取销售管理数据 (API 方式) ----
+// ---- 抓取销售管理数据 (翻页采集所有商品库存) ----
 
 async function scrapeSales() {
-  return scrapePageCaptureAll("/stock/fully-mgt/sale-manage/main");
+  // 使用通用捕获器 + 翻页逻辑
+  const page = await context.newPage();
+  const capturedApis = [];
+  const staticExts = [".js", ".css", ".png", ".svg", ".woff", ".woff2", ".ttf", ".ico", ".jpg", ".jpeg", ".gif", ".map", ".webp"];
+  const frameworkPatterns = ['phantom/xg', 'pfb/l1', 'pfb/a4', 'web-performace', '_stm', 'msgBox', 'hot-update', 'sockjs', 'hm.baidu', 'google', 'favicon', 'drogon-api', 'report/uin'];
+
+  try {
+    // 捕获所有 API（和 scrapePageCaptureAll 一样的通用逻辑）
+    page.on("response", async (resp) => {
+      try {
+        const url = resp.url();
+        if (staticExts.some(ext => url.includes(ext))) return;
+        if (frameworkPatterns.some(p => url.includes(p))) return;
+        if (resp.status() === 200) {
+          const ct = resp.headers()["content-type"] || "";
+          if (ct.includes("json") || ct.includes("application")) {
+            const body = await resp.json().catch(() => null);
+            if (body && (body.result !== undefined || body.success !== undefined)) {
+              const u = new URL(url);
+              capturedApis.push({ path: u.pathname, data: body });
+              console.error(`[sales] Captured: ${u.pathname}`);
+            }
+          }
+        }
+      } catch {}
+    });
+
+    // 导航到销售管理页面
+    console.error("[sales] Navigating to sale-manage/main...");
+    await navigateToSellerCentral(page, "/stock/fully-mgt/sale-manage/main");
+    await randomDelay(10000, 12000);
+
+    // 关闭弹窗
+    for (let i = 0; i < 8; i++) {
+      try {
+        const btn = page.locator('button:has-text("知道了"), button:has-text("我知道了"), button:has-text("确定"), button:has-text("关闭"), button:has-text("暂不")').first();
+        if (await btn.isVisible({ timeout: 500 })) await btn.click();
+        else break;
+      } catch { break; }
+    }
+    await randomDelay(3000, 5000);
+
+    // 检查第一页的 listOverall 是否有 total > 10（需要翻页）
+    const firstListApi = capturedApis.find(a => a.path?.includes("listOverall"));
+    const total = firstListApi?.data?.result?.total || 0;
+    const pageSize = firstListApi?.data?.result?.subOrderList?.length || 10;
+    const totalPages = Math.ceil(total / pageSize);
+    console.error(`[sales] Total: ${total} products, ${totalPages} pages`);
+
+    if (totalPages > 1) {
+      // Temu API 需要 anti-content 签名，只能通过点击分页按钮翻页
+      // 用 page.evaluate 查找并点击分页元素
+      for (let pageNum = 2; pageNum <= Math.min(totalPages, 30); pageNum++) {
+        try {
+          const clicked = await page.evaluate((pn) => {
+            // 方法1: 找所有看起来像分页的元素
+            const allLinks = document.querySelectorAll('a, button, li, span');
+            for (const el of allLinks) {
+              // 找页码数字
+              if (el.textContent?.trim() === String(pn) && el.offsetParent !== null) {
+                const rect = el.getBoundingClientRect();
+                // 分页通常在页面底部，宽度小于100
+                if (rect.width < 100 && rect.width > 10 && rect.bottom > 300) {
+                  el.click();
+                  return 'page-number';
+                }
+              }
+            }
+            // 方法2: 找"下一页"按钮 (通常是一个 > 图标)
+            const nextBtns = document.querySelectorAll('[class*="next"], [aria-label*="next"], [aria-label*="Next"]');
+            for (const btn of nextBtns) {
+              if (btn.offsetParent !== null && !btn.classList.contains('disabled') && !btn.hasAttribute('disabled')) {
+                btn.click();
+                return 'next-button';
+              }
+            }
+            // 方法3: 找 SVG 右箭头
+            const svgs = document.querySelectorAll('svg');
+            for (const svg of svgs) {
+              const parent = svg.closest('button, a, li, span');
+              if (parent && parent.offsetParent !== null) {
+                const rect = parent.getBoundingClientRect();
+                if (rect.bottom > 400 && rect.width < 60) {
+                  // 检查是否是右箭头（在分页区域的右侧）
+                  const siblings = parent.parentElement?.children;
+                  if (siblings && parent === siblings[siblings.length - 1]) {
+                    parent.click();
+                    return 'svg-arrow';
+                  }
+                }
+              }
+            }
+            return null;
+          }, pageNum);
+
+          if (clicked) {
+            console.error(`[sales] → page ${pageNum}/${totalPages} (via ${clicked})`);
+            await randomDelay(3000, 5000);
+          } else {
+            console.error(`[sales] Cannot find page ${pageNum} button, stopping`);
+            break;
+          }
+        } catch (e) {
+          console.error(`[sales] Page ${pageNum} click failed: ${e.message}`);
+          break;
+        }
+      }
+    }
+
+    console.error(`[sales] Done! Captured ${capturedApis.length} APIs`);
+    await saveCookies();
+    return { apis: capturedApis };
+  } finally {
+    await page.close();
+  }
 }
 
 // ---- 通用 response-listener 采集器 ----
@@ -1732,6 +1846,453 @@ async function scrapeGovernCustomsAttribute() {
 // 商品类目纠正
 async function scrapeGovernCategoryCorrection() {
   return scrapeGovernPage("category-correction");
+}
+
+// ---- 上品核价自动化 ----
+
+/**
+ * 调用 AI 图片生成服务生成商品图片
+ * @param {string} sourceImagePath - 原图路径（商品实拍图）
+ * @param {string} productTitle - 商品标题（用于生成 prompt）
+ * @param {string[]} imageTypes - 需要生成的图片类型 ["hero","lifestyle","closeup","features"]
+ * @returns {string[]} 生成的图片文件路径数组
+ */
+async function generateAIImages(sourceImagePath, productTitle, imageTypes = ["hero", "lifestyle"]) {
+  const AI_SERVER = "http://localhost:3000";
+  const outputDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "ai-images");
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  console.error(`[ai-image] Generating ${imageTypes.length} images for: ${productTitle?.slice(0, 30)}`);
+
+  // 构建 plans
+  const plans = imageTypes.map(type => ({
+    imageType: type,
+    title: `${type} image`,
+    description: `Professional ${type} product photo`,
+    prompt: `Professional e-commerce ${type} photo of: ${productTitle}. High quality, white background, studio lighting.`,
+  }));
+
+  // 构建 FormData
+  const FormData = (await import("node:buffer")).Blob ? null : null;
+  // 用 http 模块发送 multipart request
+  const boundary = "----FormBoundary" + Math.random().toString(36).slice(2);
+  const parts = [];
+
+  // 添加 plans
+  parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="plans"\r\n\r\n${JSON.stringify(plans)}`);
+  parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="productMode"\r\n\r\nsingle`);
+  parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="imageLanguage"\r\n\r\nen`);
+  parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="imageSize"\r\n\r\n800x800`);
+
+  // 添加源图片文件
+  if (sourceImagePath && fs.existsSync(sourceImagePath)) {
+    const imageData = fs.readFileSync(sourceImagePath);
+    const ext = path.extname(sourceImagePath).toLowerCase();
+    const mimeType = ext === ".png" ? "image/png" : "image/jpeg";
+    parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="${path.basename(sourceImagePath)}"\r\nContent-Type: ${mimeType}\r\n\r\n`);
+    // 需要特殊处理二进制数据
+  }
+
+  parts.push(`--${boundary}--`);
+
+  // 使用 fetch API 发送（Node 18+ 内置）
+  try {
+    const formData = new (await import("undici")).FormData();
+    formData.append("plans", JSON.stringify(plans));
+    formData.append("productMode", "single");
+    formData.append("imageLanguage", "en");
+    formData.append("imageSize", "800x800");
+
+    if (sourceImagePath && fs.existsSync(sourceImagePath)) {
+      const fileBuffer = fs.readFileSync(sourceImagePath);
+      const blob = new Blob([fileBuffer]);
+      formData.append("files", blob, path.basename(sourceImagePath));
+    }
+
+    const response = await fetch(`${AI_SERVER}/api/generate`, {
+      method: "POST",
+      body: formData,
+    });
+
+    // 解析 SSE 流
+    const text = await response.text();
+    const generatedPaths = [];
+
+    for (const line of text.split("\n")) {
+      if (line.startsWith("data: ")) {
+        try {
+          const data = JSON.parse(line.slice(6));
+          if (data.status === "done" && data.imageUrl) {
+            // data URL → 保存为文件
+            const match = data.imageUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+            if (match) {
+              const ext = match[1] === "png" ? "png" : "jpg";
+              const fileName = `${data.imageType}_${Date.now()}.${ext}`;
+              const filePath = path.join(outputDir, fileName);
+              fs.writeFileSync(filePath, Buffer.from(match[2], "base64"));
+              generatedPaths.push(filePath);
+              console.error(`[ai-image] Generated: ${fileName}`);
+            }
+          }
+        } catch {}
+      }
+    }
+
+    console.error(`[ai-image] Done! Generated ${generatedPaths.length} images`);
+    return generatedPaths;
+  } catch (e) {
+    console.error(`[ai-image] Error: ${e.message}`);
+    // 备用方案：直接用 http 模块
+    return [];
+  }
+}
+
+/**
+ * 自动创建商品并提交核价
+ * @param {Object} params
+ * @param {string} params.categorySearch - 分类搜索关键词（如 "汽车贴花"）
+ * @param {string} params.title - 商品标题
+ * @param {string[]} params.images - 主图文件路径数组（本地绝对路径）
+ * @param {string[]} [params.detailImages] - 详情图文件路径数组
+ * @param {Object} [params.attributes] - 商品属性 {key: value}
+ * @param {Array} [params.skus] - SKU列表 [{name, price, stock}]
+ * @param {number} [params.price] - 申报价格（分）
+ * @param {string} [params.description] - 商品描述
+ * @returns {Object} { success, message, productId?, screenshots[] }
+ */
+async function autoCreateProduct(params) {
+  const page = await context.newPage();
+  const screenshots = [];
+  const debugDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
+  fs.mkdirSync(debugDir, { recursive: true });
+
+  async function takeDebugScreenshot(name) {
+    try {
+      const filePath = path.join(debugDir, `create_product_${name}_${Date.now()}.png`);
+      await page.screenshot({ path: filePath, fullPage: false });
+      screenshots.push(filePath);
+      console.error(`[create-product] Screenshot: ${name}`);
+    } catch {}
+  }
+
+  try {
+    console.error("[create-product] Starting product creation...");
+    console.error(`[create-product] Category: ${params.categorySearch}, Title: ${params.title?.slice(0, 40)}`);
+
+    // ========== Step 1: 导航到创建商品页面 ==========
+    console.error("[create-product] Step 1: Navigate to create page");
+    await navigateToSellerCentral(page, "/goods/create/category");
+    await randomDelay(5000, 7000);
+
+    // 关闭可能的弹窗
+    for (let i = 0; i < 5; i++) {
+      try {
+        const btn = page.locator('button:has-text("知道了"), button:has-text("我知道了"), button:has-text("确定"), button:has-text("关闭")').first();
+        if (await btn.isVisible({ timeout: 500 })) await btn.click();
+        else break;
+      } catch { break; }
+    }
+    await takeDebugScreenshot("01_category_page");
+
+    // ========== Step 2: 搜索并选择分类 ==========
+    console.error("[create-product] Step 2: Select category");
+    const categoryInput = page.locator('input[placeholder*="搜索分类"], input[placeholder*="搜索类目"], input[placeholder*="商品名称"], input[placeholder*="可输入"]').first();
+
+    if (await categoryInput.isVisible({ timeout: 3000 })) {
+      await categoryInput.click();
+      await randomDelay(300, 500);
+      // 逐字输入模拟真人
+      for (const char of params.categorySearch) {
+        await page.keyboard.type(char, { delay: 50 + Math.random() * 100 });
+      }
+      await randomDelay(2000, 3000);
+      await takeDebugScreenshot("02_category_search");
+
+      // 点击搜索结果中的分类
+      try {
+        // 尝试点击包含搜索词的分类选项
+        const categoryOption = page.locator(`text=${params.categorySearch}`).first();
+        if (await categoryOption.isVisible({ timeout: 3000 })) {
+          await categoryOption.click();
+          await randomDelay(1000, 2000);
+        }
+      } catch {
+        console.error("[create-product] Category option not found by text, trying first result");
+      }
+
+      // 如果有多级分类，需要逐级点击
+      if (params.categoryPath) {
+        const levels = params.categoryPath.split(">");
+        for (const level of levels) {
+          try {
+            const levelOption = page.locator(`text=${level.trim()}`).first();
+            if (await levelOption.isVisible({ timeout: 2000 })) {
+              await levelOption.click();
+              await randomDelay(500, 1000);
+            }
+          } catch {}
+        }
+      }
+
+      await takeDebugScreenshot("03_category_selected");
+
+      // 点击确认/下一步按钮
+      try {
+        const confirmBtn = page.locator('button:has-text("确认"), button:has-text("下一步"), button:has-text("确定选择"), button:has-text("开始创建")').first();
+        if (await confirmBtn.isVisible({ timeout: 3000 })) {
+          await confirmBtn.click();
+          console.error("[create-product] Clicked next, waiting for page load...");
+          // 等待页面加载完成（加载中消失 + 标题输入框出现）
+          try {
+            await page.waitForSelector('textarea, input[placeholder*="标题"], input[placeholder*="商品名"]', { timeout: 30000 });
+          } catch {
+            // 备选：等待加载动画消失
+            await randomDelay(10000, 15000);
+          }
+          await randomDelay(2000, 3000);
+        }
+      } catch {}
+    } else {
+      console.error("[create-product] Category input not found!");
+      await takeDebugScreenshot("02_category_input_missing");
+      return { success: false, message: "找不到分类搜索框", screenshots };
+    }
+
+    await takeDebugScreenshot("04_basic_info_page");
+    console.error("[create-product] Step 2 done: Category selected");
+
+    // ========== Step 3: 填写商品标题 ==========
+    console.error("[create-product] Step 3: Fill title");
+    // 等待页面完全加载（loading消失）
+    try {
+      await page.waitForFunction(() => {
+        const spinners = document.querySelectorAll('.ant-spin-spinning, [class*="loading"], [class*="Loading"]');
+        return spinners.length === 0 || Array.from(spinners).every(s => s.offsetParent === null);
+      }, { timeout: 15000 });
+    } catch {
+      await randomDelay(5000, 8000);
+    }
+    await randomDelay(2000, 3000);
+
+    // 寻找标题输入框
+    const titleSelectors = [
+      'textarea[placeholder*="标题"]',
+      'textarea[placeholder*="商品名"]',
+      'input[placeholder*="标题"]',
+      'input[placeholder*="商品名"]',
+      'textarea[placeholder*="Title"]',
+      'textarea[placeholder*="title"]',
+    ];
+
+    let titleFilled = false;
+    for (const sel of titleSelectors) {
+      try {
+        const titleInput = page.locator(sel).first();
+        if (await titleInput.isVisible({ timeout: 1000 })) {
+          await titleInput.click();
+          await titleInput.fill("");
+          // 模拟真人输入
+          await titleInput.type(params.title, { delay: 20 + Math.random() * 30 });
+          titleFilled = true;
+          console.error("[create-product] Title filled");
+          break;
+        }
+      } catch {}
+    }
+
+    if (!titleFilled) {
+      // 备用方案：用 evaluate 直接填写
+      await page.evaluate((title) => {
+        const textareas = document.querySelectorAll("textarea");
+        for (const ta of textareas) {
+          if (ta.offsetParent !== null && ta.getBoundingClientRect().top < 800) {
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+            nativeInputValueSetter?.call(ta, title);
+            ta.dispatchEvent(new Event("input", { bubbles: true }));
+            ta.dispatchEvent(new Event("change", { bubbles: true }));
+            break;
+          }
+        }
+      }, params.title);
+      console.error("[create-product] Title filled via evaluate");
+    }
+
+    await takeDebugScreenshot("05_title_filled");
+
+    // ========== Step 3.5: AI 图片生成（可选） ==========
+    if (params.generateAI && params.sourceImage) {
+      console.error("[create-product] Step 3.5: Generate AI images");
+      try {
+        const aiImages = await generateAIImages(
+          params.sourceImage,
+          params.title,
+          params.aiImageTypes || ["hero", "lifestyle", "closeup"]
+        );
+        if (aiImages.length > 0) {
+          params.images = [...(params.images || []), ...aiImages];
+          console.error(`[create-product] AI generated ${aiImages.length} images`);
+        }
+      } catch (e) {
+        console.error(`[create-product] AI image generation failed: ${e.message}`);
+      }
+    }
+
+    // ========== Step 4: 上传主图 ==========
+    console.error("[create-product] Step 4: Upload images");
+    if (params.images && params.images.length > 0) {
+      // 验证文件存在
+      const validImages = params.images.filter(img => fs.existsSync(img));
+      if (validImages.length === 0) {
+        console.error("[create-product] No valid image files found!");
+        return { success: false, message: "图片文件不存在: " + params.images.join(", "), screenshots };
+      }
+
+      // 找到 file input 元素
+      const fileInputs = page.locator('input[type="file"]');
+      const fileInputCount = await fileInputs.count();
+      console.error(`[create-product] Found ${fileInputCount} file inputs`);
+
+      if (fileInputCount > 0) {
+        // 第一个 file input 通常是主图
+        await fileInputs.first().setInputFiles(validImages);
+        console.error(`[create-product] Uploaded ${validImages.length} images`);
+        await randomDelay(3000, 5000); // 等待上传完成
+      } else {
+        // 备用：通过点击上传区域触发
+        console.error("[create-product] No file input found, trying click upload area");
+        const uploadArea = page.locator('[class*="upload"], [class*="Upload"], .ant-upload, [role="button"]:has-text("上传")').first();
+        if (await uploadArea.isVisible({ timeout: 2000 })) {
+          // 注入 file input
+          const inputId = await page.evaluate(() => {
+            const input = document.createElement("input");
+            input.type = "file";
+            input.multiple = true;
+            input.accept = "image/*";
+            input.id = "__auto_upload_input__";
+            input.style.display = "none";
+            document.body.appendChild(input);
+            return input.id;
+          });
+          await page.locator(`#${inputId}`).setInputFiles(validImages);
+        }
+      }
+
+      await takeDebugScreenshot("06_images_uploaded");
+    }
+
+    // ========== Step 5: 上传详情图 ==========
+    if (params.detailImages && params.detailImages.length > 0) {
+      console.error("[create-product] Step 5: Upload detail images");
+      const validDetailImages = params.detailImages.filter(img => fs.existsSync(img));
+      if (validDetailImages.length > 0) {
+        const fileInputs = page.locator('input[type="file"]');
+        const count = await fileInputs.count();
+        // 第二个 file input 通常是详情图
+        if (count > 1) {
+          await fileInputs.nth(1).setInputFiles(validDetailImages);
+          console.error(`[create-product] Uploaded ${validDetailImages.length} detail images`);
+          await randomDelay(3000, 5000);
+        }
+      }
+      await takeDebugScreenshot("07_detail_images");
+    }
+
+    // ========== Step 6: 填写商品属性 ==========
+    if (params.attributes && Object.keys(params.attributes).length > 0) {
+      console.error("[create-product] Step 6: Fill attributes");
+      for (const [key, value] of Object.entries(params.attributes)) {
+        try {
+          // 找到标签文字对应的输入框
+          const label = page.locator(`text=${key}`).first();
+          if (await label.isVisible({ timeout: 1000 })) {
+            // 找标签旁边的 input/select
+            const parent = label.locator("xpath=../..");
+            const input = parent.locator("input, select, textarea").first();
+            if (await input.isVisible({ timeout: 500 })) {
+              const tagName = await input.evaluate(el => el.tagName.toLowerCase());
+              if (tagName === "select") {
+                await input.selectOption(String(value));
+              } else {
+                await input.fill(String(value));
+              }
+              console.error(`[create-product] Attribute set: ${key} = ${value}`);
+            }
+          }
+        } catch (e) {
+          console.error(`[create-product] Failed to set attribute ${key}: ${e.message}`);
+        }
+      }
+      await takeDebugScreenshot("08_attributes_filled");
+    }
+
+    // ========== Step 7: SKU / 价格设置 ==========
+    console.error("[create-product] Step 7: Set SKU/price");
+    if (params.skus && params.skus.length > 0) {
+      // SKU 设置较复杂，需要根据实际页面结构调整
+      for (const sku of params.skus) {
+        try {
+          // 找到价格输入框
+          const priceInputs = page.locator('input[placeholder*="价格"], input[placeholder*="申报"], input[placeholder*="Price"]');
+          const priceCount = await priceInputs.count();
+          if (priceCount > 0) {
+            await priceInputs.first().fill(String(sku.price || params.price || ""));
+            console.error(`[create-product] Price set: ${sku.price || params.price}`);
+          }
+        } catch (e) {
+          console.error(`[create-product] SKU setup error: ${e.message}`);
+        }
+      }
+    } else if (params.price) {
+      // 单一价格模式
+      try {
+        const priceInput = page.locator('input[placeholder*="价格"], input[placeholder*="申报"], input[placeholder*="Price"]').first();
+        if (await priceInput.isVisible({ timeout: 2000 })) {
+          await priceInput.fill(String(params.price));
+          console.error(`[create-product] Price set: ${params.price}`);
+        }
+      } catch {}
+    }
+    await takeDebugScreenshot("09_price_set");
+
+    // ========== Step 8: 提交核价 ==========
+    console.error("[create-product] Step 8: Submit for pricing review");
+    await takeDebugScreenshot("10_before_submit");
+
+    // 先不自动点提交，让用户确认
+    if (params.autoSubmit) {
+      try {
+        const submitBtn = page.locator('button:has-text("提交"), button:has-text("提交核价"), button:has-text("提交审核"), button:has-text("Submit")').first();
+        if (await submitBtn.isVisible({ timeout: 3000 })) {
+          await submitBtn.click();
+          await randomDelay(3000, 5000);
+          await takeDebugScreenshot("11_submitted");
+          console.error("[create-product] Submitted for pricing review!");
+        }
+      } catch (e) {
+        console.error(`[create-product] Submit error: ${e.message}`);
+        return { success: false, message: "提交失败: " + e.message, screenshots };
+      }
+    } else {
+      console.error("[create-product] Auto-submit disabled. Product form filled, waiting for manual review.");
+    }
+
+    await saveCookies();
+
+    return {
+      success: true,
+      message: params.autoSubmit ? "商品已提交核价" : "商品信息已填写完成，请手动检查并提交",
+      screenshots,
+    };
+  } catch (e) {
+    console.error(`[create-product] Error: ${e.message}`);
+    await takeDebugScreenshot("error");
+    return { success: false, message: e.message, screenshots };
+  } finally {
+    // 不关闭页面，让用户可以检查
+    if (!params.keepOpen) {
+      await page.close();
+    }
+  }
 }
 
 // ---- 推广平台采集 (ads.temu.com) ----
@@ -2667,6 +3228,18 @@ async function handleRequest(body) {
     case "scrape_sales": {
       await ensureBrowser();
       return { sales: await scrapeSales() };
+    }
+    case "create_product": {
+      await ensureBrowser();
+      return await autoCreateProduct(params);
+    }
+    case "generate_ai_images": {
+      const images = await generateAIImages(
+        params.sourceImage,
+        params.title,
+        params.imageTypes || ["hero", "lifestyle"]
+      );
+      return { success: true, images, count: images.length };
     }
     case "scrape_flux": {
       await ensureBrowser();
