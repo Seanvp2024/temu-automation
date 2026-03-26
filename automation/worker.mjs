@@ -4957,10 +4957,357 @@ async function handleRequest(body) {
       }
       return results;
     }
+    case "create_product_api": {
+      // 纯 API 方式创建商品（跳过 DOM 操作）
+      await ensureBrowser();
+      return await createProductViaAPI(params);
+    }
+    case "batch_create_api": {
+      // 纯 API 批量创建商品
+      await ensureBrowser();
+      return await batchCreateViaAPI(params);
+    }
     case "close": await closeBrowser(); return { status: "closed" };
     case "shutdown": await closeBrowser(); setTimeout(() => process.exit(0), 100); return { status: "shutting_down" };
     default: throw new Error("未知命令: " + action);
   }
+}
+
+// ============================================================
+// 纯 API 方式创建商品（跳过 DOM 操作）
+// ============================================================
+
+async function uploadImageToMaterial(page, localImagePath) {
+  // 在已登录页面中上传图片到素材中心，返回 kwcdn URL
+  const imageBuffer = fs.readFileSync(localImagePath);
+  const base64 = imageBuffer.toString("base64");
+  const ext = path.extname(localImagePath).toLowerCase();
+  const mimeType = ext === ".png" ? "image/png" : "image/jpeg";
+  const fileName = path.basename(localImagePath);
+
+  const result = await page.evaluate(async ({ base64Data, mime, name }) => {
+    try {
+      // 将 base64 转为 Blob
+      const byteChars = atob(base64Data);
+      const byteArray = new Uint8Array(byteChars.length);
+      for (let i = 0; i < byteChars.length; i++) byteArray[i] = byteChars.charCodeAt(i);
+      const blob = new Blob([byteArray], { type: mime });
+      const file = new File([blob], name, { type: mime });
+
+      // 用 FormData 上传到素材中心
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("scene", "product");
+
+      // 找上传接口 — 尝试常见的素材上传路径
+      const uploadUrls = [
+        "/visage-agent-seller/material/upload",
+        "/lich-mms/material/upload",
+        "/api/material/upload",
+        "/bg-anniston-agent-seller/material/upload",
+      ];
+
+      for (const url of uploadUrls) {
+        try {
+          const resp = await fetch(url, { method: "POST", body: formData, credentials: "include" });
+          if (resp.ok) {
+            const data = await resp.json();
+            if (data.result?.url || data.result?.imageUrl) {
+              return { success: true, url: data.result.url || data.result.imageUrl };
+            }
+            if (data.result) return { success: true, url: JSON.stringify(data.result).slice(0, 200) };
+          }
+        } catch {}
+      }
+
+      // 备用：用 pfs 上传接口
+      const pfsResp = await fetch("https://pfs.temu.com/api/luna/upload", {
+        method: "POST",
+        body: formData,
+        credentials: "include",
+      });
+      if (pfsResp.ok) {
+        const pfsData = await pfsResp.json();
+        return { success: true, url: pfsData.result?.url || pfsData.url || JSON.stringify(pfsData).slice(0, 200) };
+      }
+
+      return { success: false, error: "All upload URLs failed" };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  }, { base64Data: base64, mime: mimeType, name: fileName });
+
+  return result;
+}
+
+async function searchCategoryAPI(page, searchTerm) {
+  // 在页面中调用分类搜索 API
+  const result = await page.evaluate(async (term) => {
+    try {
+      const resp = await fetch("/anniston-agent-seller/category/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keyword: term }),
+        credentials: "include",
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        return data.result || data;
+      }
+    } catch {}
+    return null;
+  }, searchTerm);
+  return result;
+}
+
+async function createProductViaAPI(params) {
+  console.error("[api-create] Starting API-based product creation...");
+
+  // Step 1: 打开一个 Temu 页面获取认证上下文
+  const page = await context.newPage();
+  try {
+    await navigateToSellerCentral(page, "/goods/list");
+    await randomDelay(5000, 8000);
+    await saveCookies();
+
+    // Step 2: AI 生成图片（如果需要）
+    let imageUrls = params.imageUrls || []; // 已有的 kwcdn URLs
+    if (params.generateAI && params.sourceImage) {
+      console.error("[api-create] Generating AI images...");
+      const aiResult = await generateAIImages(
+        params.sourceImage,
+        params.title,
+        params.aiImageTypes || ["hero", "lifestyle", "closeup", "infographic", "size_chart"]
+      );
+      const aiImages = aiResult.images || aiResult || [];
+      console.error(`[api-create] AI generated ${aiImages.length} images`);
+
+      // Step 3: 上传图片到素材中心获取 kwcdn URLs
+      if (aiImages.length > 0) {
+        console.error("[api-create] Uploading images to material center...");
+        for (const imgPath of aiImages) {
+          const uploadResult = await uploadImageToMaterial(page, imgPath);
+          if (uploadResult.success && uploadResult.url?.includes("http")) {
+            imageUrls.push(uploadResult.url);
+            console.error(`[api-create] Uploaded: ${uploadResult.url.slice(0, 60)}`);
+          } else {
+            console.error(`[api-create] Upload failed: ${uploadResult.error || uploadResult.url}`);
+          }
+        }
+      }
+    }
+
+    if (imageUrls.length === 0) {
+      return { success: false, message: "没有可用的商品图片" };
+    }
+
+    // Step 4: 搜索分类获取 catId
+    let catIds = params.catIds; // 用户直接提供分类ID
+    if (!catIds) {
+      console.error(`[api-create] Searching category for: ${params.title?.slice(0, 30)}`);
+      const catResult = await searchCategoryAPI(page, params.title || params.categorySearch);
+      if (catResult?.list?.[0] || catResult?.[0]) {
+        const cat = catResult.list?.[0] || catResult[0];
+        catIds = {
+          cat1Id: cat.cat1Id || 0, cat2Id: cat.cat2Id || 0, cat3Id: cat.cat3Id || 0,
+          cat4Id: cat.cat4Id || 0, cat5Id: cat.cat5Id || 0,
+        };
+        console.error(`[api-create] Category: ${JSON.stringify(catIds)}`);
+      }
+    }
+
+    if (!catIds) {
+      return { success: false, message: "分类搜索失败" };
+    }
+
+    // Step 5: 构造创建商品 payload
+    const price = Math.round((params.price || 9.99) * 100); // 转为分
+    const retailPrice = Math.round(price * 4); // 建议零售价 = 申报价 × 4
+    const randomLetter = String.fromCharCode(65 + Math.floor(Math.random() * 26));
+
+    const payload = {
+      ...catIds,
+      cat6Id: 0, cat7Id: 0, cat8Id: 0, cat9Id: 0, cat10Id: 0,
+      productName: params.title || "商品",
+      carouselImageUrls: imageUrls.slice(0, 10),
+      carouselImageI18nReqs: [],
+      materialImgUrl: imageUrls[0],
+      materialMultiLanguages: [],
+      personalizationSwitch: 0,
+      productCarouseVideoReqList: [],
+      productDetailVideoReqList: [],
+      goodsAdvantageLabelTypes: [],
+      goodsLayerDecorationReqs: [],
+      goodsLayerDecorationCustomizeI18nReqs: [],
+      goodsModelReqs: [],
+      sizeTemplateIds: [],
+      showSizeTemplateIds: [],
+      productPropertyReqs: params.properties || [],
+      productWhExtAttrReq: {
+        outerGoodsUrl: "",
+        productOrigin: {
+          countryShortName: "CN",
+          region2Id: 43000000000031, // 浙江省
+        },
+      },
+      productComplianceStatementReq: { protocolVersion: "V1" },
+      productSpecPropertyReqs: [{
+        parentSpecId: 1001, parentSpecName: "颜色",
+        specId: 18112, specName: randomLetter,
+        vid: 0, specLangSimpleList: [], refPid: 0, pid: 0, templatePid: 0,
+        propName: "颜色", propValue: randomLetter,
+        valueUnit: "", valueGroupId: 0, valueGroupName: "", valueExtendInfo: "",
+      }],
+      productSkcReqs: [{
+        previewImgUrls: [imageUrls[0]],
+        productSkcCarouselImageI18nReqs: [],
+        extCode: "",
+        mainProductSkuSpecReqs: [{ parentSpecId: 0, parentSpecName: "", specId: 0, specName: "" }],
+        productSkuReqs: [{
+          thumbUrl: imageUrls[0],
+          productSkuThumbUrlI18nReqs: [],
+          extCode: "",
+          supplierPrice: price,
+          currencyType: "CNY",
+          productSkuSpecReqs: [{
+            parentSpecId: 1001, parentSpecName: "颜色",
+            specId: 18112, specName: randomLetter,
+            specLangSimpleList: [],
+          }],
+          productSkuId: 0,
+          productSkuSuggestedPriceReq: { suggestedPrice: retailPrice, suggestedPriceCurrencyType: "CNY" },
+          productSkuUsSuggestedPriceReq: {},
+          productSkuWhExtAttrReq: {
+            productSkuVolumeReq: { len: 80, width: 70, height: 60 },
+            productSkuWeightReq: { value: 50000 }, // 50g = 50000mg
+            productSkuBarCodeReqs: [],
+            productSkuSensitiveAttrReq: { isSensitive: 0, sensitiveList: [] },
+            productSkuSensitiveLimitReq: {},
+          },
+          productSkuMultiPackReq: {
+            skuClassification: 1, numberOfPieces: 1, pieceUnitCode: 1,
+            productSkuNetContentReq: { netContentNumber: 8000, netContentUnitCode: 1 },
+            totalNetContent: {},
+          },
+          productSkuAccessoriesReq: { productSkuAccessories: [] },
+          productSkuNonAuditExtAttrReq: {},
+        }],
+        productSkcId: 0,
+        isBasePlate: 0,
+      }],
+      productOuterPackageImageReqs: [],
+    };
+
+    // Step 6: 调用创建商品 API
+    console.error("[api-create] Calling product/add API...");
+    const createResult = await page.evaluate(async (body) => {
+      try {
+        const resp = await fetch("/visage-agent-seller/product/add", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          credentials: "include",
+        });
+        const data = await resp.json();
+        return data;
+      } catch (e) {
+        return { error: e.message };
+      }
+    }, payload);
+
+    console.error("[api-create] Result:", JSON.stringify(createResult).slice(0, 200));
+
+    if (createResult.success || createResult.errorCode === 1000000) {
+      console.error("[api-create] Product created successfully!");
+      return { success: true, message: "商品创建成功（API方式）", result: createResult };
+    } else {
+      return { success: false, message: createResult.errorMsg || createResult.error || "创建失败", result: createResult };
+    }
+
+  } finally {
+    if (!params.keepOpen) await page.close();
+  }
+}
+
+async function batchCreateViaAPI(params) {
+  console.error("[batch-api] Starting batch API creation...");
+  const csvPath = params.csvPath;
+  if (!csvPath || !fs.existsSync(csvPath)) {
+    return { success: false, message: "CSV文件不存在: " + csvPath };
+  }
+
+  const csvContent = fs.readFileSync(csvPath, "utf8");
+  const lines = csvContent.split("\n").filter(l => l.trim());
+  const headers = lines[0];
+  const startRow = params.startRow || 0;
+  const count = params.count || 1;
+  const results = [];
+
+  // 解析CSV列
+  const colIndex = (name) => {
+    const cols = headers.split(",");
+    return cols.findIndex(c => c.trim().includes(name));
+  };
+  const nameIdx = colIndex("商品名称");
+  const imageIdx = colIndex("商品原图");
+  const catCnIdx = colIndex("分类（中文）");
+  const priceIdx = colIndex("美元价格");
+
+  for (let i = startRow; i < Math.min(startRow + count, lines.length - 1); i++) {
+    const row = lines[i + 1]; // +1 skip header
+    const cols = [];
+    let c = "", q = false;
+    for (const ch of row) {
+      if (ch === '"') q = !q;
+      else if (ch === ',' && !q) { cols.push(c.trim()); c = ""; }
+      else c += ch;
+    }
+    cols.push(c.trim());
+
+    const productName = cols[nameIdx] || "";
+    const imageUrl = cols[imageIdx] || "";
+    const priceUSD = parseFloat(cols[priceIdx]) || 0;
+    const priceCNY = priceUSD > 0 ? priceUSD * 7 : 9.99;
+
+    console.error(`[batch-api] Product ${i + 1}: ${productName.slice(0, 30)} ¥${priceCNY.toFixed(2)}`);
+
+    // 下载竞品主图
+    let localImage = null;
+    if (imageUrl?.startsWith("http")) {
+      try {
+        const imgResp = await fetch(imageUrl);
+        const imgBuf = Buffer.from(await imgResp.arrayBuffer());
+        const imgDir = path.join(process.env.APPDATA || "", "temu-automation", "ai-images");
+        fs.mkdirSync(imgDir, { recursive: true });
+        localImage = path.join(imgDir, `csv_${i}_${Date.now()}.jpg`);
+        fs.writeFileSync(localImage, imgBuf);
+      } catch (e) {
+        console.error(`[batch-api] Download failed: ${e.message}`);
+      }
+    }
+
+    const result = await createProductViaAPI({
+      title: productName,
+      sourceImage: localImage,
+      generateAI: params.generateAI !== false,
+      aiImageTypes: params.aiImageTypes || ["hero", "lifestyle", "closeup", "infographic", "size_chart"],
+      price: priceCNY,
+      keepOpen: false,
+    });
+
+    results.push({ index: i, name: productName.slice(0, 30), ...result });
+
+    // 间隔3-5分钟（控制频率避免封号）
+    if (i < startRow + count - 1) {
+      const waitMin = 3 + Math.random() * 2;
+      console.error(`[batch-api] Waiting ${waitMin.toFixed(1)} minutes before next...`);
+      await new Promise(r => setTimeout(r, waitMin * 60000));
+    }
+  }
+
+  const successCount = results.filter(r => r.success).length;
+  console.error(`[batch-api] Done! ${successCount}/${results.length} succeeded`);
+  return { success: true, results, successCount, failCount: results.length - successCount };
 }
 
 const server = http.createServer(async (req, res) => {
