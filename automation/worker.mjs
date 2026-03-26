@@ -5041,21 +5041,40 @@ async function uploadImageToMaterial(page, localImagePath) {
 }
 
 async function searchCategoryAPI(page, searchTerm) {
-  // 在页面中调用分类搜索 API
-  const result = await page.evaluate(async (term) => {
-    try {
-      const resp = await fetch("/anniston-agent-seller/category/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keyword: term }),
-        credentials: "include",
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        return data.result || data;
+  // 在页面中用 XHR 调用分类搜索 API（自动带签名）
+  const result = await page.evaluate((term) => {
+    return new Promise((resolve) => {
+      // 尝试多个可能的分类搜索 API
+      const urls = [
+        "/anniston-agent-seller/category/search",
+        "/anniston-agent-seller/category/children/list",
+        "/visage-agent-seller/category/search",
+      ];
+      let tried = 0;
+      function tryNext() {
+        if (tried >= urls.length) { resolve(null); return; }
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", urls[tried], true);
+        xhr.setRequestHeader("Content-Type", "application/json");
+        xhr.withCredentials = true;
+        xhr.onreadystatechange = function() {
+          if (xhr.readyState === 4) {
+            try {
+              const data = JSON.parse(xhr.responseText);
+              if (data.result && (data.errorCode === 1000000 || data.success)) {
+                resolve(data.result);
+                return;
+              }
+            } catch {}
+            tried++;
+            tryNext();
+          }
+        };
+        xhr.onerror = () => { tried++; tryNext(); };
+        xhr.send(JSON.stringify({ keyword: term, pageNo: 1, pageSize: 10 }));
       }
-    } catch {}
-    return null;
+      tryNext();
+    });
   }, searchTerm);
   return result;
 }
@@ -5198,21 +5217,29 @@ async function createProductViaAPI(params) {
       productOuterPackageImageReqs: [],
     };
 
-    // Step 6: 调用创建商品 API
+    // Step 6: 调用创建商品 API（用 XMLHttpRequest 触发 Temu 签名拦截器）
     console.error("[api-create] Calling product/add API...");
-    const createResult = await page.evaluate(async (body) => {
-      try {
-        const resp = await fetch("/visage-agent-seller/product/add", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-          credentials: "include",
-        });
-        const data = await resp.json();
-        return data;
-      } catch (e) {
-        return { error: e.message };
-      }
+
+    // 方法：用 Temu 页面中的 XMLHttpRequest 发请求
+    // Temu 前端会拦截 XHR 并自动添加 anti-content/anti-token headers
+    const createResult = await page.evaluate((body) => {
+      return new Promise((resolve) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "/visage-agent-seller/product/add", true);
+        xhr.setRequestHeader("Content-Type", "application/json");
+        xhr.withCredentials = true;
+        xhr.onreadystatechange = function() {
+          if (xhr.readyState === 4) {
+            try {
+              resolve(JSON.parse(xhr.responseText));
+            } catch {
+              resolve({ error: xhr.responseText?.slice(0, 200), status: xhr.status });
+            }
+          }
+        };
+        xhr.onerror = () => resolve({ error: "XHR error", status: xhr.status });
+        xhr.send(JSON.stringify(body));
+      });
     }, payload);
 
     console.error("[api-create] Result:", JSON.stringify(createResult).slice(0, 200));
