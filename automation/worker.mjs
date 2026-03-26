@@ -2001,7 +2001,7 @@ async function batchCreateFromCSV(params) {
         aiImageTypes: params.aiImageTypes || ["hero", "lifestyle", "closeup", "infographic", "size_chart"],
         price: parseFloat(priceCNY),
         autoSubmit: params.autoSubmit || false,
-        keepOpen: false, // 批量模式不保持打开
+        keepOpen: params.keepOpen || false,
       });
 
       results.push({
@@ -3025,7 +3025,7 @@ async function autoCreateProduct(params) {
           const targetValue = defaultValues[r.field];
           if (targetValue) {
             const selectFirst = targetValue === "__FIRST__";
-            await page.evaluate((val, first) => {
+            await page.evaluate(({ val, first }) => {
               const options = document.querySelectorAll('[class*="option"], [class*="Option"], li[role="option"], [class*="item"]');
               const visible = Array.from(options).filter(o => {
                 if (!o.offsetParent) return false;
@@ -3033,14 +3033,12 @@ async function autoCreateProduct(params) {
                 return rect.height > 10 && rect.top > 0 && rect.width > 30;
               });
               if (!first && val) {
-                // 精确匹配
                 for (const opt of visible) {
                   if (opt.textContent?.trim()?.includes(val)) { opt.click(); return; }
                 }
               }
-              // 选第一个可见选项
               if (visible.length > 0) { visible[0].click(); }
-            }, targetValue, selectFirst);
+            }, { val: targetValue, first: selectFirst });
             // 按Escape关闭下拉框
             await page.keyboard.press("Escape").catch(() => {});
             await randomDelay(500, 1000);
