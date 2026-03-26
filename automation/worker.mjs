@@ -2589,38 +2589,14 @@ async function autoCreateProduct(params) {
                 }
               }
 
-              // 确保在"图片"视图（不是"上传列表"视图）
-              try {
-                await page.evaluate(() => {
-                  const els = document.querySelectorAll("span, div, button, a");
-                  for (const el of els) {
-                    const text = el.textContent?.trim() || "";
-                    if (text === "图片" && el.offsetParent !== null) {
-                      const rect = el.getBoundingClientRect();
-                      if (rect.width > 20 && rect.width < 100 && rect.top < 300) {
-                        el.click();
-                        return;
-                      }
-                    }
-                  }
-                });
-                await randomDelay(2000, 3000);
-              } catch {}
-
-              // 点击"刷新"
-              try {
-                await page.evaluate(() => {
-                  const els = document.querySelectorAll("a, span, div");
-                  for (const el of els) {
-                    if (el.textContent?.trim() === "刷新" && el.offsetParent !== null) {
-                      const rect = el.getBoundingClientRect();
-                      if (rect.top < 300) { el.click(); return; }
-                    }
-                  }
-                });
-                console.error("[create-product] Refreshed material list");
-                await randomDelay(3000, 5000);
-              } catch {}
+              // 关闭"上传列表"面板 — 点击空白区域即可关闭
+              console.error("[create-product] Closing upload list panel...");
+              await page.mouse.click(900, 400).catch(() => {}); // 点击素材网格区域
+              await randomDelay(2000, 3000);
+              // 再点一次确保关闭
+              await page.mouse.click(900, 300).catch(() => {});
+              await randomDelay(2000, 3000);
+              console.error("[create-product] Upload list closed");
             }
           } else {
             console.error("[create-product] '本地上传' element not found in DOM");
