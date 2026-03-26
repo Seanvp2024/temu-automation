@@ -2817,10 +2817,8 @@ async function autoCreateProduct(params) {
     console.error("[create-product] Step 6: Smart auto-fill required fields");
 
     // 默认值映射（字段关键词 → 要选择的值）
+    // 产地已在 6a 单独处理，不在这里重复操作
     const defaultValues = {
-      // 产地
-      "商品产地": "中国大陆",
-      "产地": "中国大陆",
       // 属性
       "可重用性": "否",
       "Reusability": "否",
