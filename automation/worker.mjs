@@ -5721,10 +5721,10 @@ ${propsForAI.map((p, i) => `${i + 1}. ${p.name}${p.required ? '(必填)' : '(选
   }
 
   // 后处理：检查父子关系冲突
-  // 如果电源方式=不带电/无，则移除工作电压、插头规格、电池相关等子属性
-  const powerProp = output.find(p => p.propName === "电源方式");
-  if (powerProp && /不带电|无|不需要/.test(powerProp.propValue)) {
-    const electricChildProps = ["工作电压", "插头规格", "额定功率", "电压", "功率", "瓦数", "电池数量", "电池类型", "电池容量", "充电时间", "充电方式"];
+  // 如果电源方式=不带电/无 或 电池属性=不带电池，则移除所有电相关子属性
+  const powerProp = output.find(p => p.propName === "电源方式" || p.propName === "电池属性");
+  if (powerProp && /不带电|无|不需要|不含/.test(powerProp.propValue)) {
+    const electricChildProps = ["工作电压", "插头规格", "额定功率", "电压", "功率", "瓦数", "电池数量", "电池类型", "电池容量", "充电时间", "充电方式", "可充电电池", "不可充电电池", "太阳能电池", "电池属性"];
     for (let i = output.length - 1; i >= 0; i--) {
       if (electricChildProps.some(n => output[i].propName.includes(n))) {
         console.error(`[getCategoryProperties] Remove child prop "${output[i].propName}" (parent 电源方式=不带电)`);
@@ -5742,7 +5742,7 @@ ${propsForAI.map((p, i) => `${i + 1}. ${p.name}${p.required ? '(必填)' : '(选
   }
 
   // 通用电池子属性兜底：如果有电池相关子属性但没有对应父属性，移除子属性
-  const batteryChildNames = ["电池数量", "电池类型", "电池容量", "充电时间", "充电方式"];
+  const batteryChildNames = ["电池数量", "电池类型", "电池容量", "充电时间", "充电方式", "可充电电池", "不可充电电池", "太阳能电池", "电池属性"];
   const hasBatteryParent = output.some(p => p.propName === "电源方式" || p.propName === "是否含电池");
   if (!hasBatteryParent) {
     for (let i = output.length - 1; i >= 0; i--) {
