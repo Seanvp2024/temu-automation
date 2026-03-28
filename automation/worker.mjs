@@ -6066,6 +6066,51 @@ async function createProductViaAPI(params) {
       console.error(`[api-create] Re-extracted leafCatId=${leafCatId} from catIds`);
     }
 
+    // Step 3.5: AI 验证分类是否匹配商品标题
+    if (catIds && params.title && AI_API_KEY) {
+      const catPath = Object.keys(catIds)
+        .filter(k => k.endsWith("Name") && catIds[k])
+        .map(k => catIds[k]).join(" > ");
+      if (catPath) {
+        try {
+          console.error(`[api-create] AI verifying category: "${catPath}" for "${params.title.slice(0, 30)}..."`);
+          const verifyResp = await fetch(`${AI_BASE_URL}/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${AI_API_KEY}` },
+            body: JSON.stringify({
+              model: AI_MODEL,
+              messages: [{ role: "user", content: `商品标题: "${params.title.slice(0, 80)}"\n分类路径: "${catPath}"\n\n这个分类是否适合该商品？只回答 "yes" 或 "no"。如果商品明显不属于这个分类就回答no。` }],
+              temperature: 0,
+              max_tokens: 10,
+            }),
+          });
+          if (verifyResp.ok) {
+            const vData = await verifyResp.json();
+            const answer = (vData.choices?.[0]?.message?.content || "").trim().toLowerCase();
+            console.error(`[api-create] Category verify: ${answer}`);
+            if (answer.includes("no")) {
+              console.error(`[api-create] Category mismatch! Re-searching with product title...`);
+              // 用标题重新搜索分类
+              const titleCatResult = await searchCategoryAPI(page, params.title);
+              if (titleCatResult?.list?.[0]) {
+                const cat = titleCatResult.list[0];
+                catIds = {};
+                for (let i = 1; i <= 10; i++) {
+                  catIds[`cat${i}Id`] = cat[`cat${i}Id`] || 0;
+                  if (cat[`cat${i}Name`]) catIds[`cat${i}Name`] = cat[`cat${i}Name`];
+                }
+                for (let i = 10; i >= 1; i--) {
+                  if (catIds[`cat${i}Id`] > 0) { leafCatId = catIds[`cat${i}Id`]; break; }
+                }
+                const newPath = Object.keys(catIds).filter(k => k.endsWith("Name") && catIds[k]).map(k => catIds[k]).join(" > ");
+                console.error(`[api-create] Re-searched category: ${newPath}, leaf=${leafCatId}`);
+              }
+            }
+          }
+        } catch (e) { logSilent("category.verify", e); }
+      }
+    }
+
     // Step 4: 获取分类属性和规格
     let properties = params.properties;
     if (!properties) {
