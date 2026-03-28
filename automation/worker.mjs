@@ -5688,8 +5688,22 @@ ${propsForAI.map((p, i) => `${i + 1}. ${p.name}${p.required ? '(必填)' : '(选
     }
 
     const valText = selectedVal.value || selectedVal.propValue || "";
-    const valVid = selectedVal.vid || selectedVal.valueId || 0;
-    if (valVid <= 0) continue;
+    let valVid = selectedVal.vid || selectedVal.valueId || 0;
+    if (valVid <= 0) {
+      // vid 为0：尝试从其他可选值中找一个有 vid 的
+      if (isRequired) {
+        const altVal = propValues.find(v => (v.vid || v.valueId || 0) > 0);
+        if (altVal) {
+          valVid = altVal.vid || altVal.valueId;
+          console.error(`[getCategoryProperties] vid=0 for "${propName}", using alt: "${altVal.value || altVal.propValue}" vid=${valVid}`);
+        } else {
+          console.error(`[getCategoryProperties] WARNING: "${propName}" has no valid vid, skipping`);
+          continue;
+        }
+      } else {
+        continue;
+      }
+    }
 
     output.push({
       valueUnit: (Array.isArray(p.valueUnit) ? p.valueUnit[0] : p.valueUnit) || "",
