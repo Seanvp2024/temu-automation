@@ -6196,7 +6196,7 @@ async function createProductViaAPI(params) {
         propName: specInfo.parentSpecName, propValue: specInfo.specName,
         valueUnit: "", valueGroupId: 0, valueGroupName: "", valueExtendInfo: "",
       }],
-      carouselImageUrls: imageUrls.slice(0, 10),
+      carouselImageUrls: imageUrls.slice(0, 5),
       carouselImageI18nReqs: [],
       materialImgUrl: imageUrls[0],
       goodsLayerDecorationReqs: [],
