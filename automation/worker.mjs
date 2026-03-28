@@ -5014,8 +5014,7 @@ const IMAGE_TYPE_ORDER = [
   "scene_b",    // 2. 核价场景图B
   "dimensions", // 3. 尺寸规格图
   "lifestyle",  // 4. 场景结果图
-  "packaging",  // 5. 差异化价值图
-  "lifestyle2", // 6. A+ 收束图
+  "lifestyle2", // 5. A+ 收束图
 ];
 
 const AI_IMAGE_GEN_URL = "http://localhost:3000";
