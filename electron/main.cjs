@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } = require("electron");
 const path = require("path");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -18,6 +18,13 @@ let mainWindow = null;
 let worker = null;
 let workerPort = 19280;
 let workerReady = false;
+const AUTO_PRICING_TASKS_KEY = "temu_auto_pricing_tasks";
+const AUTO_PRICING_TASK_LIMIT = 20;
+const CREATE_HISTORY_KEY = "temu_create_history";
+const ACCOUNT_STORE_KEY = "temu_accounts";
+let autoPricingTaskPromise = null;
+let autoPricingTaskSyncTimer = null;
+let autoPricingCurrentTaskId = null;
 
 // ============ 自动更新 ============
 
@@ -91,11 +98,17 @@ autoUpdater.on("error", (error) => {
 // ============ Worker 管理（HTTP 通信，彻底避免 stdio 继承） ============
 
 function findNodeExe() {
+  const bundledNode = app.isPackaged
+    ? path.join(process.resourcesPath, "node-runtime", "node.exe")
+    : path.join(app.getAppPath(), "build", "node-runtime", "node.exe");
   const candidates = [
-    "C:/New Folder/node.exe",
+    process.env.TEMU_NODE_RUNTIME,
+    process.env.NODE_EXE,
+    bundledNode,
+    process.execPath && process.execPath.toLowerCase().endsWith("node.exe") ? process.execPath : "",
     "C:/Program Files/nodejs/node.exe",
     "C:/Program Files (x86)/nodejs/node.exe",
-  ];
+  ].filter(Boolean);
   const pathDirs = (process.env.PATH || "").split(";");
   for (const dir of pathDirs) {
     candidates.push(path.join(dir, "node.exe"));
@@ -242,12 +255,16 @@ async function startWorker() {
 
   worker.on("exit", (code) => {
     console.log(`[Main] Worker exited: ${code}`);
+    markAutoPricingTaskInterrupted("批量上品任务已中断，worker 已退出。");
+    stopAutoPricingTaskSync();
     worker = null;
     workerReady = false;
   });
 
   worker.on("error", (err) => {
     try { console.error("[Main] Worker spawn error:", err.message); } catch {}
+    markAutoPricingTaskInterrupted("批量上品任务已中断，worker 启动失败。");
+    stopAutoPricingTaskSync();
     worker = null;
     workerReady = false;
   });
@@ -273,7 +290,407 @@ async function sendCmd(action, params = {}) {
   return httpPost(workerPort, { action, params });
 }
 
+function getDefaultAutoPricingState() {
+  return {
+    activeTaskId: null,
+    tasks: [],
+  };
+}
+
+function summarizeAutoPricingResults(results) {
+  const list = Array.isArray(results) ? results : [];
+  const successCount = list.filter((item) => item?.success).length;
+  return {
+    successCount,
+    failCount: list.length - successCount,
+  };
+}
+
+function isSafeStorageReady() {
+  try {
+    return safeStorage.isEncryptionAvailable();
+  } catch {
+    return false;
+  }
+}
+
+function encryptSecret(text) {
+  if (typeof text !== "string" || !text) return "";
+  if (!isSafeStorageReady()) return text;
+  try {
+    return `enc:${safeStorage.encryptString(text).toString("base64")}`;
+  } catch (error) {
+    console.error("[Store] Failed to encrypt secret:", error.message);
+    return text;
+  }
+}
+
+function decryptSecret(text) {
+  if (typeof text !== "string" || !text) return "";
+  if (!text.startsWith("enc:")) return text;
+  if (!isSafeStorageReady()) return "";
+  try {
+    return safeStorage.decryptString(Buffer.from(text.slice(4), "base64"));
+  } catch (error) {
+    console.error("[Store] Failed to decrypt secret:", error.message);
+    return "";
+  }
+}
+
+function serializeStoreValue(key, data) {
+  const normalized = data === undefined ? null : data;
+  if (key !== ACCOUNT_STORE_KEY || !Array.isArray(normalized)) {
+    return normalized;
+  }
+
+  const encrypted = isSafeStorageReady();
+  return {
+    __temuSecureStore: "accounts:v1",
+    encrypted,
+    accounts: normalized.map((account) => ({
+      ...account,
+      password: encrypted ? encryptSecret(account?.password) : (typeof account?.password === "string" ? account.password : ""),
+    })),
+  };
+}
+
+function deserializeStoreValue(key, data, filePath) {
+  if (key !== ACCOUNT_STORE_KEY) {
+    return data;
+  }
+
+  if (Array.isArray(data)) {
+    if (data.length > 0 && isSafeStorageReady()) {
+      try {
+        writeStoreJsonAtomic(filePath, data, { skipBackup: true, key });
+      } catch (error) {
+        console.error("[Store] Failed to migrate account store:", error.message);
+      }
+    }
+    return data;
+  }
+
+  if (!data || typeof data !== "object" || !Array.isArray(data.accounts)) {
+    return data;
+  }
+
+  return data.accounts.map((account) => ({
+    ...account,
+    password: data.encrypted ? decryptSecret(account?.password) : (typeof account?.password === "string" ? account.password : ""),
+  }));
+}
+
+function appendCreateHistoryEntries(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  if (list.length === 0) return;
+
+  const history = readStoreJsonWithRecovery(getStoreFilePath(CREATE_HISTORY_KEY));
+  const nextHistory = Array.isArray(history) ? [...history] : [];
+
+  list.forEach((entry) => {
+    nextHistory.unshift(entry);
+  });
+
+  writeStoreJsonAtomic(getStoreFilePath(CREATE_HISTORY_KEY), nextHistory.slice(0, 100));
+}
+
+function normalizeAutoPricingTask(task = {}) {
+  const results = Array.isArray(task.results) ? task.results : [];
+  const summary = summarizeAutoPricingResults(results);
+  return {
+    taskId: typeof task.taskId === "string" ? task.taskId : `pricing_${Date.now()}`,
+    status: typeof task.status === "string" ? task.status : "idle",
+    running: Boolean(task.running),
+    paused: Boolean(task.paused),
+    total: Number(task.total) || 0,
+    completed: Number(task.completed) || 0,
+    current: typeof task.current === "string" ? task.current : "",
+    step: typeof task.step === "string" ? task.step : "",
+    message: typeof task.message === "string" ? task.message : "",
+    csvPath: typeof task.csvPath === "string" ? task.csvPath : "",
+    startRow: Number(task.startRow) || 0,
+    count: Number(task.count) || 0,
+    results,
+    successCount: summary.successCount,
+    failCount: summary.failCount,
+    createdAt: typeof task.createdAt === "string" ? task.createdAt : "",
+    updatedAt: typeof task.updatedAt === "string" ? task.updatedAt : "",
+    startedAt: typeof task.startedAt === "string" ? task.startedAt : "",
+    finishedAt: typeof task.finishedAt === "string" ? task.finishedAt : "",
+  };
+}
+
+function readAutoPricingState() {
+  try {
+    const raw = readStoreJsonWithRecovery(getStoreFilePath(AUTO_PRICING_TASKS_KEY));
+    if (!raw || typeof raw !== "object") {
+      autoPricingCurrentTaskId = null;
+      return getDefaultAutoPricingState();
+    }
+    const tasks = Array.isArray(raw.tasks) ? raw.tasks.map((task) => normalizeAutoPricingTask(task)) : [];
+    const activeTaskId = typeof raw.activeTaskId === "string"
+      ? raw.activeTaskId
+      : (tasks[0]?.taskId || null);
+    autoPricingCurrentTaskId = activeTaskId;
+    return {
+      activeTaskId,
+      tasks,
+    };
+  } catch {
+    autoPricingCurrentTaskId = null;
+    return getDefaultAutoPricingState();
+  }
+}
+
+function writeAutoPricingState(state) {
+  const nextState = {
+    activeTaskId: typeof state?.activeTaskId === "string" ? state.activeTaskId : null,
+    tasks: Array.isArray(state?.tasks) ? state.tasks.map((task) => normalizeAutoPricingTask(task)) : [],
+  };
+  writeStoreJsonAtomic(getStoreFilePath(AUTO_PRICING_TASKS_KEY), nextState);
+  autoPricingCurrentTaskId = nextState.activeTaskId;
+  return nextState;
+}
+
+function getAutoPricingTask(taskId) {
+  const state = readAutoPricingState();
+  if (taskId) {
+    return state.tasks.find((task) => task.taskId === taskId) || null;
+  }
+  return state.tasks.find((task) => task.taskId === state.activeTaskId) || state.tasks[0] || null;
+}
+
+function listAutoPricingTasks() {
+  return readAutoPricingState().tasks;
+}
+
+function upsertAutoPricingTask(taskPatch) {
+  const state = readAutoPricingState();
+  const existing = state.tasks.find((task) => task.taskId === taskPatch.taskId);
+  const nextTask = normalizeAutoPricingTask({ ...existing, ...taskPatch });
+  const tasks = [
+    nextTask,
+    ...state.tasks.filter((task) => task.taskId !== nextTask.taskId),
+  ].slice(0, AUTO_PRICING_TASK_LIMIT);
+
+  writeAutoPricingState({
+    activeTaskId: nextTask.taskId,
+    tasks,
+  });
+
+  return nextTask;
+}
+
+function markAutoPricingTaskInterrupted(message) {
+  const activeTask = getAutoPricingTask(autoPricingCurrentTaskId);
+  if (!activeTask || !["running", "paused"].includes(activeTask.status)) {
+    return activeTask;
+  }
+  const now = new Date().toLocaleString("zh-CN");
+  return upsertAutoPricingTask({
+    ...activeTask,
+    status: "interrupted",
+    running: false,
+    paused: false,
+    message,
+    updatedAt: now,
+    finishedAt: activeTask.finishedAt || now,
+  });
+}
+
+async function requestWorkerProgressSnapshot(taskId) {
+  if (!workerReady) {
+    return { running: false };
+  }
+
+  try {
+    const pathWithQuery = taskId
+      ? `/progress?taskId=${encodeURIComponent(taskId)}`
+      : "/progress";
+    return await new Promise((resolve) => {
+      const req = http.request(
+        { hostname: "127.0.0.1", port: workerPort, method: "GET", path: pathWithQuery, timeout: 3000 },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+            catch { resolve({ running: false }); }
+          });
+        }
+      );
+      req.on("error", () => resolve({ running: false }));
+      req.on("timeout", () => { req.destroy(); resolve({ running: false }); });
+      req.end();
+    });
+  } catch {
+    return { running: false };
+  }
+}
+
+async function requestWorkerTaskSnapshots() {
+  if (!workerReady) {
+    return [];
+  }
+
+  try {
+    return await new Promise((resolve) => {
+      const req = http.request(
+        { hostname: "127.0.0.1", port: workerPort, method: "GET", path: "/tasks", timeout: 3000 },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            try {
+              const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+              resolve(Array.isArray(payload) ? payload : []);
+            } catch {
+              resolve([]);
+            }
+          });
+        }
+      );
+      req.on("error", () => resolve([]));
+      req.on("timeout", () => { req.destroy(); resolve([]); });
+      req.end();
+    });
+  } catch {
+    return [];
+  }
+}
+
+function hasWorkerTaskSnapshot(task) {
+  return Boolean(
+    task
+    && (
+      task.running
+      || task.paused
+      || task.current
+      || task.step
+      || task.total
+      || task.completed
+      || (Array.isArray(task.results) && task.results.length > 0)
+      || (typeof task.status === "string" && task.status !== "idle")
+    )
+  );
+}
+
+function mergeWorkerSnapshotIntoTask(task, live, fallbackTaskId) {
+  const baseTask = task || {};
+  const now = new Date().toLocaleString("zh-CN");
+  const isRunning = Boolean(live?.running);
+  const isPaused = Boolean(live?.paused);
+  const nextStatus = typeof live?.status === "string" && live.status
+    ? live.status
+    : (isRunning ? (isPaused ? "paused" : "running") : baseTask.status);
+  const nextResults = Array.isArray(live?.results) ? live.results : baseTask.results;
+  const nextCompleted = Number(live?.completed)
+    || (Array.isArray(live?.results) ? live.results.length : baseTask.completed);
+  const nextFinishedAt = !isRunning && !isPaused && ["completed", "failed", "interrupted"].includes(nextStatus)
+    ? (typeof live?.finishedAt === "string" && live.finishedAt ? live.finishedAt : (baseTask.finishedAt || now))
+    : "";
+
+  return upsertAutoPricingTask({
+    ...baseTask,
+    ...live,
+    taskId: typeof live?.taskId === "string" && live.taskId
+      ? live.taskId
+      : (baseTask.taskId || fallbackTaskId || `pricing_${Date.now()}`),
+    status: nextStatus,
+    running: isRunning,
+    paused: isPaused,
+    total: Number(live?.total) || baseTask.total,
+    completed: nextCompleted,
+    current: typeof live?.current === "string" ? live.current : baseTask.current,
+    step: typeof live?.step === "string" ? live.step : baseTask.step,
+    results: Array.isArray(nextResults) ? nextResults : [],
+    message: typeof live?.message === "string" && live.message ? live.message : baseTask.message,
+    updatedAt: typeof live?.updatedAt === "string" && live.updatedAt ? live.updatedAt : now,
+    finishedAt: nextFinishedAt,
+  });
+}
+
+async function syncAutoPricingTaskFromWorker(taskId, options = {}) {
+  const { markInterruptedOnIdle = false } = options;
+  const task = getAutoPricingTask(taskId || autoPricingCurrentTaskId);
+  if (!task) {
+    return null;
+  }
+
+  const live = await requestWorkerProgressSnapshot(task.taskId);
+
+  if (hasWorkerTaskSnapshot(live)) {
+    return mergeWorkerSnapshotIntoTask(task, live, task.taskId);
+  }
+
+  if (markInterruptedOnIdle && !autoPricingTaskPromise && ["running", "paused"].includes(task.status)) {
+    return markAutoPricingTaskInterrupted("任务已中断，应用或 worker 已重启，请重新发起批量上品。");
+  }
+
+  return task;
+}
+
+async function syncWorkerTaskSnapshotsToStore() {
+  const liveTasks = await requestWorkerTaskSnapshots();
+  if (!Array.isArray(liveTasks) || liveTasks.length === 0) {
+    return listAutoPricingTasks();
+  }
+
+  liveTasks.forEach((liveTask) => {
+    if (!hasWorkerTaskSnapshot(liveTask)) return;
+    mergeWorkerSnapshotIntoTask(getAutoPricingTask(liveTask.taskId), liveTask, liveTask.taskId);
+  });
+
+  return listAutoPricingTasks();
+}
+
+async function syncActiveAutoPricingTaskFromWorker(options = {}) {
+  return syncAutoPricingTaskFromWorker(autoPricingCurrentTaskId, options);
+}
+
+function startAutoPricingTaskSync() {
+  if (autoPricingTaskSyncTimer) return;
+  autoPricingTaskSyncTimer = setInterval(() => {
+    syncActiveAutoPricingTaskFromWorker({ markInterruptedOnIdle: true }).catch(() => {});
+  }, 3000);
+}
+
+function stopAutoPricingTaskSync() {
+  if (autoPricingTaskSyncTimer) {
+    clearInterval(autoPricingTaskSyncTimer);
+    autoPricingTaskSyncTimer = null;
+  }
+}
+
+function getAutoPricingProgressPayload(task) {
+  if (!task) {
+    return {
+      taskId: null,
+      status: "idle",
+      running: false,
+      paused: false,
+      total: 0,
+      completed: 0,
+      current: "",
+      step: "",
+      results: [],
+      successCount: 0,
+      failCount: 0,
+      message: "",
+      csvPath: "",
+      startRow: 0,
+      count: 0,
+      updatedAt: "",
+      createdAt: "",
+      startedAt: "",
+      finishedAt: "",
+    };
+  }
+  return normalizeAutoPricingTask(task);
+}
+
 function stopWorker() {
+  stopAutoPricingTaskSync();
   if (worker) {
     try { worker.kill(); } catch {}
     worker = null;
@@ -302,20 +719,37 @@ function updateImageStudioStatus(patch = {}) {
   return imageStudioStatus;
 }
 
+function dedupePaths(paths) {
+  const seen = new Set();
+  const list = [];
+  paths.filter(Boolean).forEach((item) => {
+    const normalized = path.resolve(item);
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    list.push(normalized);
+  });
+  return list;
+}
+
 function getAutoImageProjectCandidates() {
   const appDir = app.getAppPath();
-  const workspaceRoot = path.resolve(appDir, "..");
-  return [
+  const cwd = process.cwd();
+  return dedupePaths([
     process.env.AUTO_IMAGE_GEN_DIR,
-    "C:/Users/Administrator/auto-image-gen-dev",
-    path.resolve(workspaceRoot, "auto-image-gen-dev"),
-    path.resolve(workspaceRoot, "../auto-image-gen-dev"),
+    app.isPackaged ? path.join(process.resourcesPath, "auto-image-gen-runtime") : path.resolve(appDir, "build", "auto-image-gen-runtime"),
+    path.resolve(appDir, "auto-image-gen-dev"),
+    path.resolve(appDir, "..", "auto-image-gen-dev"),
+    path.resolve(appDir, "..", "build", "auto-image-gen-runtime"),
+    path.resolve(cwd, "auto-image-gen-dev"),
+    path.resolve(cwd, "..", "auto-image-gen-dev"),
+    path.resolve(cwd, "build", "auto-image-gen-runtime"),
     app.isPackaged ? path.join(process.resourcesPath, "auto-image-gen-runtime") : "",
-  ].filter(Boolean);
+  ]);
 }
 
 function resolveAutoImageProjectDir() {
-  for (const candidate of getAutoImageProjectCandidates()) {
+  const candidates = getAutoImageProjectCandidates();
+  for (const candidate of candidates) {
     try {
       const standaloneServerPath = path.join(candidate, "server.js");
       const standaloneBootstrapPath = path.join(candidate, "bootstrap.cjs");
@@ -326,14 +760,15 @@ function resolveAutoImageProjectDir() {
           projectPath: candidate,
           mode: "packaged-runtime",
           serverPath: fs.existsSync(standaloneBootstrapPath) ? standaloneBootstrapPath : standaloneServerPath,
+          searchedPaths: candidates,
         };
       }
       if (fs.existsSync(packageJsonPath) && fs.existsSync(nextBinPath)) {
-        return { projectPath: candidate, mode: "dev-project", nextBinPath };
+        return { projectPath: candidate, mode: "dev-project", nextBinPath, searchedPaths: candidates };
       }
     } catch {}
   }
-  return null;
+  return { searchedPaths: candidates };
 }
 
 function httpGet(url, timeout = 5000) {
@@ -374,8 +809,9 @@ function stopImageStudioService() {
 
 async function ensureImageStudioService() {
   const projectInfo = resolveAutoImageProjectDir();
-  if (!projectInfo) {
-    throw new Error("未找到 AI 出图运行时，请确认 auto-image-gen-dev 项目存在");
+  if (!projectInfo?.projectPath) {
+    const searched = (projectInfo?.searchedPaths || []).join("；");
+    throw new Error(`未找到 AI 出图运行时。请设置 AUTO_IMAGE_GEN_DIR，或确认这些目录之一存在可运行项目：${searched}`);
   }
   updateImageStudioStatus({ projectPath: projectInfo.projectPath });
 
@@ -565,15 +1001,152 @@ ipcMain.handle("automation:create-product", async (_e, params) => {
 });
 
 ipcMain.handle("automation:auto-pricing", async (_e, params) => {
-  return sendCmd("auto_pricing", params);
+  const existingTask = getAutoPricingTask(autoPricingCurrentTaskId);
+  if (existingTask && ["running", "paused"].includes(existingTask.status)) {
+    return {
+      accepted: false,
+      taskId: existingTask.taskId,
+      message: "已有批量上品任务正在执行，请先等待完成或恢复当前任务。",
+      task: getAutoPricingProgressPayload(existingTask),
+    };
+  }
+
+  await startWorker();
+
+  const now = new Date().toLocaleString("zh-CN");
+  const taskId = typeof params?.taskId === "string" && params.taskId.trim()
+    ? params.taskId.trim()
+    : `pricing_${Date.now()}`;
+
+  const nextTask = upsertAutoPricingTask({
+    taskId,
+    status: "running",
+    running: true,
+    paused: false,
+    total: Number(params?.count) || 0,
+    completed: 0,
+    current: "准备中...",
+    step: "初始化",
+    message: "批量上品任务已启动",
+    csvPath: typeof params?.csvPath === "string" ? params.csvPath : "",
+    startRow: Number(params?.startRow) || 0,
+    count: Number(params?.count) || 0,
+    results: [],
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    finishedAt: "",
+  });
+
+  startAutoPricingTaskSync();
+  autoPricingTaskPromise = sendCmd("auto_pricing", { ...params, taskId })
+    .then((result) => {
+      const finishedAt = new Date().toLocaleString("zh-CN");
+      appendCreateHistoryEntries((result?.results || []).map((item) => ({
+        title: item?.name || "商品",
+        status: item?.success ? "draft" : "failed",
+        message: item?.message || "",
+        productId: item?.productId || "",
+        createdAt: Date.now(),
+      })));
+      upsertAutoPricingTask({
+        ...nextTask,
+        taskId,
+        status: result?.success === false ? "failed" : "completed",
+        running: false,
+        paused: false,
+        total: Number(result?.total) || nextTask.total,
+        completed: Number(result?.total) || (Array.isArray(result?.results) ? result.results.length : nextTask.completed),
+        current: "完成",
+        step: result?.success === false ? "失败" : "完成",
+        message: result?.message || "批量上品任务已完成",
+        results: Array.isArray(result?.results) ? result.results : nextTask.results,
+        updatedAt: finishedAt,
+        finishedAt,
+      });
+      return result;
+    })
+    .catch(async (error) => {
+      const live = await requestWorkerProgressSnapshot(taskId);
+      if (live?.running || live?.paused) {
+        upsertAutoPricingTask({
+          ...nextTask,
+          taskId,
+          status: live.paused ? "paused" : "running",
+          running: Boolean(live.running),
+          paused: Boolean(live.paused),
+          total: Number(live.total) || nextTask.total,
+          completed: Number(live.completed) || nextTask.completed,
+          current: typeof live.current === "string" ? live.current : nextTask.current,
+          step: typeof live.step === "string" ? live.step : nextTask.step,
+          results: Array.isArray(live.results) ? live.results : nextTask.results,
+          updatedAt: new Date().toLocaleString("zh-CN"),
+          message: "与 worker 的长连接已断开，正在根据实时进度继续跟踪任务。",
+        });
+        return null;
+      }
+
+      const failedAt = new Date().toLocaleString("zh-CN");
+      upsertAutoPricingTask({
+        ...nextTask,
+        taskId,
+        status: "failed",
+        running: false,
+        paused: false,
+        current: "失败",
+        step: "失败",
+        message: error?.message || "批量上品任务失败",
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      });
+      return null;
+    })
+    .finally(async () => {
+      autoPricingTaskPromise = null;
+      const latestTask = await syncActiveAutoPricingTaskFromWorker({ markInterruptedOnIdle: true });
+      if (!latestTask || !latestTask.running) {
+        stopAutoPricingTaskSync();
+      }
+    });
+
+  return {
+    accepted: true,
+    taskId,
+    task: getAutoPricingProgressPayload(nextTask),
+  };
 });
 
-ipcMain.handle("automation:pause-pricing", async () => {
-  return sendCmd("pause_pricing");
+ipcMain.handle("automation:pause-pricing", async (_e, taskId) => {
+  const result = await sendCmd("pause_pricing", { taskId });
+  const activeTask = getAutoPricingTask(taskId || autoPricingCurrentTaskId);
+  if (activeTask) {
+    upsertAutoPricingTask({
+      ...activeTask,
+      status: "paused",
+      running: true,
+      paused: true,
+      message: "暂停请求已发送，当前商品处理完后停止。",
+      updatedAt: new Date().toLocaleString("zh-CN"),
+    });
+  }
+  return result;
 });
 
-ipcMain.handle("automation:resume-pricing", async () => {
-  return sendCmd("resume_pricing");
+ipcMain.handle("automation:resume-pricing", async (_e, taskId) => {
+  const result = await sendCmd("resume_pricing", { taskId });
+  const activeTask = getAutoPricingTask(taskId || autoPricingCurrentTaskId);
+  if (activeTask) {
+    upsertAutoPricingTask({
+      ...activeTask,
+      status: "running",
+      running: true,
+      paused: false,
+      message: "批量上品任务已恢复。",
+      updatedAt: new Date().toLocaleString("zh-CN"),
+    });
+  }
+  startAutoPricingTaskSync();
+  return result;
 });
 
 ipcMain.handle("automation:list-drafts", async () => {
@@ -589,21 +1162,19 @@ ipcMain.handle("automation:delete-draft", async (_e, draftId) => {
 });
 
 ipcMain.handle("automation:get-progress", async () => {
-  try {
-    return await new Promise((resolve, reject) => {
-      const req = http.request({ hostname: "127.0.0.1", port: workerPort, method: "GET", path: "/progress", timeout: 3000 }, (res) => {
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => {
-          try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
-          catch { resolve({ running: false }); }
-        });
-      });
-      req.on("error", () => resolve({ running: false }));
-      req.on("timeout", () => { req.destroy(); resolve({ running: false }); });
-      req.end();
-    });
-  } catch { return { running: false }; }
+  const syncedTask = await syncActiveAutoPricingTaskFromWorker({ markInterruptedOnIdle: true });
+  return getAutoPricingProgressPayload(syncedTask || getAutoPricingTask(autoPricingCurrentTaskId));
+});
+
+ipcMain.handle("automation:get-task-progress", async (_e, taskId) => {
+  await syncAutoPricingTaskFromWorker(taskId, { markInterruptedOnIdle: true });
+  return getAutoPricingProgressPayload(getAutoPricingTask(taskId));
+});
+
+ipcMain.handle("automation:list-tasks", async () => {
+  await syncWorkerTaskSnapshotsToStore();
+  await syncActiveAutoPricingTaskFromWorker({ markInterruptedOnIdle: true });
+  return listAutoPricingTasks().map((task) => getAutoPricingProgressPayload(task));
 });
 
 ipcMain.handle("automation:read-scrape-data", async (_e, key) => {
@@ -687,19 +1258,80 @@ ipcMain.handle("app:open-log-directory", async () => {
 
 // ============ 文件存储 IPC ============
 
-ipcMain.handle("store:get", (_, key) => {
-  const filePath = path.join(app.getPath("userData"), `${key}.json`);
+function getStoreFilePath(key) {
+  return path.join(app.getPath("userData"), `${key}.json`);
+}
+
+function getStoreBackupPath(filePath) {
+  return `${filePath}.bak`;
+}
+
+function readStoreJson(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+}
+
+function writeStoreJsonAtomic(filePath, data, options = {}) {
+  const { skipBackup = false, key } = options;
+  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  const backupPath = getStoreBackupPath(filePath);
+  const serialized = JSON.stringify(serializeStoreValue(key, data), null, 2);
+
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+
   try {
+    fs.writeFileSync(tempPath, serialized);
+
     if (fs.existsSync(filePath)) {
-      return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      if (!skipBackup) {
+        try {
+          fs.copyFileSync(filePath, backupPath);
+        } catch (error) {
+          console.error("[Store] Failed to create backup:", error.message);
+        }
+      }
+      fs.rmSync(filePath, { force: true });
     }
-  } catch {}
-  return null;
+
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try {
+      if (fs.existsSync(tempPath)) fs.rmSync(tempPath, { force: true });
+    } catch {}
+    throw error;
+  }
+}
+
+function readStoreJsonWithRecovery(filePath, key) {
+  const backupPath = getStoreBackupPath(filePath);
+
+  if (fs.existsSync(filePath)) {
+    try {
+      return deserializeStoreValue(key, readStoreJson(filePath), filePath);
+    } catch (error) {
+      console.error(`[Store] Failed to read ${path.basename(filePath)}:`, error.message);
+    }
+  }
+
+  if (!fs.existsSync(backupPath)) {
+    return null;
+  }
+
+  try {
+    const restored = readStoreJson(backupPath);
+    writeStoreJsonAtomic(filePath, restored, { skipBackup: true, key });
+    console.error(`[Store] Restored ${path.basename(filePath)} from backup`);
+    return deserializeStoreValue(key, restored, filePath);
+  } catch (error) {
+    console.error(`[Store] Failed to recover ${path.basename(filePath)} from backup:`, error.message);
+    return null;
+  }
+}
+
+ipcMain.handle("store:get", (_, key) => {
+  return readStoreJsonWithRecovery(getStoreFilePath(key), key);
 });
 
 ipcMain.handle("store:set", (_, key, data) => {
-  const filePath = path.join(app.getPath("userData"), `${key}.json`);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  writeStoreJsonAtomic(getStoreFilePath(key), data, { key });
   return true;
 });

@@ -1,12 +1,20 @@
 import { useState, useEffect } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { Card, Row, Col, Statistic, Tag, Tabs, Table, Descriptions, Image, Button, Empty, Spin, Typography, Space } from "antd";
+import { Alert, Card, Row, Col, Statistic, Tag, Tabs, Table, Descriptions, Image, Button, Empty, Spin, Typography, Space } from "antd";
 import {
   ArrowLeftOutlined, ShoppingOutlined, LineChartOutlined, InboxOutlined,
   DollarOutlined, RiseOutlined, WarningOutlined, CustomerServiceOutlined,
   EyeOutlined, SafetyCertificateOutlined, BarChartOutlined,
 } from "@ant-design/icons";
-import { parseProductsData, parseOrdersData, parseSalesData } from "../utils/parseRawApis";
+import {
+  COLLECTION_DIAGNOSTICS_KEY,
+  getCollectionDataIssue,
+  normalizeCollectionDiagnostics,
+  type CollectionDiagnostics,
+} from "../utils/collectionDiagnostics";
+import { parseProductsData, parseOrdersData, parseSalesData, parseFluxData } from "../utils/parseRawApis";
+import { getFirstExistingStoreValue, getStoreValue, STORE_KEY_ALIASES } from "../utils/storeCompat";
+import { ACTIVE_ACCOUNT_CHANGED_EVENT } from "../utils/multiStore";
 
 const { Title, Paragraph } = Typography;
 const store = window.electronAPI?.store;
@@ -27,6 +35,28 @@ interface ProductInfo {
   skcStatus?: number;
 }
 
+interface DetailDataSources {
+  sales: boolean;
+  orders: boolean;
+  afterSales: boolean;
+  flux: boolean;
+  quality: boolean;
+  checkup: boolean;
+  goodsData: boolean;
+  marketingActivity: boolean;
+}
+
+const EMPTY_DATA_SOURCES: DetailDataSources = {
+  sales: false,
+  orders: false,
+  afterSales: false,
+  flux: false,
+  quality: false,
+  checkup: false,
+  goodsData: false,
+  marketingActivity: false,
+};
+
 function findInRawStore(rawData: any, apiPathFragment: string): any {
   if (!rawData?.apis) return null;
   const api = rawData.apis.find((a: any) => a.path?.includes(apiPathFragment));
@@ -37,6 +67,23 @@ function safeRender(val: any): string {
   if (val === null || val === undefined) return "-";
   if (typeof val === "object") return JSON.stringify(val).slice(0, 100);
   return String(val);
+}
+
+function buildProductIdCandidates(id: string | undefined, product?: Partial<ProductInfo> | null) {
+  return new Set(
+    [
+      id,
+      product?.skcId,
+      product?.spuId,
+      product?.goodsId,
+    ]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+  );
+}
+
+function matchesRecordByCandidateIds(record: any, fields: string[], candidates: Set<string>) {
+  return fields.some((field) => candidates.has(String(record?.[field] || "").trim()));
 }
 
 export default function ProductDetail() {
@@ -54,121 +101,224 @@ export default function ProductDetail() {
   const [goodsSalesData, setGoodsSalesData] = useState<any>(null);
   const [marketingActivities, setMarketingActivities] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [diagnostics, setDiagnostics] = useState<CollectionDiagnostics | null>(null);
+  const [dataSources, setDataSources] = useState<DetailDataSources>(EMPTY_DATA_SOURCES);
 
   useEffect(() => {
     loadProduct();
   }, [id]);
 
+  useEffect(() => {
+    const handleActiveAccountChanged = () => {
+      void loadProduct();
+    };
+    window.addEventListener(ACTIVE_ACCOUNT_CHANGED_EVENT, handleActiveAccountChanged);
+    return () => {
+      window.removeEventListener(ACTIVE_ACCOUNT_CHANGED_EVENT, handleActiveAccountChanged);
+    };
+  }, [id]);
+
   const loadProduct = async () => {
     setLoading(true);
+    setProduct(null);
+    setSalesInfo(null);
+    setOrders([]);
+    setAfterSalesRecords([]);
+    setFlowPriceInfo(null);
+    setRetailPriceInfo([]);
+    setFluxItems([]);
+    setQualityInfo(null);
+    setCheckupInfo(null);
+    setGoodsSalesData(null);
+    setMarketingActivities([]);
+    setDataSources(EMPTY_DATA_SOURCES);
     try {
+      setDiagnostics(normalizeCollectionDiagnostics(await getStoreValue(store, COLLECTION_DIAGNOSTICS_KEY)));
+      const nextSources: DetailDataSources = { ...EMPTY_DATA_SOURCES };
+      let resolvedProduct: ProductInfo | null = null;
+      let productIdCandidates = buildProductIdCandidates(id);
+      let fallbackProduct: ProductInfo | null = null;
+
       // Load product by skcId
-      const rawProducts = await store?.get("temu_products");
+      const rawProducts = await getStoreValue(store, "temu_products");
       if (rawProducts) {
         const products = parseProductsData(rawProducts);
         const found = products.find((p: any) => String(p.skcId) === id || String(p.spuId) === id || String(p.goodsId) === id);
-        if (found) setProduct(found);
+        if (found) {
+          resolvedProduct = found;
+          productIdCandidates = buildProductIdCandidates(id, found);
+          setProduct(found);
+        }
       }
 
       // Load related sales data
-      const rawSales = await store?.get("temu_sales");
+      const rawSales = await getStoreValue(store, "temu_sales");
       if (rawSales) {
+        nextSources.sales = true;
         const sales = parseSalesData(rawSales);
-        const salesItem = sales?.items?.find((s: any) => String(s.skcId) === id);
-        if (salesItem) setSalesInfo(salesItem);
+        const salesItem = sales?.items?.find((item: any) => matchesRecordByCandidateIds(item, ["skcId", "spuId"], productIdCandidates));
+        if (salesItem) {
+          setSalesInfo(salesItem);
+          if (!resolvedProduct) {
+            fallbackProduct = {
+              title: salesItem.title || "未命名商品",
+              category: salesItem.category || "",
+              categories: salesItem.category || "",
+              spuId: String(salesItem.spuId || ""),
+              skcId: String(salesItem.skcId || ""),
+              goodsId: "",
+              sku: salesItem.skuCode || "",
+              imageUrl: salesItem.imageUrl || "",
+              status: "",
+              totalSales: salesItem.totalSales || 0,
+              last7DaysSales: salesItem.last7DaysSales || 0,
+            };
+          }
+        }
       }
 
       // Load related orders
-      const rawOrders = await store?.get("temu_orders");
+      const rawOrders = await getStoreValue(store, "temu_orders");
       if (rawOrders) {
+        nextSources.orders = true;
         const allOrders = parseOrdersData(rawOrders);
-        const related = allOrders.filter((o: any) => String(o.skcId) === id);
+        const related = allOrders.filter((item: any) => matchesRecordByCandidateIds(item, ["skcId", "spuId"], productIdCandidates));
         setOrders(related);
+        if (!resolvedProduct && !fallbackProduct && related.length > 0) {
+          fallbackProduct = {
+            title: related[0].title || "未命名商品",
+            category: "",
+            categories: "",
+            spuId: "",
+            skcId: String(related[0].skcId || ""),
+            goodsId: "",
+            sku: related[0].skuCode || "",
+            imageUrl: "",
+            status: "",
+            totalSales: 0,
+            last7DaysSales: 0,
+          };
+        }
       }
 
       // Load after-sales records
-      const rawAfterSales = await store?.get("temu_raw_afterSales");
+      const rawAfterSales = await getStoreValue(store, "temu_raw_afterSales");
       if (rawAfterSales) {
+        nextSources.afterSales = true;
         const result = findInRawStore(rawAfterSales, "queryPageV3");
         if (result) {
           const list = result?.pageItems || result?.list || (Array.isArray(result) ? result : []);
-          const matched = list.filter((r: any) => String(r.productSkcId) === id || String(r.skcId) === id);
+          const matched = list.filter((item: any) => matchesRecordByCandidateIds(item, ["productSkcId", "skcId", "goodsId", "productId"], productIdCandidates));
           setAfterSalesRecords(matched);
         }
       }
 
       // Load flow price / high price data
-      const rawFlowPrice = await store?.get("temu_raw_flowPrice");
+      const rawFlowPrice = await getStoreValue(store, "temu_raw_flowPrice");
       if (rawFlowPrice) {
         const result = findInRawStore(rawFlowPrice, "highPriceFlowReduce") || findInRawStore(rawFlowPrice, "high/price");
         if (result) {
           const list = result?.pageItems || result?.list || (Array.isArray(result) ? result : []);
-          const matched = list.find((r: any) => String(r.productSkcId) === id || String(r.skcId) === id);
+          const matched = list.find((item: any) => matchesRecordByCandidateIds(item, ["productSkcId", "skcId", "goodsId", "spuId"], productIdCandidates));
           if (matched) setFlowPriceInfo(matched);
         }
       }
 
       // Load retail price data
-      const rawRetailPrice = await store?.get("temu_raw_retailPrice");
+      const rawRetailPrice = await getStoreValue(store, "temu_raw_retailPrice");
       if (rawRetailPrice) {
         const result = findInRawStore(rawRetailPrice, "suggestedPrice/pageQuery") || findInRawStore(rawRetailPrice, "suggestedPrice");
         if (result) {
           const list = result?.pageItems || result?.list || (Array.isArray(result) ? result : []);
-          const matched = list.filter((r: any) => String(r.productSkcId) === id || String(r.skcId) === id);
+          const matched = list.filter((item: any) => matchesRecordByCandidateIds(item, ["productSkcId", "skcId", "goodsId", "spuId"], productIdCandidates));
           setRetailPriceInfo(matched);
         }
       }
 
       // Load traffic/flux data
-      const rawFlux = await store?.get("temu_flux");
-      if (rawFlux?.items) {
-        const productFlux = rawFlux.items.map((day: any) => {
-          const prod = day.products?.find((p: any) => String(p.goodsId) === id || String(p.productSkcId) === id);
-          return prod ? { date: day.date, ...prod } : null;
-        }).filter(Boolean);
-        setFluxItems(productFlux);
+      const rawFlux = await getStoreValue(store, "temu_flux");
+      if (rawFlux) {
+        nextSources.flux = true;
+        const parsedFlux = parseFluxData(rawFlux);
+        const candidateIds = new Set(
+          [id, resolvedProduct?.goodsId, resolvedProduct?.spuId, resolvedProduct?.skcId]
+            .map((value) => String(value || "").trim())
+            .filter(Boolean),
+        );
+        const matchedFluxItems = Array.isArray(parsedFlux?.items)
+          ? parsedFlux.items.filter((item: any) => (
+              candidateIds.has(String(item.goodsId || ""))
+              || candidateIds.has(String(item.spuId || ""))
+            ))
+          : [];
+        setFluxItems(matchedFluxItems);
+        if (!resolvedProduct && !fallbackProduct && matchedFluxItems.length > 0) {
+          fallbackProduct = {
+            title: matchedFluxItems[0].goodsName || "未命名商品",
+            category: matchedFluxItems[0].category || "",
+            categories: matchedFluxItems[0].category || "",
+            spuId: String(matchedFluxItems[0].spuId || ""),
+            skcId: "",
+            goodsId: String(matchedFluxItems[0].goodsId || ""),
+            sku: "",
+            imageUrl: matchedFluxItems[0].imageUrl || "",
+            status: "",
+            totalSales: 0,
+            last7DaysSales: 0,
+          };
+        }
       }
 
       // Load quality dashboard data
-      const rawQuality = await store?.get("temu_raw_qualityDashboard");
+      const rawQuality = await getStoreValue(store, "temu_raw_qualityDashboard");
       if (rawQuality) {
+        nextSources.quality = true;
         const result = findInRawStore(rawQuality, "qualityMetrics/pageQuery");
         if (result?.pageItems) {
-          const matched = result.pageItems.find((r: any) => String(r.productSkcId) === id);
+          const matched = result.pageItems.find((item: any) => matchesRecordByCandidateIds(item, ["productSkcId", "skcId"], productIdCandidates));
           if (matched) setQualityInfo(matched);
         }
       }
 
       // Load checkup data
-      const rawCheckup = await store?.get("temu_raw_checkup");
+      const rawCheckup = await getStoreValue(store, "temu_raw_checkup");
       if (rawCheckup) {
+        nextSources.checkup = true;
         const result = findInRawStore(rawCheckup, "check/product/list");
         if (result?.list) {
-          const matched = result.list.find((r: any) => String(r.productSkcId) === id);
+          const matched = result.list.find((item: any) => matchesRecordByCandidateIds(item, ["productSkcId", "skcId", "goodsId"], productIdCandidates));
           if (matched) setCheckupInfo(matched);
         }
       }
 
       // Load goods sales data
-      const rawGoodsData = await store?.get("temu_goods_data");
+      const rawGoodsData = await getFirstExistingStoreValue(store, STORE_KEY_ALIASES.goodsData);
       if (rawGoodsData) {
+        nextSources.goodsData = true;
         const result = findInRawStore(rawGoodsData, "skc/sales/data");
         if (result?.skcSalesDataList) {
-          const matched = result.skcSalesDataList.find((r: any) => String(r.skcExtId) === id);
+          const matched = result.skcSalesDataList.find((item: any) => matchesRecordByCandidateIds(item, ["skcExtId", "productSkcId", "skcId", "goodsId", "spuId"], productIdCandidates));
           if (matched) setGoodsSalesData(matched);
         }
       }
 
       // Load marketing activity data
-      const rawMarketing = await store?.get("temu_marketing_activity");
+      const rawMarketing = await getFirstExistingStoreValue(store, STORE_KEY_ALIASES.marketingActivity);
       if (rawMarketing) {
+        nextSources.marketingActivity = true;
         const result = findInRawStore(rawMarketing, "activity/list");
         if (result?.activityList) {
           setMarketingActivities(result.activityList);
         }
       }
+      if (!resolvedProduct && fallbackProduct) {
+        setProduct(fallbackProduct);
+      }
+      setDataSources(nextSources);
     } catch (e) {
       console.error("加载商品详情失败", e);
+      setDiagnostics(null);
+      setDataSources(EMPTY_DATA_SOURCES);
     } finally {
       setLoading(false);
     }
@@ -188,6 +338,16 @@ export default function ProductDetail() {
   }
 
   const p = product;
+  const dataIssues = [
+    getCollectionDataIssue(diagnostics, "sales", "销售数据", dataSources.sales),
+    getCollectionDataIssue(diagnostics, "orders", "备货单数据", dataSources.orders),
+    getCollectionDataIssue(diagnostics, "flux", "流量数据", dataSources.flux),
+    getCollectionDataIssue(diagnostics, "afterSales", "售后数据", dataSources.afterSales),
+    getCollectionDataIssue(diagnostics, "qualityDashboard", "质量数据", dataSources.quality),
+    getCollectionDataIssue(diagnostics, "checkup", "体检数据", dataSources.checkup),
+    getCollectionDataIssue(diagnostics, "goodsData", "销售明细", dataSources.goodsData),
+    getCollectionDataIssue(diagnostics, "marketingActivity", "营销活动", dataSources.marketingActivity),
+  ].filter((issue): issue is string => Boolean(issue));
 
   const tabItems = [
     {
@@ -226,12 +386,19 @@ export default function ProductDetail() {
           <Table
             dataSource={fluxItems.map((item: any, i: number) => ({ ...item, key: i }))}
             columns={[
-              { title: "日期", dataIndex: "date", key: "date", render: (v: any) => safeRender(v) },
+              { title: "商品ID", dataIndex: "goodsId", key: "goodsId", render: (v: any) => safeRender(v) },
               { title: "曝光量", dataIndex: "exposeNum", key: "exposeNum", render: (v: any) => safeRender(v) },
               { title: "点击量", dataIndex: "clickNum", key: "clickNum", render: (v: any) => safeRender(v) },
-              { title: "详情访问", dataIndex: "detailVisit", key: "detailVisit", render: (v: any) => safeRender(v) },
-              { title: "加购人数", dataIndex: "addCartNum", key: "addCartNum", render: (v: any) => safeRender(v) },
-              { title: "支付人数", dataIndex: "payNum", key: "payNum", render: (v: any) => safeRender(v) },
+              { title: "详情访问", dataIndex: "detailVisitNum", key: "detailVisitNum", render: (v: any) => safeRender(v) },
+              { title: "加购人数", dataIndex: "addToCartUserNum", key: "addToCartUserNum", render: (v: any) => safeRender(v) },
+              { title: "支付买家", dataIndex: "buyerNum", key: "buyerNum", render: (v: any) => safeRender(v) },
+              { title: "支付件数", dataIndex: "payGoodsNum", key: "payGoodsNum", render: (v: any) => safeRender(v) },
+              {
+                title: "点击支付转化率",
+                dataIndex: "clickPayRate",
+                key: "clickPayRate",
+                render: (v: any) => typeof v === "number" ? `${(v * 100).toFixed(2)}%` : safeRender(v),
+              },
             ]}
             size="small"
             pagination={{ pageSize: 10 }}
@@ -431,6 +598,20 @@ export default function ProductDetail() {
           </Space>
         </div>
       </div>
+
+      {dataIssues.length > 0 && (
+        <Alert
+          style={{ marginBottom: 16 }}
+          type="warning"
+          showIcon
+          message="部分数据源尚未就绪"
+          description={[
+            dataIssues.slice(0, 4).join("；"),
+            dataIssues.length > 4 ? `另有 ${dataIssues.length - 4} 个数据源也需要重新采集。` : "",
+            diagnostics?.syncedAt ? `最近一次采集时间：${diagnostics.syncedAt}` : "",
+          ].filter(Boolean).join(" ")}
+        />
+      )}
 
       <Tabs items={tabItems} defaultActiveKey="basic" />
     </div>

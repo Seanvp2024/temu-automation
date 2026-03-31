@@ -11,8 +11,16 @@ import {
   message,
   notification,
 } from "antd";
-import { PlusOutlined, LoginOutlined, DeleteOutlined, LogoutOutlined } from "@ant-design/icons";
+import { PlusOutlined, LoginOutlined, DeleteOutlined, LogoutOutlined, EyeOutlined } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
+import {
+  ACTIVE_ACCOUNT_CHANGED_EVENT,
+  emitActiveAccountChanged,
+  readActiveAccountId,
+  setActiveAccountAndSync,
+  syncScopedDataToGlobalStore,
+  writeActiveAccountId,
+} from "../utils/multiStore";
 
 interface Account {
   id: string;
@@ -34,30 +42,83 @@ const STORAGE_KEY = "temu_accounts";
 
 export default function AccountManager() {
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [loginLoadingId, setLoginLoadingId] = useState<string | null>(null);
+  const [hydrated, setHydrated] = useState(false);
   const [form] = Form.useForm();
 
   const api = window.electronAPI?.automation;
   const store = (window as any).electronAPI?.store;
 
+  const clearActiveAccount = async () => {
+    if (!store) return;
+    setActiveAccountId(null);
+    await writeActiveAccountId(store, null);
+    await syncScopedDataToGlobalStore(store, null);
+    emitActiveAccountChanged(null);
+  };
+
+  const restoreActiveAccountData = async (nextAccounts: Account[]) => {
+    if (!store) return;
+
+    const activeAccountId = await readActiveAccountId(store);
+    if (activeAccountId && nextAccounts.some((account) => account.id === activeAccountId)) {
+      setActiveAccountId(activeAccountId);
+      await setActiveAccountAndSync(store, nextAccounts, activeAccountId);
+      return;
+    }
+
+    setActiveAccountId(null);
+    await clearActiveAccount();
+  };
+
   // 启动时从文件加载账号
   useEffect(() => {
     if (store) {
-      store.get(STORAGE_KEY).then((data: Account[] | null) => {
+      store.get(STORAGE_KEY).then(async (data: Account[] | null) => {
         if (data && Array.isArray(data)) {
-          setAccounts(data.map((a: Account) => ({ ...a, status: "offline" as const })));
+          const nextAccounts = data.map((a: Account) => ({ ...a, status: "offline" as const }));
+          setAccounts(nextAccounts);
+          await restoreActiveAccountData(nextAccounts);
+        } else {
+          await clearActiveAccount();
         }
+        setHydrated(true);
+      }).catch(() => {
+        setHydrated(true);
       });
+    } else {
+      setHydrated(true);
     }
-  }, []);
+  }, [store]);
 
   // 账号变化时保存到文件
   useEffect(() => {
-    if (store && accounts.length > 0) {
+    if (!store) return;
+
+    const syncActiveAccount = async () => {
+      const id = await readActiveAccountId(store);
+      setActiveAccountId(id);
+    };
+
+    syncActiveAccount().catch(() => {});
+
+    const handleActiveAccountChanged = () => {
+      syncActiveAccount().catch(() => {});
+    };
+
+    window.addEventListener(ACTIVE_ACCOUNT_CHANGED_EVENT, handleActiveAccountChanged as EventListener);
+    return () => {
+      window.removeEventListener(ACTIVE_ACCOUNT_CHANGED_EVENT, handleActiveAccountChanged as EventListener);
+    };
+  }, [store]);
+
+  useEffect(() => {
+    if (store && hydrated) {
       store.set(STORAGE_KEY, accounts);
     }
-  }, [accounts]);
+  }, [accounts, hydrated, store]);
 
   const columns: ColumnsType<Account> = [
     {
@@ -75,7 +136,9 @@ export default function AccountManager() {
       dataIndex: "status",
       key: "status",
       render: (status: keyof typeof statusMap) => (
-        <Tag color={statusMap[status]?.color}>{statusMap[status]?.text}</Tag>
+        <Space size={6}>
+          <Tag color={statusMap[status]?.color}>{statusMap[status]?.text}</Tag>
+        </Space>
       ),
     },
     {
@@ -107,6 +170,14 @@ export default function AccountManager() {
               登录
             </Button>
           )}
+          <Button
+            type="link"
+            icon={<EyeOutlined />}
+            disabled={activeAccountId === record.id}
+            onClick={() => handleActivateAccount(record.id)}
+          >
+            {activeAccountId === record.id ? "当前数据" : "切换数据"}
+          </Button>
           <Popconfirm
             title="确定删除此账号？"
             onConfirm={() => handleDelete(record.id)}
@@ -161,17 +232,20 @@ export default function AccountManager() {
       const result = await api.login(account.id, account.phone, account.password);
 
       if (result?.success) {
-        setAccounts((prev) =>
-          prev.map((a) =>
-            a.id === account.id
-              ? { ...a, status: "online" as const, lastLoginAt: new Date().toLocaleString() }
-              : a
-          )
+        const lastLoginAt = new Date().toLocaleString("zh-CN");
+        const nextAccounts = accounts.map((a) =>
+          a.id === account.id
+            ? { ...a, status: "online" as const, lastLoginAt }
+            : { ...a, status: "offline" as const }
         );
+        setAccounts(nextAccounts);
+        await setActiveAccountAndSync(store, nextAccounts, account.id);
         notification.success({
           key: "login",
           message: "登录成功",
-          description: `「${account.name}」已成功登录 Temu 卖家后台`,
+          description: result.matchedStoreName
+            ? `「${account.name}」已成功登录，当前匹配店铺：${result.matchedStoreName}`
+            : `「${account.name}」已成功登录 Temu 卖家后台`,
         });
       } else {
         throw new Error("登录返回失败");
@@ -190,20 +264,61 @@ export default function AccountManager() {
     }
   };
 
+  const handleActivateAccount = async (id: string) => {
+    if (!store) {
+      message.warning("本地存储未连接，暂时无法切换数据视图");
+      return;
+    }
+
+    if (activeAccountId === id) {
+      return;
+    }
+
+    const target = accounts.find((account) => account.id === id);
+    if (!target) {
+      message.warning("目标账号不存在");
+      return;
+    }
+
+    try {
+      await setActiveAccountAndSync(store, accounts, id);
+      setActiveAccountId(id);
+      message.success(`已切换到「${target.name}」的数据视图`);
+    } catch (error: any) {
+      message.error(error?.message || "切换数据视图失败");
+    }
+  };
+
   const handleLogout = async (id: string) => {
     if (api) {
       try {
         await api.close();
       } catch {}
     }
-    setAccounts((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, status: "offline" as const } : a))
-    );
+    const nextAccounts = accounts.map((a) => (a.id === id ? { ...a, status: "offline" as const } : a));
+    setAccounts(nextAccounts);
+    const activeAccountId = await readActiveAccountId(store);
+    if (activeAccountId === id) {
+      await clearActiveAccount();
+    }
     message.success("已断开连接");
   };
 
-  const handleDelete = (id: string) => {
-    setAccounts((prev) => prev.filter((a) => a.id !== id));
+  const handleDelete = async (id: string) => {
+    const target = accounts.find((account) => account.id === id);
+    if (target?.status === "online" && api) {
+      try {
+        await api.close();
+      } catch {}
+    }
+    const nextAccounts = accounts.filter((a) => a.id !== id);
+    setAccounts(nextAccounts);
+    const activeAccountId = await readActiveAccountId(store);
+    if (activeAccountId === id) {
+      await clearActiveAccount();
+    } else {
+      await restoreActiveAccountData(nextAccounts);
+    }
     message.success("账号已删除");
   };
 

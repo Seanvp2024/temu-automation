@@ -1,5 +1,6 @@
 node_modules/
-# dist/ 不排除，electron-builder 需要打包
+dist/
+build/
 target/
 automation/dist/
 automation/node_modules/
@@ -16,3 +17,16 @@ electron_*.log
 # Cookies 和用户数据
 cookies/
 debug/
+
+# 本地调试/解包产物
+.claude/worktrees/
+_extracted_asar/
+release/
+release-*/
+deploy/static-update-site/releases/
+scripts/__pycache__/
+m[[]1])
+read_*.py
+tmp-*.py
+tmp-*.cmd
+tmp_*.cjs

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import {
-  Tabs, Card, Form, Input, InputNumber, Button, Space, Table, Tag,
+  Alert, Tabs, Card, Form, Input, InputNumber, Button, Space, Table, Tag,
   message, Progress, Upload, Row, Col, Statistic, Descriptions,
 } from "antd";
 import {
@@ -8,6 +8,7 @@ import {
   CloudUploadOutlined, PauseCircleOutlined, PlayCircleOutlined,
   CheckCircleOutlined, CloseCircleOutlined, InboxOutlined,
 } from "@ant-design/icons";
+import { setStoreValueForActiveAccount } from "../utils/multiStore";
 
 const { TextArea } = Input;
 const { Dragger } = Upload;
@@ -42,7 +43,7 @@ function SingleCreate() {
         message.success("上品成功！");
         const history = (await store?.get("temu_create_history")) || [];
         history.unshift({ title: values.title, price: values.price, status: "draft", createdAt: Date.now(), result: res });
-        await store?.set("temu_create_history", history.slice(0, 100));
+        await setStoreValueForActiveAccount(store, "temu_create_history", history.slice(0, 100));
       } else {
         message.error(res?.message || "上品失败");
       }
@@ -104,9 +105,71 @@ function BatchCreate() {
   const [count, setCount] = useState(5);
   const [running, setRunning] = useState(false);
   const [paused, setPaused] = useState(false);
-  const [progressInfo, setProgressInfo] = useState<any>({ running: false });
+  const [progressInfo, setProgressInfo] = useState<any>({ running: false, status: "idle" });
   const [results, setResults] = useState<any[]>([]);
+  const [taskHistory, setTaskHistory] = useState<any[]>([]);
+  const [selectedTaskId, setSelectedTaskId] = useState("");
+  const [historyLoading, setHistoryLoading] = useState(false);
   const progressRef = useRef<any>(null);
+  const runningStateRef = useRef(false);
+
+  const syncTaskHistory = (task: any) => {
+    if (!task?.taskId) return;
+    setTaskHistory((prev) => {
+      const next = [task, ...prev.filter((item) => item?.taskId !== task.taskId)];
+      return next.slice(0, 10);
+    });
+  };
+
+  const applyTaskSnapshot = (task: any) => {
+    if (!task) return;
+    if (task.taskId) setSelectedTaskId(task.taskId);
+    setProgressInfo(task);
+    setResults(Array.isArray(task.results) ? task.results : []);
+    setPaused(Boolean(task.paused));
+    setRunning(Boolean(task.running));
+    if (task.csvPath) setFilePath(task.csvPath);
+    if (typeof task.startRow === "number") setStartRow(task.startRow);
+    if (typeof task.count === "number" && task.count > 0) setCount(task.count);
+  };
+
+  const refreshTaskHistory = async (preserveSelection = true) => {
+    try {
+      setHistoryLoading(true);
+      const tasks = await api?.listTasks?.();
+      if (!Array.isArray(tasks)) return;
+      setTaskHistory(tasks);
+      if (tasks.length === 0) return;
+
+      const preferredTask = preserveSelection
+        ? tasks.find((task: any) => task?.taskId === selectedTaskId) || tasks[0]
+        : tasks[0];
+      if (preferredTask) applyTaskSnapshot(preferredTask);
+    } catch {
+      // ignore
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const restoreTaskView = async (taskId: string) => {
+    if (!taskId) return;
+    try {
+      const task = await api?.getTaskProgress?.(taskId);
+      if (!task) return;
+      applyTaskSnapshot(task);
+      syncTaskHistory(task);
+      if (task.running) {
+        pollProgress(task.taskId, true);
+      } else if (progressRef.current) {
+        clearInterval(progressRef.current);
+        progressRef.current = null;
+      }
+      message.success("已恢复任务视图");
+    } catch (error: any) {
+      message.error(error?.message || "恢复任务失败");
+    }
+  };
 
   // 通过 Electron 原生对话框选择文件
   const selectFile = async () => {
@@ -182,56 +245,84 @@ function BatchCreate() {
   };
 
   // 进度轮询（核心：前端状态完全由轮询驱动，不依赖 autoPricing 的 await 返回）
-  const pollProgress = () => {
+  const pollProgress = (taskId?: string, suppressNotice = false) => {
     if (progressRef.current) clearInterval(progressRef.current);
     progressRef.current = setInterval(async () => {
       try {
-        const p = await api?.getProgress?.();
+        const p = taskId ? await api?.getTaskProgress?.(taskId) : await api?.getProgress?.();
         if (p) {
-          setProgressInfo(p);
-          if (p.results?.length) setResults(p.results);
-          if (p.paused) setPaused(true);
-          else setPaused(false);
-          if (!p.running && p.completed > 0) {
+          applyTaskSnapshot(p);
+          syncTaskHistory(p);
+          if (!p.running && (p.taskId || p.completed > 0 || ["completed", "failed", "interrupted"].includes(p.status))) {
             // Worker 完成，更新前端状态
             clearInterval(progressRef.current);
             progressRef.current = null;
             setRunning(false);
             setPaused(false);
+            refreshTaskHistory().catch(() => {});
+            const shouldNotify = !suppressNotice && runningStateRef.current;
             const sc = (p.results || []).filter((r: any) => r.success).length;
             const fc = (p.results || []).filter((r: any) => !r.success).length;
-            if (sc > 0) message.success(`批量上品完成：${sc} 成功，${fc} 失败`);
-            else if (fc > 0) message.error(`批量上品全部失败（${fc}个）`);
-            // 保存历史
-            try {
-              const history = (await store?.get("temu_create_history")) || [];
-              (p.results || []).forEach((r: any) => {
-                history.unshift({
-                  title: r.name || `商品`,
-                  status: r.success ? "draft" : "failed",
-                  message: r.message || "",
-                  productId: r.productId || "",
-                  createdAt: Date.now(),
-                });
-              });
-              await store?.set("temu_create_history", history.slice(0, 100));
-            } catch {}
+            if (shouldNotify) {
+              if (p.status === "failed" || p.status === "interrupted") {
+                message.error(p.message || "批量上品任务已中断");
+              } else if (sc > 0) {
+                message.success(`批量上品完成：${sc} 成功，${fc} 失败`);
+              } else if (fc > 0) {
+                message.error(`批量上品全部失败（${fc}个）`);
+              }
+            }
           }
         }
       } catch {}
     }, 3000);
   };
 
+  const hydrateTaskState = async () => {
+    try {
+      const tasks = await api?.listTasks?.();
+      if (Array.isArray(tasks) && tasks.length > 0) {
+        setTaskHistory(tasks);
+        const latestTask = tasks[0];
+        applyTaskSnapshot(latestTask);
+        if (latestTask.running) {
+          pollProgress(latestTask.taskId, true);
+        }
+        return;
+      }
+
+      const task = await api?.getProgress?.();
+      if (!task) return;
+      const hasTaskState = Boolean(
+        task.taskId
+        || task.running
+        || task.completed > 0
+        || (Array.isArray(task.results) && task.results.length > 0)
+        || (task.status && task.status !== "idle")
+      );
+      if (!hasTaskState) return;
+      applyTaskSnapshot(task);
+      syncTaskHistory(task);
+      if (task.running) {
+        pollProgress(task.taskId, true);
+      }
+    } catch {}
+  };
+
   // 暂停/继续
   const togglePause = async () => {
+    const taskId = selectedTaskId || progressInfo?.taskId;
     if (paused) {
-      await api?.resumePricing?.();
-      setPaused(false);
+      await api?.resumePricing?.(taskId);
       message.info("已恢复");
     } else {
-      await api?.pausePricing?.();
-      setPaused(true);
+      await api?.pausePricing?.(taskId);
       message.warning("已暂停，当前商品处理完后停止");
+    }
+    const task = taskId ? await api?.getTaskProgress?.(taskId) : await api?.getProgress?.();
+    if (task) {
+      applyTaskSnapshot(task);
+      syncTaskHistory(task);
     }
   };
 
@@ -244,21 +335,39 @@ function BatchCreate() {
     setRunning(true);
     setPaused(false);
     setResults([]);
-    setProgressInfo({ running: true, total: count, completed: 0, current: "准备中...", step: "初始化" });
+    setProgressInfo({ running: true, status: "running", total: count, completed: 0, current: "准备中...", step: "初始化", results: [] });
 
-    // 发射后不管：不 await，靠 pollProgress 轮询结果
-    api?.autoPricing({ csvPath: filePath, startRow, count }).then((res: any) => {
-      // Worker 返回结果时更新（但可能比轮询慢）
-      if (res?.results) setResults(res.results);
-      const sc = res?.results?.filter((r: any) => r.success).length || 0;
-      message.success(`批量上品完成：${sc}/${count} 成功`);
-    }).catch(() => {
-      // HTTP 连接断开不影响 Worker 继续跑，前端靠轮询
-    });
+    const response = await api?.autoPricing({ csvPath: filePath, startRow, count });
+    if (!response?.accepted) {
+      setRunning(false);
+      setPaused(false);
+      if (response?.task) {
+        applyTaskSnapshot(response.task);
+        syncTaskHistory(response.task);
+      }
+      message.warning(response?.message || "已有批量上品任务在运行");
+      if (response?.task?.running) pollProgress(response.task.taskId, true);
+      return;
+    }
+
+    if (response?.task) {
+      applyTaskSnapshot(response.task);
+      syncTaskHistory(response.task);
+    }
+    message.success("批量上品任务已启动");
+    refreshTaskHistory(false).catch(() => {});
 
     // 轮询进度（每3秒），直到 Worker 报告 running=false
-    pollProgress();
+    pollProgress(response?.task?.taskId);
   };
+
+  useEffect(() => {
+    runningStateRef.current = running;
+  }, [running]);
+
+  useEffect(() => {
+    hydrateTaskState();
+  }, []);
 
   useEffect(() => {
     return () => { if (progressRef.current) clearInterval(progressRef.current); };
@@ -385,6 +494,15 @@ function BatchCreate() {
             )}
           </Space>
 
+          {(progressInfo?.status === "failed" || progressInfo?.status === "interrupted") && progressInfo?.message && (
+            <Alert
+              style={{ marginTop: 16 }}
+              type="error"
+              showIcon
+              message={progressInfo.message}
+            />
+          )}
+
           {/* 进度条 */}
           {running && (
             <div style={{ marginTop: 16 }}>
@@ -432,6 +550,73 @@ function BatchCreate() {
             size="small"
             bordered={false}
           />
+        </Card>
+      )}
+
+      {taskHistory.length > 0 && (
+        <Card
+          title="最近任务"
+          extra={(
+            <Button size="small" onClick={() => refreshTaskHistory()} loading={historyLoading}>
+              刷新任务
+            </Button>
+          )}
+          style={{ borderRadius: 12 }}
+        >
+          <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+            {taskHistory.map((task) => {
+              const isActive = task.taskId === selectedTaskId;
+              const statusColorMap: Record<string, string> = {
+                running: "processing",
+                paused: "warning",
+                completed: "success",
+                failed: "error",
+                interrupted: "default",
+              };
+              const statusTextMap: Record<string, string> = {
+                running: "进行中",
+                paused: "已暂停",
+                completed: "已完成",
+                failed: "失败",
+                interrupted: "已中断",
+              };
+              const displayName = task.csvPath ? task.csvPath.split(/[/\\]/).pop() : "未命名任务";
+              return (
+                <div
+                  key={task.taskId}
+                  style={{
+                    border: isActive ? "1px solid #1677ff" : "1px solid #f0f0f0",
+                    borderRadius: 10,
+                    padding: 12,
+                    background: isActive ? "#f0f7ff" : "#fff",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
+                    <div style={{ minWidth: 0 }}>
+                      <Space wrap>
+                        <Tag color={statusColorMap[task.status] || "default"}>
+                          {statusTextMap[task.status] || task.status || "未知状态"}
+                        </Tag>
+                        <span style={{ fontWeight: 500 }}>{displayName}</span>
+                      </Space>
+                      <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>
+                        {task.completed || 0}/{task.total || task.count || 0} 已处理
+                        {task.updatedAt ? `，最近更新 ${task.updatedAt}` : ""}
+                      </div>
+                      {task.message && (
+                        <div style={{ marginTop: 6, color: task.status === "failed" || task.status === "interrupted" ? "#ff4d4f" : "#666", fontSize: 12 }}>
+                          {task.message}
+                        </div>
+                      )}
+                    </div>
+                    <Button size="small" onClick={() => restoreTaskView(task.taskId)}>
+                      {task.running ? "继续跟踪" : "查看结果"}
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
+          </Space>
         </Card>
       )}
     </Space>

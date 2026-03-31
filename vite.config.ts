@@ -12,6 +12,27 @@ export default defineConfig(async () => ({
     },
   },
   clearScreen: false,
+  build: {
+    chunkSizeWarningLimit: 700,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          const normalizedId = id.split(path.sep).join("/");
+          if (!normalizedId.includes("/node_modules/")) return;
+          if (normalizedId.includes("/node_modules/react-router")) return "router";
+          if (
+            normalizedId.includes("/node_modules/react/")
+            || normalizedId.includes("/node_modules/react-dom/")
+            || normalizedId.includes("/node_modules/scheduler/")
+          ) {
+            return "react-vendor";
+          }
+          if (normalizedId.includes("/node_modules/@babel/runtime/")) return "babel-runtime";
+          return undefined;
+        },
+      },
+    },
+  },
   server: {
     port: 1420,
     strictPort: true,

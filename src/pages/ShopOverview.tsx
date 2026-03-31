@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import {
+  Alert,
   Card,
   Row,
   Col,
@@ -15,7 +16,15 @@ import {
   Spin,
   Segmented,
 } from "antd";
-import { parseDashboardData } from "../utils/parseRawApis";
+import { parseDashboardData, parseFluxData } from "../utils/parseRawApis";
+import {
+  COLLECTION_DIAGNOSTICS_KEY,
+  getCollectionDataIssue,
+  normalizeCollectionDiagnostics,
+  type CollectionDiagnostics,
+} from "../utils/collectionDiagnostics";
+import { getFirstExistingStoreValue, getStoreValue, STORE_KEY_ALIASES } from "../utils/storeCompat";
+import { ACTIVE_ACCOUNT_CHANGED_EVENT } from "../utils/multiStore";
 
 const { Title, Text } = Typography;
 
@@ -43,6 +52,54 @@ function findInRawStore(rawData: any, apiPathFragment: string): any {
   return api?.data?.result || api?.data || null;
 }
 
+function deepFindObjectByKeys(rawData: any, keys: string[]): any {
+  const queue = [rawData];
+  const seen = new Set<any>();
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== "object" || seen.has(current)) continue;
+    seen.add(current);
+
+    if (keys.every((key) => key in current)) {
+      return current;
+    }
+
+    if (Array.isArray(current)) {
+      current.forEach((item) => queue.push(item));
+      continue;
+    }
+
+    Object.values(current).forEach((value) => {
+      if (value && typeof value === "object") queue.push(value);
+    });
+  }
+
+  return null;
+}
+
+function extractFluxSummary(rawData: any) {
+  if (!rawData) return null;
+  if (rawData?.summary?.trendList || rawData?.summary?.todayVisitors !== undefined || rawData?.summary?.todayBuyers !== undefined) {
+    return rawData.summary;
+  }
+  const summary = findInRawStore(rawData, "mall/summary");
+  if (!summary) return null;
+  return {
+    todayVisitors: summary.todayTotalVisitorsNum ?? summary.todayVisitors ?? 0,
+    todayBuyers: summary.todayPayBuyerNum ?? summary.todayBuyers ?? 0,
+    todayConversionRate: summary.todayConversionRate ?? 0,
+    trendList: Array.isArray(summary.trendList)
+      ? summary.trendList.map((item: any) => ({
+          date: item.statDate || item.date || "",
+          visitors: item.visitorsNum ?? item.visitors ?? 0,
+          buyers: item.payBuyerNum ?? item.buyers ?? 0,
+          conversionRate: item.conversionRate ?? 0,
+        }))
+      : [],
+  };
+}
+
 const ShopOverview: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [dashboard, setDashboard] = useState<any>(null);
@@ -61,37 +118,60 @@ const ShopOverview: React.FC = () => {
   const [qualityRegion, setQualityRegion] = useState<string>("global");
   const [checkup, setCheckup] = useState<any>(null);
   const [qcDetail, setQcDetail] = useState<any>(null);
+  const [diagnostics, setDiagnostics] = useState<CollectionDiagnostics | null>(null);
 
   useEffect(() => {
     loadAllData();
+    const handleActiveAccountChanged = () => {
+      void loadAllData();
+    };
+    window.addEventListener(ACTIVE_ACCOUNT_CHANGED_EVENT, handleActiveAccountChanged);
+    return () => {
+      window.removeEventListener(ACTIVE_ACCOUNT_CHANGED_EVENT, handleActiveAccountChanged);
+    };
   }, []);
 
   const loadAllData = async () => {
     setLoading(true);
+    setDashboard(null);
+    setFlux(null);
+    setPerformance(null);
+    setSoldout(null);
+    setDelivery(null);
+    setQuality(null);
+    setGovern(null);
+    setMarketing(null);
+    setAdsHome(null);
+    setFluxUS(null);
+    setFluxEU(null);
+    setQualityEU(null);
+    setCheckup(null);
+    setQcDetail(null);
     try {
       const [
         dashRaw, fluxRaw, perfRaw, soldoutRaw, deliveryRaw,
         qualityRaw, governRaw, marketingRaw, adsRaw,
-        fluxUSRaw, fluxEURaw, qualityEURaw, checkupRaw, qcDetailRaw,
+        fluxUSRaw, fluxEURaw, qualityEURaw, checkupRaw, qcDetailRaw, diagnosticsRaw,
       ] = await Promise.all([
-        store?.get("temu_dashboard"),
-        store?.get("temu_flux"),
-        store?.get("temu_performance"),
-        store?.get("temu_soldout"),
-        store?.get("temu_delivery"),
-        store?.get("temu_raw_qualityDashboard"),
-        store?.get("temu_raw_governDashboard"),
-        store?.get("temu_marketing_activity"),
-        store?.get("temu_raw_adsHome"),
-        store?.get("temu_flux_us"),
-        store?.get("temu_flux_eu"),
-        store?.get("temu_raw_qualityDashboardEU"),
-        store?.get("temu_raw_checkup"),
-        store?.get("temu_qc_detail"),
+        getStoreValue(store, "temu_dashboard"),
+        getStoreValue(store, "temu_flux"),
+        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.performance),
+        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.soldout),
+        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.delivery),
+        getStoreValue(store, "temu_raw_qualityDashboard"),
+        getStoreValue(store, "temu_raw_governDashboard"),
+        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.marketingActivity),
+        getStoreValue(store, "temu_raw_adsHome"),
+        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.fluxUS),
+        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.fluxEU),
+        getStoreValue(store, "temu_raw_qualityDashboardEU"),
+        getStoreValue(store, "temu_raw_checkup"),
+        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.qcDetail),
+        getStoreValue(store, COLLECTION_DIAGNOSTICS_KEY),
       ]);
 
       if (dashRaw) setDashboard(parseDashboardData(dashRaw));
-      if (fluxRaw) setFlux(fluxRaw);
+      if (fluxRaw) setFlux(parseFluxData(fluxRaw));
       if (perfRaw) setPerformance(perfRaw);
       if (soldoutRaw) setSoldout(soldoutRaw);
       if (deliveryRaw) setDelivery(deliveryRaw);
@@ -104,8 +184,10 @@ const ShopOverview: React.FC = () => {
       if (qualityEURaw) setQualityEU(qualityEURaw);
       if (checkupRaw) setCheckup(checkupRaw);
       if (qcDetailRaw) setQcDetail(qcDetailRaw);
+      setDiagnostics(normalizeCollectionDiagnostics(diagnosticsRaw));
     } catch (e) {
       console.error("加载店铺概览数据失败", e);
+      setDiagnostics(null);
     } finally {
       setLoading(false);
     }
@@ -120,25 +202,21 @@ const ShopOverview: React.FC = () => {
   // 流量数据 - 根据区域切换
   const getRegionFlux = () => {
     if (fluxRegion === "us") {
-      const summary = findInRawStore(fluxUS, "mall/summary");
+      const summary = extractFluxSummary(fluxUS);
       if (!summary) return { summary: null, trendList: [], yesterday: null };
-      const trendList = (summary.trendList || []).map((t: any) => ({
-        date: t.statDate, visitors: t.visitorsNum, buyers: t.payBuyerNum, conversionRate: t.conversionRate,
-      }));
+      const trendList = summary.trendList || [];
       return {
-        summary: { todayVisitors: summary.todayTotalVisitorsNum, todayBuyers: summary.todayPayBuyerNum, todayConversionRate: summary.todayConversionRate },
+        summary,
         trendList,
         yesterday: trendList.length >= 2 ? trendList[trendList.length - 2] : null,
       };
     }
     if (fluxRegion === "eu") {
-      const summary = findInRawStore(fluxEU, "mall/summary");
+      const summary = extractFluxSummary(fluxEU);
       if (!summary) return { summary: null, trendList: [], yesterday: null };
-      const trendList = (summary.trendList || []).map((t: any) => ({
-        date: t.statDate, visitors: t.visitorsNum, buyers: t.payBuyerNum, conversionRate: t.conversionRate,
-      }));
+      const trendList = summary.trendList || [];
       return {
-        summary: { todayVisitors: summary.todayTotalVisitorsNum, todayBuyers: summary.todayPayBuyerNum, todayConversionRate: summary.todayConversionRate },
+        summary,
         trendList,
         yesterday: trendList.length >= 2 ? trendList[trendList.length - 2] : null,
       };
@@ -163,13 +241,20 @@ const ShopOverview: React.FC = () => {
   const qualityScoreList = findInRawStore(currentQuality, "qualityScore/count");
 
   // 履约数据
-  const perfAbstract = performance?.purchasePerformance?.abstractInfo || null;
+  const perfAbstract = performance?.purchasePerformance?.abstractInfo
+    || deepFindObjectByKeys(performance, ["supplierAvgScore", "excellentZoneStart", "excellentZoneEnd"])
+    || null;
 
   // 售罄数据
-  const soldoutOverview = soldout?.overview?.todayTotal || null;
+  const soldoutOverview = soldout?.overview?.todayTotal
+    || deepFindObjectByKeys(soldout, ["soonSellOutNum", "sellOutNum", "sellOutLossNum"])
+    || null;
 
   // 物流发货
-  const deliverySummary = delivery?.forwardSummary?.result || null;
+  const deliverySummary = delivery?.forwardSummary?.result
+    || delivery?.forwardSummary
+    || deepFindObjectByKeys(delivery, ["stagingCount", "forwardCount", "expiredCount"])
+    || null;
 
   // 合规数据
   const complianceBoard = findInRawStore(govern, "compliance/dashBoard/main_page");
@@ -181,6 +266,18 @@ const ShopOverview: React.FC = () => {
 
   // 广告数据
   const adsCount = findInRawStore(adsHome, "coconut/message_box/count");
+
+  const dataIssues = [
+    getCollectionDataIssue(diagnostics, "dashboard", "店铺概览", Boolean(dashboard)),
+    getCollectionDataIssue(diagnostics, "flux", "流量分析", Boolean(flux || fluxUS || fluxEU)),
+    getCollectionDataIssue(diagnostics, "qualityDashboard", "质量看板", Boolean(quality || qualityEU)),
+    getCollectionDataIssue(diagnostics, "performance", "履约表现", Boolean(perfAbstract)),
+    getCollectionDataIssue(diagnostics, "marketingActivity", "营销活动", Boolean(marketing)),
+    getCollectionDataIssue(diagnostics, "delivery", "发货数据", Boolean(deliverySummary)),
+    getCollectionDataIssue(diagnostics, "soldout", "售罄分析", Boolean(soldoutOverview)),
+    getCollectionDataIssue(diagnostics, "checkup", "店铺体检", Boolean(checkup)),
+    getCollectionDataIssue(diagnostics, "qcDetail", "抽检结果", Boolean(qcDetail)),
+  ].filter((issue): issue is string => Boolean(issue));
 
   // ========== Tab 1: 数据概览 ==========
   const renderOverviewTab = () => (
@@ -1063,6 +1160,19 @@ const ShopOverview: React.FC = () => {
 
   return (
     <div>
+      {dataIssues.length > 0 && (
+        <Alert
+          style={{ marginBottom: 16 }}
+          type="warning"
+          showIcon
+          message="部分模块暂无可用数据"
+          description={[
+            dataIssues.slice(0, 4).join("；"),
+            dataIssues.length > 4 ? `另有 ${dataIssues.length - 4} 个模块也需要重新采集。` : "",
+            diagnostics?.syncedAt ? `最近一次采集时间：${diagnostics.syncedAt}` : "",
+          ].filter(Boolean).join(" ")}
+        />
+      )}
       <Tabs
         defaultActiveKey="overview"
         items={tabItems}

@@ -1,76 +1,311 @@
 /**
  * 从 Worker 返回的原始 API 捕获数据 { apis: [{ path, data }, ...] } 中提取结构化数据
- * 所有采集函数返回 { apis: [...] } 格式，各页面需要从中提取业务数据
+ * 各页面依赖这些解析函数拿到稳定字段，尽量避免接口轻微漂移后整页空白。
  */
 
-// 通用：在 apis 数组中查找匹配 pattern 的 API 结果
-function findApi(apis: any[], pattern: string): any {
-  return apis.find((a: any) => a.path?.includes(pattern))?.data?.result;
+type RawApiEntry = {
+  path?: string;
+  data?: any;
+};
+
+function getRawApis(data: any): RawApiEntry[] {
+  if (Array.isArray(data?.apis)) return data.apis;
+  if (Array.isArray(data?.data?.apis)) return data.data.apis;
+  return [];
 }
 
-function findAllApis(apis: any[], pattern: string): any[] {
-  return apis.filter((a: any) => a.path?.includes(pattern)).map((a: any) => a.data?.result).filter(Boolean);
+function unwrapApiPayload(entry: RawApiEntry | any): any {
+  return entry?.data?.result ?? entry?.data?.data ?? entry?.data ?? entry?.result ?? entry ?? null;
 }
 
-// 判断是否为原始 API 格式
+function findApi(apis: RawApiEntry[], pattern: string): any {
+  const matched = apis.find((item) => item?.path?.includes(pattern));
+  return matched ? unwrapApiPayload(matched) : null;
+}
+
+function findAllApis(apis: RawApiEntry[], pattern: string): any[] {
+  return apis
+    .filter((item) => item?.path?.includes(pattern))
+    .map((item) => unwrapApiPayload(item))
+    .filter((item) => item !== null && item !== undefined);
+}
+
 function isRawApiFormat(data: any): boolean {
-  return data && Array.isArray(data.apis) && data.apis.length > 0;
+  return getRawApis(data).length > 0;
+}
+
+function toArray<T = any>(value: any): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function toStringValue(value: any): string {
+  if (value === null || value === undefined) return "";
+  return typeof value === "string" ? value : String(value);
+}
+
+function toNumberValue(value: any, fallback = 0): number {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function pickFirst<T>(...values: T[]): T | undefined {
+  return values.find((value) => value !== null && value !== undefined && value !== "");
+}
+
+function normalizeCategoryPath(value: any): string {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => normalizeCategoryPath(item))
+      .filter(Boolean)
+      .join(" > ");
+  }
+  if (typeof value !== "object") return "";
+
+  return Object.keys(value)
+    .filter((key) => key.startsWith("cat"))
+    .sort()
+    .map((key) => toStringValue(value[key]?.catName || value[key]?.name || value[key]))
+    .filter(Boolean)
+    .join(" > ");
+}
+
+function formatFenPrice(value: any): string {
+  if (value === null || value === undefined || value === "") return "";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return toStringValue(value);
+  return (num / 100).toFixed(2);
+}
+
+function normalizeSupplyStatus(value: any): string {
+  if (typeof value === "number") {
+    return (
+      {
+        0: "正常供货",
+        1: "暂时无法供货",
+        2: "永久停止供货",
+      } as Record<number, string>
+    )[value] || String(value);
+  }
+  return toStringValue(value);
+}
+
+function normalizeProductStatus(value: any): string {
+  if (typeof value === "number") {
+    return value === 0 ? "在售" : value === 1 ? "已下架" : String(value);
+  }
+  return toStringValue(value);
+}
+
+function normalizeProductsFromList(items: any[], syncedAt = ""): any[] {
+  return items.map((item: any) => {
+    const categories = normalizeCategoryPath(item.categories || item.categoryPath || item.categoryTree);
+    const leafCategory = toStringValue(
+      pickFirst(
+        item.leafCat?.catName,
+        item.leafCatName,
+        item.leafCat,
+        item.category?.catName,
+        item.categoryName,
+      ),
+    );
+    const skuExtCodes = toArray(item.productSkuSummaries || item.skuList)
+      .map((sku: any) => toStringValue(pickFirst(sku.extCode, sku.skuExtCode, sku.skuCode)))
+      .filter(Boolean)
+      .join(", ");
+
+    return {
+      title: toStringValue(pickFirst(item.productName, item.title, item.goodsName)),
+      category: leafCategory || categories,
+      categories,
+      spuId: toStringValue(pickFirst(item.productId, item.spuId, item.productSpuId)),
+      skcId: toStringValue(pickFirst(item.productSkcId, item.skcId, item.skcExtId)),
+      goodsId: toStringValue(item.goodsId),
+      sku: toStringValue(pickFirst(item.extCode, item.skuExtCode, item.skuCode, skuExtCodes)),
+      imageUrl: toStringValue(pickFirst(item.thumbUrl, item.mainImageUrl, item.goodsImageUrl, item.imageUrl)),
+      price: toStringValue(item.price),
+      status: normalizeProductStatus(pickFirst(item.removeStatus, item.status)),
+      totalSales: toNumberValue(pickFirst(item.productTotalSalesVolume, item.totalSales)),
+      last7DaysSales: toNumberValue(pickFirst(item.last7DaysSalesVolume, item.lastSevenDaysSalesVolume, item.last7DaysSales)),
+      skcStatus: item.skcStatus,
+      skcSiteStatus: item.skcSiteStatus,
+      createdAt: pickFirst(item.createdAt, item.createTime),
+      syncedAt,
+    };
+  });
+}
+
+function dedupeByKey<T>(items: T[], getKey: (item: T) => string): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  items.forEach((item) => {
+    const key = getKey(item);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    result.push(item);
+  });
+  return result;
+}
+
+function normalizeSalesFlatItem(item: any, syncedAt = "") {
+  const inventoryInfo = item.inventoryNumInfo || item.inventoryInfo || {};
+  return {
+    key: toStringValue(pickFirst(item.key, item.skuId, item.productSkcId, item.skcId, item.spuId)),
+    title: toStringValue(pickFirst(item.productName, item.title, item.goodsName)),
+    category: normalizeCategoryPath(pickFirst(item.category, item.categories, item.categoryTree)),
+    skcId: toStringValue(pickFirst(item.productSkcId, item.skcId, item.skcExtId)),
+    spuId: toStringValue(pickFirst(item.productId, item.spuId, item.productSpuId)),
+    imageUrl: toStringValue(pickFirst(item.productSkcPicture, item.imageUrl, item.goodsImageUrl)),
+    todaySales: toNumberValue(pickFirst(item.todaySaleVolume, item.todaySales)),
+    last7DaysSales: toNumberValue(pickFirst(item.lastSevenDaysSaleVolume, item.last7DaysSales)),
+    last30DaysSales: toNumberValue(pickFirst(item.lastThirtyDaysSaleVolume, item.last30DaysSales)),
+    totalSales: toNumberValue(pickFirst(item.totalSaleVolume, item.totalSales)),
+    warehouseStock: toNumberValue(pickFirst(inventoryInfo.warehouseInventoryNum, item.warehouseStock)),
+    adviceQuantity: toNumberValue(pickFirst(item.adviceQuantity, item.suggestStock)),
+    lackQuantity: toNumberValue(item.lackQuantity),
+    price: pickFirst(
+      item.price,
+      item.supplierPrice !== undefined ? formatFenPrice(item.supplierPrice) : "",
+    ) || "",
+    skuCode: toStringValue(pickFirst(item.skuExtCode, item.skuCode, item.extCode)),
+    stockStatus: toStringValue(pickFirst(item.stockStatusName, item.stockStatus)),
+    supplyStatus: normalizeSupplyStatus(pickFirst(item.supplyStatusName, item.supplyStatus)),
+    hotTag: toStringValue(pickFirst(item.hotTag?.tagName, item.hotTag, item.hotSaleTag)),
+    isAdProduct: item.isAdProduct ? "广告商品" : toStringValue(item.isAdProduct),
+    availableSaleDays: pickFirst(item.availableSaleDays, inventoryInfo.availableSaleDays, null),
+    syncedAt,
+  };
+}
+
+function normalizeSalesItemsFromSkuList(items: any[], syncedAt = ""): any[] {
+  return items.flatMap((item: any, itemIndex: number) =>
+    toArray(item.skuList).map((sku: any, skuIndex: number) => ({
+      key: `${itemIndex}-${skuIndex}`,
+      title: toStringValue(pickFirst(item.productName, item.title)),
+      category: normalizeCategoryPath(item.category),
+      skcId: toStringValue(pickFirst(item.skcId, item.productSkcId)),
+      spuId: toStringValue(pickFirst(item.spuId, item.productId)),
+      imageUrl: toStringValue(pickFirst(item.imageUrl, item.productSkcPicture)),
+      skuId: toStringValue(sku.skuId),
+      skuName: toStringValue(pickFirst(sku.skuName, sku.name)),
+      skuCode: toStringValue(pickFirst(sku.skuCode, sku.extCode, sku.skuExtCode)),
+      price: toNumberValue(sku.price),
+      warehouseStock: toNumberValue(sku.warehouseStock),
+      occupyStock: toNumberValue(sku.occupyStock),
+      unavailableStock: toNumberValue(sku.unavailableStock),
+      warehouseGroup: toStringValue(sku.warehouseGroup),
+      suggestStock: toNumberValue(sku.suggestStock),
+      stockStatus: toStringValue(sku.stockStatus),
+      syncedAt,
+    })),
+  );
+}
+
+function normalizeFluxTrendItem(item: any) {
+  return {
+    date: toStringValue(pickFirst(item.statDate, item.date)),
+    visitors: toNumberValue(pickFirst(item.visitorsNum, item.visitors)),
+    buyers: toNumberValue(pickFirst(item.payBuyerNum, item.buyers)),
+    conversionRate: toNumberValue(item.conversionRate),
+  };
+}
+
+function normalizeFluxSummary(summaryRaw: any) {
+  if (!summaryRaw) return null;
+  return {
+    todayVisitors: toNumberValue(pickFirst(summaryRaw.todayTotalVisitorsNum, summaryRaw.todayVisitors)),
+    todayBuyers: toNumberValue(pickFirst(summaryRaw.todayPayBuyerNum, summaryRaw.todayBuyers)),
+    todayConversionRate: toNumberValue(summaryRaw.todayConversionRate),
+    updateTime: toStringValue(summaryRaw.updateTime),
+    trendList: toArray(summaryRaw.trendList).map(normalizeFluxTrendItem),
+  };
+}
+
+function normalizeFluxItems(items: any[]): any[] {
+  return items.map((item: any, index: number) => ({
+    key: toStringValue(pickFirst(item.key, item.goodsId, `${index}`)),
+    goodsId: toStringValue(item.goodsId),
+    goodsName: toStringValue(pickFirst(item.goodsName, item.productName, item.title)),
+    imageUrl: toStringValue(pickFirst(item.goodsImageUrl, item.imageUrl, item.mainImageUrl)),
+    spuId: toStringValue(pickFirst(item.productSpuId, item.spuId, item.productId)),
+    category: normalizeCategoryPath(pickFirst(item.category, item.categories)),
+    exposeNum: toNumberValue(item.exposeNum),
+    exposeNumChange: pickFirst(item.exposeNumLinkRelative, item.exposeNumChange, null),
+    clickNum: toNumberValue(item.clickNum),
+    clickNumChange: pickFirst(item.clickNumLinkRelative, item.clickNumChange, null),
+    detailVisitNum: toNumberValue(pickFirst(item.goodsDetailVisitNum, item.detailVisitNum)),
+    detailVisitorNum: toNumberValue(pickFirst(item.goodsDetailVisitorNum, item.detailVisitorNum)),
+    addToCartUserNum: toNumberValue(item.addToCartUserNum),
+    collectUserNum: toNumberValue(item.collectUserNum),
+    payGoodsNum: toNumberValue(item.payGoodsNum),
+    payOrderNum: toNumberValue(item.payOrderNum),
+    buyerNum: toNumberValue(item.buyerNum),
+    searchExposeNum: toNumberValue(item.searchExposeNum),
+    searchClickNum: toNumberValue(item.searchClickNum),
+    recommendExposeNum: toNumberValue(item.recommendExposeNum),
+    recommendClickNum: toNumberValue(item.recommendClickNum),
+    clickPayRate: toNumberValue(pickFirst(item.clickPayConversionRate, item.clickPayRate)),
+    exposeClickRate: toNumberValue(pickFirst(item.exposeClickConversionRate, item.exposeClickRate)),
+    growDataText: toStringValue(item.growDataText),
+  }));
 }
 
 // ============ Dashboard 仪表盘 ============
 export function parseDashboardData(raw: any): any {
   if (!isRawApiFormat(raw)) return raw;
-  const apis = raw.apis;
+  const apis = getRawApis(raw);
 
-  // 统计数据 - 路径: /bg/swift/api/common/statistics/web/queryStatisticDataFullManaged
   const statsRaw = findApi(apis, "queryStatisticDataFullManaged");
   const statistics = statsRaw ? {
-    onSaleProducts: statsRaw.onSaleProductNumber ?? 0,
-    sevenDaysSales: statsRaw.sevenDaysSaleVolume ?? 0,
-    thirtyDaysSales: statsRaw.thirtyDaysSaleVolume ?? 0,
-    lackSkcNumber: statsRaw.lackSkcNumber ?? 0,
-    alreadySoldOut: statsRaw.alreadySoldOutNumber ?? statsRaw.sellOutNum ?? 0,
-    aboutToSellOut: statsRaw.aboutToSellOutNumber ?? statsRaw.aboutToSellOut ?? 0,
-    advicePrepareSkcNumber: statsRaw.advicePrepareSkcNumber ?? 0,
-    waitProductNumber: statsRaw.waitProductNumber ?? 0,
-    highPriceLimit: statsRaw.adjustPrice ?? statsRaw.highPriceLimitNumber ?? 0,
+    onSaleProducts: toNumberValue(statsRaw.onSaleProductNumber),
+    sevenDaysSales: toNumberValue(statsRaw.sevenDaysSaleVolume),
+    thirtyDaysSales: toNumberValue(statsRaw.thirtyDaysSaleVolume),
+    lackSkcNumber: toNumberValue(statsRaw.lackSkcNumber),
+    alreadySoldOut: toNumberValue(pickFirst(statsRaw.alreadySoldOutNumber, statsRaw.sellOutNum)),
+    aboutToSellOut: toNumberValue(pickFirst(statsRaw.aboutToSellOutNumber, statsRaw.aboutToSellOut)),
+    advicePrepareSkcNumber: toNumberValue(statsRaw.advicePrepareSkcNumber),
+    waitProductNumber: toNumberValue(statsRaw.waitProductNumber),
+    highPriceLimit: toNumberValue(pickFirst(statsRaw.adjustPrice, statsRaw.highPriceLimitNumber)),
   } : undefined;
 
-  // 排名数据 - 路径: /bg/swift/api/common/statistics/queryIncomeRanking
   const rankRaw = findApi(apis, "queryIncomeRanking");
   const ranking = rankRaw ? {
-    date: rankRaw.pt || "",
-    overall: rankRaw.ranking ?? undefined,
-    pvRank: rankRaw.mallPVRank ?? undefined,
-    richnessRank: rankRaw.mallGoodsRichnessRank ?? undefined,
-    saleOutRate: rankRaw.mallSaleOutRateRank ?? undefined,
+    date: toStringValue(rankRaw.pt),
+    overall: pickFirst(rankRaw.ranking, undefined),
+    pvRank: pickFirst(rankRaw.mallPVRank, undefined),
+    richnessRank: pickFirst(rankRaw.mallGoodsRichnessRank, undefined),
+    saleOutRate: pickFirst(rankRaw.mallSaleOutRateRank, undefined),
   } : undefined;
 
-  // 收入数据 - 路径: /api/merchant/front/finance/income-summary
   const incomeRaw = findApi(apis, "income-summary");
   const income = Array.isArray(incomeRaw) ? incomeRaw.map((item: any) => ({
-    date: item.date,
-    amount: item.incomeAmount?.digitalText || item.incomeAmount?.fullText || "0",
+    date: toStringValue(item.date),
+    amount: toStringValue(pickFirst(item.incomeAmount?.digitalText, item.incomeAmount?.fullText, item.amount, "0")),
   })) : undefined;
 
-  // 商品状态 - 路径: /api/kiana/mms/robin/queryProductStatusCount
   const productStatusRaw = findApi(apis, "queryProductStatusCount");
-  const productStatusArr = productStatusRaw?.productSkcStatusAggregation;
-  // 转换为 key-value 格式
-  const productStatus = Array.isArray(productStatusArr)
+  const productStatusArr = toArray(productStatusRaw?.productSkcStatusAggregation);
+  const productStatus = productStatusArr.length > 0
     ? productStatusArr.reduce((acc: any, item: any) => {
         const statusMap: Record<number, string> = {
-          1: "toSubmit", 3: "rejected", 7: "notListed", 9: "onSale",
-          10: "soldOut", 11: "offShelf", 12: "inReview", 13: "toConfirm",
-          14: "banned", 15: "other",
+          1: "toSubmit",
+          3: "rejected",
+          7: "notListed",
+          9: "onSale",
+          10: "soldOut",
+          11: "offShelf",
+          12: "inReview",
+          13: "toConfirm",
+          14: "banned",
+          15: "other",
         };
         const key = statusMap[item.selectStatus] || `status_${item.selectStatus}`;
-        acc[key] = item.count;
+        acc[key] = toNumberValue(item.count);
         return acc;
       }, {})
     : undefined;
 
-  // 销售分析 - 路径: /api/sale/analysis/total
   const saleAnalysis = findApi(apis, "analysis/total");
 
   return { ...raw, statistics, ranking, income, productStatus, saleAnalysis, syncedAt: raw.syncedAt };
@@ -78,245 +313,159 @@ export function parseDashboardData(raw: any): any {
 
 // ============ Products 商品列表 ============
 export function parseProductsData(raw: any): any[] {
-  if (Array.isArray(raw)) return raw; // 已经是数组
-  if (!isRawApiFormat(raw)) return [];
-  const apis = raw.apis;
-
-  // 从 product/skc/pageQuery 提取商品列表
-  const allProducts: any[] = [];
-  const productResults = findAllApis(apis, "product/skc/pageQuery");
-  for (const result of productResults) {
-    const items = result?.pageItems || [];
-    items.forEach((p: any) => {
-      // categories 是对象 {cat1:{catId,catName}, cat2:...}，需要提取文本
-      const catObj = p.categories;
-      let categoryStr = "";
-      if (typeof catObj === "string") {
-        categoryStr = catObj;
-      } else if (catObj && typeof catObj === "object") {
-        categoryStr = Object.keys(catObj)
-          .filter(k => k.startsWith("cat"))
-          .sort()
-          .map(k => catObj[k]?.catName || "")
-          .filter(Boolean)
-          .join(" > ");
-      }
-      const leafCatName = typeof p.leafCat === "string" ? p.leafCat :
-        (p.leafCat?.catName || "");
-
-      // 提取 SKU 货号列表
-      const skuSummaries = p.productSkuSummaries;
-      let skuExtCodes = "";
-      if (Array.isArray(skuSummaries)) {
-        skuExtCodes = skuSummaries
-          .map((s: any) => s.extCode || s.skuExtCode || "")
-          .filter(Boolean)
-          .join(", ");
-      }
-
-      allProducts.push({
-        title: p.productName || "",
-        category: leafCatName || categoryStr,
-        categories: categoryStr,
-        spuId: String(p.productId || ""),
-        skcId: String(p.productSkcId || ""),
-        goodsId: String(p.goodsId || ""),
-        sku: p.extCode || skuExtCodes || "",
-        imageUrl: p.thumbUrl || p.mainImageUrl || "",
-        price: "",
-        status: p.removeStatus === 0 ? "在售" : p.removeStatus === 1 ? "已下架" : String(p.removeStatus ?? ""),
-        totalSales: p.productTotalSalesVolume || 0,
-        last7DaysSales: p.last7DaysSalesVolume || 0,
-        skcStatus: p.skcStatus,
-        skcSiteStatus: p.skcSiteStatus,
-        createdAt: p.createdAt,
-        syncedAt: raw.syncedAt || "",
-      });
-    });
+  if (Array.isArray(raw)) {
+    return normalizeProductsFromList(raw);
   }
-  return allProducts;
+  if (Array.isArray(raw?.items)) {
+    return normalizeProductsFromList(raw.items, raw.syncedAt || "");
+  }
+  if (!isRawApiFormat(raw)) return [];
+
+  const apis = getRawApis(raw);
+  const productResults = findAllApis(apis, "product/skc/pageQuery");
+  const products = productResults.flatMap((result) =>
+    normalizeProductsFromList(
+      toArray(result?.pageItems).length > 0 ? result.pageItems : toArray(result?.list),
+      raw.syncedAt || "",
+    ),
+  );
+
+  return dedupeByKey(products, (item) => [item.skcId, item.goodsId, item.spuId, item.title].filter(Boolean).join("|"));
 }
 
 // ============ Orders 备货单 ============
 export function parseOrdersData(raw: any): any[] {
   if (Array.isArray(raw)) return raw;
   if (!isRawApiFormat(raw)) return [];
-  const apis = raw.apis;
 
-  // 从备货单相关 API 提取 - 路径: mms/venom/api/supplier/purchase/manager/querySubOrderList
-  const allOrders: any[] = [];
+  const apis = getRawApis(raw);
   const orderResults = findAllApis(apis, "querySubOrderList");
-  for (const result of orderResults) {
-    const items = result?.subOrderForSupplierList || result?.pageItems || result?.list || [];
-    if (Array.isArray(items)) {
-      items.forEach((item: any, idx: number) => {
-        const firstSku = item.skuQuantityDetailList?.[0] ||
-          item.skuQuantityDetailForSupplierList?.[0];
-        allOrders.push({
-          key: allOrders.length + 1,
-          type: typeof item.categoryType === "number"
-            ? (item.categoryType === 1 ? "紧急备货建议" : item.categoryType === 2 ? "普通备货建议" : String(item.categoryType))
-            : (item.categoryType || ""),
-          purchaseOrderNo: item.subPurchaseOrderSn || item.originalPurchaseOrderSn || "",
-          parentOrderNo: item.originalPurchaseOrderSn || "",
-          title: item.productName || "",
-          skcId: String(item.productSkcId || ""),
-          skuId: String(firstSku?.productSkuId || ""),
-          skuCode: firstSku?.skuExtCode || "",
-          quantity: firstSku?.purchaseQuantity ?? item.skuQuantityTotalInfo?.totalPurchaseQuantity ?? 0,
-          status: typeof item.status === "number"
-            ? ({ 1: "待发货", 2: "已发货", 3: "已完成", 4: "已取消", 5: "部分发货" } as Record<number, string>)[item.status] || String(item.status)
-            : (item.status || ""),
-          amount: firstSku?.supplierPrice ? (firstSku.supplierPrice / 100).toFixed(2) : "",
-          warehouse: item.warehouseGroupName || "",
-          orderTime: item.purchaseTime || "",
-          urgencyInfo: item.urgencyType ? String(item.urgencyType) : "",
-          attributes: firstSku?.className || "",
-        });
+  const allOrders: any[] = [];
+
+  orderResults.forEach((result) => {
+    const items = toArray(
+      pickFirst(
+        result?.subOrderForSupplierList,
+        result?.pageItems,
+        result?.list,
+      ),
+    );
+
+    items.forEach((item: any) => {
+      const firstSku = pickFirst(
+        toArray(item.skuQuantityDetailList)[0],
+        toArray(item.skuQuantityDetailForSupplierList)[0],
+        item.skuInfo,
+      ) || {};
+
+      allOrders.push({
+        key: allOrders.length + 1,
+        type: typeof item.categoryType === "number"
+          ? (item.categoryType === 1 ? "紧急备货建议" : item.categoryType === 2 ? "普通备货建议" : String(item.categoryType))
+          : toStringValue(item.categoryType),
+        purchaseOrderNo: toStringValue(pickFirst(item.subPurchaseOrderSn, item.purchaseOrderNo, item.originalPurchaseOrderSn)),
+        parentOrderNo: toStringValue(item.originalPurchaseOrderSn),
+        title: toStringValue(pickFirst(item.productName, item.title)),
+        skcId: toStringValue(pickFirst(item.productSkcId, item.skcId)),
+        skuId: toStringValue(pickFirst(firstSku.productSkuId, firstSku.skuId)),
+        skuCode: toStringValue(pickFirst(firstSku.skuExtCode, firstSku.skuCode)),
+        quantity: toNumberValue(pickFirst(firstSku.purchaseQuantity, item.skuQuantityTotalInfo?.totalPurchaseQuantity)),
+        status: typeof item.status === "number"
+          ? ({ 1: "待发货", 2: "已发货", 3: "已完成", 4: "已取消", 5: "部分发货" } as Record<number, string>)[item.status] || String(item.status)
+          : toStringValue(item.status),
+        amount: firstSku.supplierPrice !== undefined ? formatFenPrice(firstSku.supplierPrice) : "",
+        warehouse: toStringValue(item.warehouseGroupName),
+        orderTime: toStringValue(pickFirst(item.purchaseTime, item.orderTime)),
+        urgencyInfo: toStringValue(item.urgencyType),
+        attributes: toStringValue(pickFirst(firstSku.className, firstSku.attribute)),
       });
-    }
-  }
+    });
+  });
+
   return allOrders;
 }
 
 // ============ Sales 销售管理 ============
 export function parseSalesData(raw: any): any {
-  // 新格式：scrapeSales 直接返回 {summary, items, apis}，items 含 skuList
-  if (raw?.items && Array.isArray(raw.items) && raw.items[0]?.skuList) {
-    // 扁平化：每个 SKU 一行
-    const flatItems = raw.items.flatMap((item: any, idx: number) =>
-      (item.skuList || []).map((sku: any, si: number) => ({
-        key: idx * 100 + si + 1,
-        title: item.productName || "",
-        category: item.category || "",
-        skcId: item.skcId || "",
-        spuId: item.spuId || "",
-        imageUrl: item.imageUrl || "",
-        skuId: sku.skuId || "",
-        skuName: sku.skuName || "",
-        skuCode: sku.skuCode || "",
-        price: sku.price || 0,
-        warehouseStock: sku.warehouseStock || 0,
-        occupyStock: sku.occupyStock || 0,
-        unavailableStock: sku.unavailableStock || 0,
-        warehouseGroup: sku.warehouseGroup || "",
-        suggestStock: sku.suggestStock || 0,
-        stockStatus: sku.stockStatus || "",
-      }))
-    );
-    return { summary: raw.summary || {}, items: flatItems, syncedAt: raw.syncedAt };
+  if (Array.isArray(raw?.items) && raw.items.some((item: any) => Array.isArray(item?.skuList))) {
+    return {
+      summary: raw.summary || {},
+      items: normalizeSalesItemsFromSkuList(raw.items, raw.syncedAt),
+      syncedAt: raw.syncedAt,
+    };
   }
-  if (raw?.items && Array.isArray(raw.items)) return raw; // 旧格式已解析
+
+  if (Array.isArray(raw?.items)) {
+    return {
+      summary: raw.summary || {},
+      items: raw.items.map((item: any) => normalizeSalesFlatItem(item, raw.syncedAt)),
+      syncedAt: raw.syncedAt,
+    };
+  }
+
   if (!isRawApiFormat(raw)) return { summary: {}, items: [] };
-  const apis = raw.apis;
+  const apis = getRawApis(raw);
 
-  // 统计概览 - 路径: mms/venom/api/supplier/sales/management/listOverall
-  const overallRaw = findApi(apis, "listOverall");
-  const summary = overallRaw ? {
-    saleOutSkcNum: overallRaw.saleOutSkcNum ?? 0,
-    soonSaleOutSkcNum: overallRaw.soonSaleOutSkcNum ?? 0,
-    adviceStockSkcNum: overallRaw.adviceStockSkcNum ?? 0,
-    completelySoldOutSkcNum: overallRaw.completelySoldOutSkcNum ?? 0,
-    adSkcNum: overallRaw.adSkcNum ?? 0,
-    shortageSkcNum: overallRaw.shortageSkcNum ?? 0,
-    totalSkcNum: overallRaw.totalSkcNum ?? 0,
-  } : {};
+  const overallRaw = pickFirst(
+    findApi(apis, "listOverall"),
+    findApi(apis, "sales/management/overall"),
+  ) || {};
 
-  // 销售商品列表（从 listOverall.subOrderList）
-  const items: any[] = [];
-  const subList = overallRaw?.subOrderList || [];
-  if (Array.isArray(subList)) {
-    subList.forEach((item: any, idx: number) => {
-      const firstSku = item.skuQuantityDetailList?.[0];
-      items.push({
-        key: idx + 1,
-        title: item.productName || "",
-        category: typeof item.category === "object" ? (item.category?.catName || "") : String(item.category || ""),
-        skcId: String(item.productSkcId || ""),
-        imageUrl: item.productSkcPicture || "",
-        todaySales: firstSku?.todaySaleVolume ?? 0,
-        last7DaysSales: firstSku?.lastSevenDaysSaleVolume ?? 0,
-        last30DaysSales: firstSku?.lastThirtyDaysSaleVolume ?? 0,
-        totalSales: firstSku?.totalSaleVolume ?? 0,
-        warehouseStock: firstSku?.inventoryNumInfo?.warehouseInventoryNum ?? 0,
-        adviceQuantity: firstSku?.adviceQuantity ?? 0,
-        lackQuantity: firstSku?.lackQuantity ?? 0,
-        price: firstSku?.supplierPrice ? (firstSku.supplierPrice / 100).toFixed(2) : "",
-        skuCode: firstSku?.skuExtCode || "",
-        stockStatus: typeof item.stockStatus === "number" ? String(item.stockStatus) : (item.stockStatus || ""),
-        supplyStatus: typeof item.supplyStatus === "number"
-          ? ({ 0: "正常供货", 1: "暂时无法供货", 2: "永久停止供货" } as Record<number, string>)[item.supplyStatus] || String(item.supplyStatus)
-          : (item.supplyStatus || ""),
-        hotTag: typeof item.hotTag === "object" ? (item.hotTag?.tagName || "") : String(item.hotTag || ""),
-        isAdProduct: item.isAdProduct ? "广告商品" : "",
-        availableSaleDays: firstSku?.availableSaleDays ?? null,
-      });
-    });
-  }
+  const summary = {
+    saleOutSkcNum: toNumberValue(overallRaw.saleOutSkcNum),
+    soonSaleOutSkcNum: toNumberValue(overallRaw.soonSaleOutSkcNum),
+    adviceStockSkcNum: toNumberValue(overallRaw.adviceStockSkcNum),
+    completelySoldOutSkcNum: toNumberValue(overallRaw.completelySoldOutSkcNum),
+    adSkcNum: toNumberValue(overallRaw.adSkcNum),
+    shortageSkcNum: toNumberValue(overallRaw.shortageSkcNum),
+    totalSkcNum: toNumberValue(overallRaw.totalSkcNum),
+  };
+
+  const itemSources = [
+    ...toArray(overallRaw?.subOrderList),
+    ...toArray(overallRaw?.pageItems),
+    ...toArray(overallRaw?.list),
+  ];
+  const items = itemSources.map((item: any) => {
+    const firstSku = pickFirst(
+      toArray(item.skuQuantityDetailList)[0],
+      toArray(item.skuQuantityDetailForSupplierList)[0],
+      item.skuInfo,
+      item,
+    ) || {};
+    return normalizeSalesFlatItem(
+      {
+        ...item,
+        ...firstSku,
+        productSkcPicture: pickFirst(item.productSkcPicture, item.imageUrl),
+      },
+      raw.syncedAt,
+    );
+  });
 
   return { summary, items, syncedAt: raw.syncedAt };
 }
 
 // ============ Flux 流量分析 ============
 export function parseFluxData(raw: any): any {
-  if (raw?.summary !== undefined && raw?.items !== undefined && !raw?.apis) return raw;
-  if (!isRawApiFormat(raw)) return { summary: null, items: [] };
-  const apis = raw.apis;
-
-  // 店铺流量概览 - 路径: /api/seller/full/flow/analysis/mall/summary
-  const mallSummaryRaw = findApi(apis, "mall/summary");
-  const mallSummary = mallSummaryRaw ? {
-    todayVisitors: mallSummaryRaw.todayTotalVisitorsNum ?? 0,
-    todayBuyers: mallSummaryRaw.todayPayBuyerNum ?? 0,
-    todayConversionRate: mallSummaryRaw.todayConversionRate ?? 0,
-    updateTime: mallSummaryRaw.updateTime || "",
-    trendList: Array.isArray(mallSummaryRaw.trendList)
-      ? mallSummaryRaw.trendList.map((t: any) => ({
-          date: t.statDate || t.date || "",
-          visitors: t.visitorsNum ?? t.visitors ?? 0,
-          buyers: t.payBuyerNum ?? t.buyers ?? 0,
-          conversionRate: t.conversionRate ?? 0,
-        }))
-      : [],
-  } : null;
-
-  // 商品流量数据 - 路径: /api/seller/full/flow/analysis/goods/list (可能为 null)
-  const items: any[] = [];
-  const fluxResults = findAllApis(apis, "goods/list");
-  for (const result of fluxResults) {
-    if (!result) continue; // goods/list 可能返回 null
-    const list = result?.list || result?.pageItems || [];
-    if (Array.isArray(list)) {
-      list.forEach((item: any, idx: number) => {
-        items.push({
-          key: items.length + 1,
-          goodsId: String(item.goodsId || ""),
-          goodsName: item.goodsName || "",
-          imageUrl: item.goodsImageUrl || item.imageUrl || "",
-          spuId: String(item.productSpuId || ""),
-          category: typeof item.category === "object" ? (item.category?.catName || "") : String(item.category || ""),
-          exposeNum: item.exposeNum || 0,
-          exposeNumChange: item.exposeNumLinkRelative ?? null,
-          clickNum: item.clickNum || 0,
-          clickNumChange: item.clickNumLinkRelative ?? null,
-          detailVisitNum: item.goodsDetailVisitNum || 0,
-          detailVisitorNum: item.goodsDetailVisitorNum || 0,
-          addToCartUserNum: item.addToCartUserNum || 0,
-          collectUserNum: item.collectUserNum || 0,
-          payGoodsNum: item.payGoodsNum || 0,
-          payOrderNum: item.payOrderNum || 0,
-          buyerNum: item.buyerNum || 0,
-          searchExposeNum: item.searchExposeNum || 0,
-          searchClickNum: item.searchClickNum || 0,
-          recommendExposeNum: item.recommendExposeNum || 0,
-          recommendClickNum: item.recommendClickNum || 0,
-          clickPayRate: item.clickPayConversionRate || 0,
-          exposeClickRate: item.exposeClickConversionRate || 0,
-          growDataText: typeof item.growDataText === "string" ? item.growDataText : "",
-        });
-      });
-    }
+  if (raw?.summary !== undefined && raw?.items !== undefined && !raw?.apis) {
+    return {
+      summary: normalizeFluxSummary(raw.summary),
+      items: normalizeFluxItems(toArray(raw.items)),
+      syncedAt: raw.syncedAt,
+    };
   }
+
+  if (!isRawApiFormat(raw)) return { summary: null, items: [] };
+  const apis = getRawApis(raw);
+
+  const mallSummary = normalizeFluxSummary(findApi(apis, "mall/summary"));
+  const fluxResults = findAllApis(apis, "goods/list");
+  const items = fluxResults.flatMap((result) =>
+    normalizeFluxItems(
+      toArray(pickFirst(result?.list, result?.pageItems, result?.items)),
+    ),
+  );
 
   return { summary: mallSummary, items, syncedAt: raw.syncedAt };
 }
@@ -326,11 +475,17 @@ export function parseStoreData(key: string, raw: any): any {
   if (!raw || !isRawApiFormat(raw)) return raw;
 
   switch (key) {
-    case "dashboard": return parseDashboardData(raw);
-    case "products": return parseProductsData(raw);
-    case "orders": return parseOrdersData(raw);
-    case "sales": return parseSalesData(raw);
-    case "flux": return parseFluxData(raw);
-    default: return raw; // 其他数据保持原始格式
+    case "dashboard":
+      return parseDashboardData(raw);
+    case "products":
+      return parseProductsData(raw);
+    case "orders":
+      return parseOrdersData(raw);
+    case "sales":
+      return parseSalesData(raw);
+    case "flux":
+      return parseFluxData(raw);
+    default:
+      return raw;
   }
 }

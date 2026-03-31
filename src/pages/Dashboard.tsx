@@ -30,6 +30,7 @@ export default function Dashboard() {
     successCount, errorCount,
     startCollectAll, startSyncDashboard, syncingDashboard,
   } = useCollection();
+  const completedCount = Object.values(taskStates).filter((task) => task.status === "success" || task.status === "error").length;
 
   return (
     <div>
@@ -65,7 +66,7 @@ export default function Dashboard() {
             percent={progress}
             status={collecting ? "active" : progress === 100 ? (errorCount > 0 ? "exception" : "success") : "normal"}
             strokeColor={{ "0%": "#f56a00", "100%": "#52c41a" }}
-            format={() => collecting ? `${successCount}/${COLLECT_TASKS.length}` : progress === 100 ? `${successCount} 成功` : "就绪"}
+            format={() => collecting ? `${completedCount}/${COLLECT_TASKS.length}` : progress === 100 ? `${successCount} 成功` : "就绪"}
           />
           {collecting && (
             <div style={{ textAlign: "center", marginTop: 4 }}>

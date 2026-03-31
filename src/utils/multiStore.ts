@@ -13,11 +13,13 @@ export interface MultiStoreAccount {
 
 export const ACCOUNT_SCOPED_BASE_KEYS = [
   "temu_collection_diagnostics",
+  "temu_create_history",
   "temu_dashboard",
   "temu_products",
   "temu_orders",
   "temu_sales",
   "temu_flux",
+  "temu_task_manager_state",
   "temu_raw_goodsData",
   "temu_raw_lifecycle",
   "temu_raw_imageTask",
@@ -38,6 +40,8 @@ export const ACCOUNT_SCOPED_BASE_KEYS = [
   "temu_raw_returnReceipt",
   "temu_raw_exceptionNotice",
   "temu_raw_afterSales",
+  "temu_raw_soldout",
+  "temu_raw_performance",
   "temu_raw_checkup",
   "temu_raw_qualityDashboard",
   "temu_raw_qualityDashboardEU",
@@ -68,6 +72,7 @@ export const ACCOUNT_SCOPED_BASE_KEYS = [
   "temu_raw_governComplianceReference",
   "temu_raw_governCustomsAttribute",
   "temu_raw_governCategoryCorrection",
+  "temu_raw_delivery",
   "temu_raw_adsHome",
   "temu_raw_adsProduct",
   "temu_raw_adsReport",
@@ -146,4 +151,18 @@ export async function setActiveAccountAndSync(store: StoreLike, accounts: MultiS
   await syncScopedDataToGlobalStore(store, nextId);
   emitActiveAccountChanged(nextId);
   return nextId;
+}
+
+export async function setStoreValueForActiveAccount(store: StoreLike, baseKey: string, value: any) {
+  if (!store) return;
+
+  await store.set(baseKey, value);
+  if (!ACCOUNT_SCOPED_BASE_KEYS.includes(baseKey as typeof ACCOUNT_SCOPED_BASE_KEYS[number])) {
+    return;
+  }
+
+  const activeAccountId = await readActiveAccountId(store);
+  if (!activeAccountId) return;
+
+  await store.set(buildScopedStoreKey(activeAccountId, baseKey), value);
 }

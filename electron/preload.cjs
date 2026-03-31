@@ -33,8 +33,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("automation:create-product", params),
     autoPricing: (params) =>
       ipcRenderer.invoke("automation:auto-pricing", params),
+    startAutoPricing: (params) =>
+      ipcRenderer.invoke("automation:auto-pricing", params),
     getProgress: () =>
       ipcRenderer.invoke("automation:get-progress"),
+    getTaskProgress: (taskId) =>
+      ipcRenderer.invoke("automation:get-task-progress", taskId),
+    listTasks: () =>
+      ipcRenderer.invoke("automation:list-tasks"),
     readScrapeData: (key) =>
       ipcRenderer.invoke("automation:read-scrape-data", key),
     scrapeLifecycle: () =>
@@ -51,10 +57,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("automation:scrape-us-retrieval"),
     scrapeDelivery: () =>
       ipcRenderer.invoke("automation:scrape-delivery"),
-    pausePricing: () =>
-      ipcRenderer.invoke("automation:pause-pricing"),
-    resumePricing: () =>
-      ipcRenderer.invoke("automation:resume-pricing"),
+    pausePricing: (taskId) =>
+      ipcRenderer.invoke("automation:pause-pricing", taskId),
+    resumePricing: (taskId) =>
+      ipcRenderer.invoke("automation:resume-pricing", taskId),
     listDrafts: () =>
       ipcRenderer.invoke("automation:list-drafts"),
     retryDraft: (draftId) =>

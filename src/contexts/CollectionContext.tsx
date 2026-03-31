@@ -1,6 +1,12 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from "react";
 import { message } from "antd";
 import { parseDashboardData, parseProductsData, parseOrdersData, parseSalesData, parseFluxData } from "../utils/parseRawApis";
+import {
+  COLLECTION_DIAGNOSTICS_KEY,
+  normalizeCollectionDiagnostics,
+  type CollectionTaskDiagnostic,
+} from "../utils/collectionDiagnostics";
+import { setStoreValueForActiveAccount } from "../utils/multiStore";
 
 const api = window.electronAPI?.automation;
 const store = window.electronAPI?.store;
@@ -14,7 +20,7 @@ export interface CollectTask {
   category: string;
 }
 
-// 全部62个采集任务（不含 icon，icon 在 UI 层处理）
+// 全部65个采集任务（不含 icon，icon 在 UI 层处理）
 export const COLLECT_TASKS: CollectTask[] = [
   { key: "dashboard", label: "仪表盘概览", storeKey: "temu_dashboard", category: "核心数据" },
   { key: "products", label: "商品列表", storeKey: "temu_products", category: "核心数据" },
@@ -35,12 +41,15 @@ export const COLLECT_TASKS: CollectTask[] = [
   { key: "shippingDesk", label: "发货台", storeKey: "temu_raw_shippingDesk", category: "订单物流" },
   { key: "shippingList", label: "发货单列表", storeKey: "temu_raw_shippingList", category: "订单物流" },
   { key: "addressManage", label: "发退货地址", storeKey: "temu_raw_addressManage", category: "订单物流" },
+  { key: "delivery", label: "发货考核", storeKey: "temu_raw_delivery", category: "订单物流" },
   { key: "returnOrders", label: "退货单", storeKey: "temu_raw_returnOrders", category: "退货管理" },
   { key: "returnDetail", label: "退货详情", storeKey: "temu_raw_returnDetail", category: "退货管理" },
   { key: "salesReturn", label: "销售退货", storeKey: "temu_raw_salesReturn", category: "退货管理" },
   { key: "returnReceipt", label: "退货收据", storeKey: "temu_raw_returnReceipt", category: "退货管理" },
   { key: "exceptionNotice", label: "收货异常", storeKey: "temu_raw_exceptionNotice", category: "退货管理" },
   { key: "afterSales", label: "售后数据", storeKey: "temu_raw_afterSales", category: "售后质量" },
+  { key: "soldout", label: "售罄分析", storeKey: "temu_raw_soldout", category: "订单物流" },
+  { key: "performance", label: "履约表现", storeKey: "temu_raw_performance", category: "订单物流" },
   { key: "checkup", label: "体检中心", storeKey: "temu_raw_checkup", category: "售后质量" },
   { key: "qualityDashboard", label: "质量看板", storeKey: "temu_raw_qualityDashboard", category: "售后质量" },
   { key: "qualityDashboardEU", label: "欧盟质量看板", storeKey: "temu_raw_qualityDashboardEU", category: "售后质量" },
@@ -159,6 +168,7 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
     setProgress(5);
 
     const syncedAt = new Date().toLocaleString("zh-CN");
+    const diagnosticsTasks: Record<string, CollectionTaskDiagnostic> = {};
 
     try {
       const allResults: any = await api.scrapeAll();
@@ -169,6 +179,9 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
         if (r && r.success) {
           try {
             const data = await api.readScrapeData(task.key);
+            if (data === null || data === undefined) {
+              throw new Error("采集结果文件为空或未生成");
+            }
             const count = data?.apis?.length || 0;
 
             let storeData: any = data;
@@ -180,14 +193,14 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
               else if (task.key === "flux") storeData = parseFluxData(data);
 
               if (Array.isArray(storeData)) {
-                await store?.set(task.storeKey, storeData);
+                await setStoreValueForActiveAccount(store, task.storeKey, storeData);
               } else if (typeof storeData === "object" && storeData !== null) {
-                await store?.set(task.storeKey, { ...storeData, syncedAt });
+                await setStoreValueForActiveAccount(store, task.storeKey, { ...storeData, syncedAt });
               } else {
-                await store?.set(task.storeKey, storeData);
+                await setStoreValueForActiveAccount(store, task.storeKey, storeData);
               }
             } else {
-              await store?.set(task.storeKey, { ...data, syncedAt });
+              await setStoreValueForActiveAccount(store, task.storeKey, { ...data, syncedAt });
             }
 
             const displayCount = !PARSED_TASK_KEYS.has(task.key) ? count
@@ -196,30 +209,92 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
               : task.key === "sales" ? (storeData?.items?.length || count)
               : count;
 
+            diagnosticsTasks[task.key] = {
+              status: "success",
+              storeKey: task.storeKey,
+              updatedAt: syncedAt,
+              count: displayCount,
+              duration: r.duration,
+              message: `${displayCount} 条数据`,
+            };
+
             setTaskStates(prev => ({ ...prev, [task.key]: {
               status: "success", count: displayCount, duration: r.duration, message: `${displayCount} 条数据`
             }}));
-          } catch {
+          } catch (error: any) {
+            const detail = error?.message || "读取采集结果失败";
+            diagnosticsTasks[task.key] = {
+              status: "error",
+              storeKey: task.storeKey,
+              updatedAt: syncedAt,
+              duration: r.duration,
+              message: detail.substring(0, 50),
+            };
             setTaskStates(prev => ({ ...prev, [task.key]: {
-              status: "success", count: r.dataSize || 0, duration: r.duration, message: `已保存 (${Math.round((r.dataSize || 0) / 1024)}KB)`
+              status: "error", duration: r.duration, message: detail.substring(0, 50)
             }}));
           }
         } else if (r) {
+          diagnosticsTasks[task.key] = {
+            status: "error",
+            storeKey: task.storeKey,
+            updatedAt: syncedAt,
+            duration: r.duration,
+            message: r.error?.substring(0, 50) || "未知错误",
+          };
           setTaskStates(prev => ({ ...prev, [task.key]: {
             status: "error", duration: r.duration, message: r.error?.substring(0, 50) || "未知错误"
+          }}));
+        } else {
+          diagnosticsTasks[task.key] = {
+            status: "error",
+            storeKey: task.storeKey,
+            updatedAt: syncedAt,
+            message: "未收到采集结果",
+          };
+          setTaskStates(prev => ({ ...prev, [task.key]: {
+            status: "error", message: "未收到采集结果"
           }}));
         }
         completed++;
         setProgress(Math.round((completed / COLLECT_TASKS.length) * 100));
       }
 
-      message.success("一键采集完成!");
+      const successTotal = Object.values(diagnosticsTasks).filter((task) => task.status === "success").length;
+      const errorTotal = Object.values(diagnosticsTasks).filter((task) => task.status === "error").length;
+      if (errorTotal > 0) {
+        message.warning(`采集完成：${successTotal} 项成功，${errorTotal} 项失败`);
+      } else {
+        message.success("一键采集完成!");
+      }
     } catch (e: any) {
       message.error("采集失败: " + e.message);
       COLLECT_TASKS.forEach(t => {
+        diagnosticsTasks[t.key] = {
+          status: "error",
+          storeKey: t.storeKey,
+          updatedAt: syncedAt,
+          message: e.message?.substring(0, 50) || "采集失败",
+        };
         setTaskStates(prev => ({ ...prev, [t.key]: { status: "error", message: e.message?.substring(0, 50) }}));
       });
       setProgress(100);
+    }
+
+    if (store) {
+      try {
+        const successTotal = Object.values(diagnosticsTasks).filter((task) => task.status === "success").length;
+        const errorTotal = Object.values(diagnosticsTasks).filter((task) => task.status === "error").length;
+        await setStoreValueForActiveAccount(store, COLLECTION_DIAGNOSTICS_KEY, {
+          syncedAt,
+          tasks: diagnosticsTasks,
+          summary: {
+            totalTasks: COLLECT_TASKS.length,
+            successCount: successTotal,
+            errorCount: errorTotal,
+          },
+        });
+      } catch {}
     }
 
     setCollecting(false);
@@ -228,14 +303,100 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
   const startSyncDashboard = useCallback(async () => {
     if (!api || syncingDashboard) return;
     setSyncingDashboard(true);
+    setTaskStates((prev) => ({
+      ...prev,
+      dashboard: {
+        status: "running",
+        message: "正在同步仪表盘数据",
+      },
+    }));
     try {
       const res = await api.scrapeDashboard();
       const raw = (res as any)?.dashboard || res;
       const data = parseDashboardData(raw);
       const syncedAt = new Date().toLocaleString("zh-CN");
-      await store?.set("temu_dashboard", { ...data, syncedAt });
+      await setStoreValueForActiveAccount(store, "temu_dashboard", { ...data, syncedAt });
+      if (store) {
+        try {
+          const current = normalizeCollectionDiagnostics(await store.get(COLLECTION_DIAGNOSTICS_KEY));
+          await setStoreValueForActiveAccount(store, COLLECTION_DIAGNOSTICS_KEY, {
+            ...current,
+            syncedAt,
+            tasks: {
+              ...current.tasks,
+              dashboard: {
+                status: "success",
+                storeKey: "temu_dashboard",
+                updatedAt: syncedAt,
+                message: "仪表盘数据已同步",
+              },
+            },
+            summary: {
+              totalTasks: Math.max(current.summary.totalTasks, COLLECT_TASKS.length),
+              successCount: Object.values({
+                ...current.tasks,
+                dashboard: {
+                  status: "success",
+                  storeKey: "temu_dashboard",
+                  updatedAt: syncedAt,
+                  message: "仪表盘数据已同步",
+                },
+              }).filter((task) => task.status === "success").length,
+              errorCount: Object.values({
+                ...current.tasks,
+                dashboard: {
+                  status: "success",
+                  storeKey: "temu_dashboard",
+                  updatedAt: syncedAt,
+                  message: "仪表盘数据已同步",
+                },
+              }).filter((task) => task.status === "error").length,
+            },
+          });
+        } catch {}
+      }
+      setTaskStates((prev) => ({
+        ...prev,
+        dashboard: {
+          status: "success",
+          message: "仪表盘数据已同步",
+        },
+      }));
       message.success("仪表盘数据同步成功!");
     } catch (e: any) {
+      const detail = e?.message?.substring(0, 50) || "同步失败";
+      const updatedAt = new Date().toLocaleString("zh-CN");
+      if (store) {
+        try {
+          const current = normalizeCollectionDiagnostics(await store.get(COLLECTION_DIAGNOSTICS_KEY));
+          const nextTasks = {
+            ...current.tasks,
+            dashboard: {
+              status: "error",
+              storeKey: "temu_dashboard",
+              updatedAt,
+              message: detail,
+            },
+          };
+          await setStoreValueForActiveAccount(store, COLLECTION_DIAGNOSTICS_KEY, {
+            ...current,
+            syncedAt: updatedAt,
+            tasks: nextTasks,
+            summary: {
+              totalTasks: Math.max(current.summary.totalTasks, COLLECT_TASKS.length),
+              successCount: Object.values(nextTasks).filter((task) => task.status === "success").length,
+              errorCount: Object.values(nextTasks).filter((task) => task.status === "error").length,
+            },
+          });
+        } catch {}
+      }
+      setTaskStates((prev) => ({
+        ...prev,
+        dashboard: {
+          status: "error",
+          message: detail,
+        },
+      }));
       message.error("同步失败: " + e.message);
     } finally {
       setSyncingDashboard(false);

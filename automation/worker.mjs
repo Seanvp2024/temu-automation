@@ -3933,6 +3933,8 @@ async function handleRequest(body) {
         { key: "goodsData", fn: () => _registryScrape("goodsData") },
         { key: "activity", fn: () => _registryScrape("activity") },
         { key: "afterSales", fn: () => _registryScrape("aftersales") },
+        { key: "soldout", fn: () => _registryScrape("soldout") },
+        { key: "performance", fn: () => _registryScrape("performance") },
         // ---- 扩展采集 ----
         { key: "lifecycle", fn: () => _registryScrape("lifecycle") },
         { key: "priceCompete", fn: () => _registryScrape("priceCompete") },
@@ -3940,6 +3942,7 @@ async function handleRequest(body) {
         { key: "shippingDesk", fn: () => _registryScrape("shippingDesk") },
         { key: "shippingList", fn: () => _registryScrape("shippingList") },
         { key: "addressManage", fn: () => _registryScrape("addressManage") },
+        { key: "delivery", fn: () => _registryScrape("delivery") },
         { key: "returnOrders", fn: () => _registryScrape("returnOrders") },
         { key: "exceptionNotice", fn: () => _registryScrape("exceptionNotice") },
         { key: "returnDetail", fn: () => _registryScrape("returnDetail") },
@@ -4456,8 +4459,34 @@ async function handleRequest(body) {
     }
     case "close": await closeBrowser(); return { status: "closed" };
     case "shutdown": await closeBrowser(); setTimeout(() => process.exit(0), 100); return { status: "shutting_down" };
-    case "pause_pricing": pricingPaused = true; console.error("[Worker] Pricing PAUSED"); return { status: "paused" };
-    case "resume_pricing": pricingPaused = false; console.error("[Worker] Pricing RESUMED"); return { status: "resumed" };
+    case "pause_pricing":
+      if (!isCurrentProgressTask(params?.taskId)) {
+        return { status: currentProgress.status || "idle", taskId: currentProgress.taskId };
+      }
+      pricingPaused = true;
+      updateCurrentProgress({
+        running: true,
+        paused: true,
+        status: "paused",
+        step: "已暂停",
+        message: "批量上品任务已暂停，等待继续。",
+      });
+      console.error("[Worker] Pricing PAUSED");
+      return { status: "paused", taskId: currentProgress.taskId };
+    case "resume_pricing":
+      if (!isCurrentProgressTask(params?.taskId)) {
+        return { status: currentProgress.status || "idle", taskId: currentProgress.taskId };
+      }
+      pricingPaused = false;
+      updateCurrentProgress({
+        running: true,
+        paused: false,
+        status: "running",
+        step: "继续执行",
+        message: "批量上品任务已恢复。",
+      });
+      console.error("[Worker] Pricing RESUMED");
+      return { status: "resumed", taskId: currentProgress.taskId };
     default: {
       // 注册表驱动的采集命令（替代 50+ 重复 case）
       const scrapeHandlers = buildScrapeHandlers({
@@ -5181,9 +5210,28 @@ async function uploadImageToKwcdn(page, localImagePath) {
  */
 async function autoPricingFromCSV(params) {
   console.error("[auto-pricing] Starting full auto pricing flow...");
+  const taskId = typeof params?.taskId === "string" && params.taskId.trim()
+    ? params.taskId.trim()
+    : `pricing_${Date.now()}`;
   const csvPath = params.csvPath;
   if (!csvPath || !fs.existsSync(csvPath)) {
-    return { success: false, message: "CSV文件不存在: " + csvPath };
+    const message = "CSV文件不存在: " + csvPath;
+    const failedAt = getProgressTimestamp();
+    replaceCurrentProgress({
+      taskId,
+      status: "failed",
+      running: false,
+      paused: false,
+      current: "失败",
+      step: "校验文件",
+      message,
+      csvPath: typeof csvPath === "string" ? csvPath : "",
+      startRow: Number(params?.startRow) || 0,
+      count: Number(params?.count) || 0,
+      updatedAt: failedAt,
+      finishedAt: failedAt,
+    });
+    return { success: false, taskId, message };
   }
 
   const startRow = params.startRow || 0;
@@ -5246,13 +5294,32 @@ async function autoPricingFromCSV(params) {
 
   console.error(`[auto-pricing] Columns: name=${nameIdx}, image=${imageIdx}, cat=${catCnIdx}, price=${priceIdx}`);
 
-  const total = Math.min(count, dataRows.length - startRow);
+  const total = Math.max(0, Math.min(count, dataRows.length - startRow));
   console.error(`[auto-pricing] Will process ${total} products (dataRows=${dataRows.length})`);
   console.error(`[auto-pricing] Columns: name=${nameIdx}, nameEn=${nameEnIdx}, image=${imageIdx}, carousel=${carouselIdx}, cat=${catCnIdx}, price=${priceIdx}`);
 
   // 创建临时目录
   const tmpDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "auto-pricing-tmp");
   fs.mkdirSync(tmpDir, { recursive: true });
+  pricingPaused = false;
+  const startedAt = getProgressTimestamp();
+  replaceCurrentProgress({
+    taskId,
+    status: "running",
+    running: true,
+    paused: false,
+    total,
+    completed: 0,
+    current: "准备中...",
+    step: "初始化",
+    message: "批量上品任务运行中",
+    csvPath,
+    startRow,
+    count,
+    createdAt: startedAt,
+    startedAt,
+    updatedAt: startedAt,
+  });
 
   for (let i = startRow; i < startRow + total; i++) {
     const cols = dataRows[i] || [];
@@ -5268,12 +5335,30 @@ async function autoPricingFromCSV(params) {
 
     // 暂停检查：等待恢复
     while (pricingPaused) {
-      currentProgress = { running: true, paused: true, total, completed: itemNum - 1, current: `${itemNum}/${total} ${productName.slice(0, 30)}`, step: "已暂停", results: [...results] };
+      syncCurrentProgressResults(results, {
+        running: true,
+        paused: true,
+        status: "paused",
+        total,
+        completed: itemNum - 1,
+        current: `${itemNum}/${total} ${productName.slice(0, 30)}`,
+        step: "已暂停",
+        message: "批量上品任务已暂停，等待继续。",
+      });
       await new Promise(r => setTimeout(r, 1000));
     }
 
     // 更新实时进度
-    currentProgress = { running: true, total, completed: itemNum - 1, current: `${itemNum}/${total} ${productName.slice(0, 30)}`, step: "开始处理", results: [...results] };
+    syncCurrentProgressResults(results, {
+      running: true,
+      paused: false,
+      status: "running",
+      total,
+      completed: itemNum - 1,
+      current: `${itemNum}/${total} ${productName.slice(0, 30)}`,
+      step: "开始处理",
+      message: "批量上品任务运行中",
+    });
     console.error(`\n[auto-pricing] ======== ${itemNum}/${total} ========`);
     console.error(`[auto-pricing] Title: ${productName.slice(0, 50)}`);
     console.error(`[auto-pricing] Category: ${categoryCn}`);
@@ -5281,7 +5366,7 @@ async function autoPricingFromCSV(params) {
 
     try {
       // Step 1: 下载商品原图
-      currentProgress.step = "下载原图";
+      updateCurrentProgress({ step: "下载原图" });
       let sourceImagePath = null;
       if (imageUrl?.startsWith("http")) {
         const imgFile = path.join(tmpDir, `source_${i}_${Date.now()}.jpg`);
@@ -5296,6 +5381,7 @@ async function autoPricingFromCSV(params) {
 
       if (!sourceImagePath) {
         results.push({ index: i, name: productName.slice(0, 40), success: false, message: "无法下载商品原图" });
+        syncCurrentProgressResults(results, { current: `${itemNum}/${total} ${productName.slice(0, 30)}`, step: "原图下载失败" });
         continue;
       }
 
@@ -5314,11 +5400,12 @@ async function autoPricingFromCSV(params) {
       }
 
       // Step 2: AI 生成 10 张图（主图 + 轮播图一起给 AI）
-      currentProgress.step = "AI生图中...";
+      updateCurrentProgress({ step: "AI生图中..." });
       console.error(`[auto-pricing] Generating AI images (${1 + carouselLocalPaths.length} source images)...`);
       const aiResult = await generateImagesWithAI(sourceImagePath, productName, carouselLocalPaths);
       if (!aiResult.success) {
         results.push({ index: i, name: productName.slice(0, 40), success: false, message: "AI生图失败: " + (aiResult.error || "图片不足5张") });
+        syncCurrentProgressResults(results, { current: `${itemNum}/${total} ${productName.slice(0, 30)}`, step: "AI生图失败" });
         continue;
       }
 
@@ -5334,7 +5421,7 @@ async function autoPricingFromCSV(params) {
       console.error(`[auto-pricing] Saved ${Object.keys(localImages).length} images locally`);
 
       // Step 4: 上传到素材中心获取 kwcdn URL
-      currentProgress.step = "上传图片...";
+      updateCurrentProgress({ step: "上传图片..." });
       console.error(`[auto-pricing] Uploading to material center...`);
       const page = await context.newPage();
       await navigateToSellerCentral(page, "/goods/list");
@@ -5369,11 +5456,12 @@ async function autoPricingFromCSV(params) {
 
       if (orderedImageUrls.length < 5) {
         results.push({ index: i, name: productName.slice(0, 40), success: false, message: `上传图片不足5张 (${orderedImageUrls.length})` });
+        syncCurrentProgressResults(results, { current: `${itemNum}/${total} ${productName.slice(0, 30)}`, step: "图片上传失败" });
         continue;
       }
 
       // Step 5: AI 生成中文标题
-      currentProgress.step = "生成标题...";
+      updateCurrentProgress({ step: "生成标题..." });
       let finalTitle = productName;
       if (aiResult.analysis) {
         try {
@@ -5422,7 +5510,7 @@ async function autoPricingFromCSV(params) {
       const categorySearch = categoryCn || aiCategory || productName;
       console.error(`[auto-pricing] Category search: CSV="${categoryCn}" AI="${aiCategory}" → using "${categorySearch}"`);
 
-      currentProgress.step = "提交核价...";
+      updateCurrentProgress({ step: "提交核价..." });
       console.error(`[auto-pricing] Submitting pricing with ${orderedImageUrls.length} images...`);
       const createResult = await createProductViaAPI({
         title: finalTitle,
@@ -5438,6 +5526,11 @@ async function autoPricingFromCSV(params) {
         name: productName.slice(0, 40),
         ...createResult,
       });
+      syncCurrentProgressResults(results, {
+        current: `${itemNum}/${total} ${productName.slice(0, 30)}`,
+        step: createResult.success ? "提交成功" : "提交失败",
+        message: createResult.success ? "当前商品提交成功" : (createResult.message || "当前商品提交失败"),
+      });
       console.error(`[auto-pricing] ${createResult.success ? "SUCCESS productId=" + createResult.productId : "FAIL: " + createResult.message}`);
 
       // 清理临时文件
@@ -5448,6 +5541,11 @@ async function autoPricingFromCSV(params) {
 
     } catch (e) {
       results.push({ index: i, name: productName.slice(0, 40), success: false, message: e.message });
+      syncCurrentProgressResults(results, {
+        current: `${itemNum}/${total} ${productName.slice(0, 30)}`,
+        step: "执行失败",
+        message: e.message || "当前商品执行失败",
+      });
       console.error(`[auto-pricing] ERROR: ${e.message}`);
     }
 
@@ -5470,8 +5568,20 @@ async function autoPricingFromCSV(params) {
   fs.writeFileSync(resultFile, JSON.stringify({ total: results.length, successCount, failCount: failedItems.length, results }, null, 2));
 
   // 重置进度
-  currentProgress = { running: false, total: results.length, completed: results.length, current: "完成", step: "完成", results };
-  return { success: true, total: results.length, successCount, failCount: failedItems.length, results, resultFile };
+  const finishedAt = getProgressTimestamp();
+  syncCurrentProgressResults(results, {
+    running: false,
+    paused: false,
+    status: "completed",
+    total: results.length,
+    completed: results.length,
+    current: "完成",
+    step: "完成",
+    message: `批量上品完成：${successCount} 成功，${failedItems.length} 失败`,
+    updatedAt: finishedAt,
+    finishedAt,
+  });
+  return { success: true, taskId, total: results.length, successCount, failCount: failedItems.length, results, resultFile };
 }
 
 // ============================================================
@@ -6512,7 +6622,7 @@ async function batchCreateViaAPI(params) {
     return result;
   }
 
-  const total = Math.min(count, lines.length - 1 - startRow);
+  const total = Math.max(0, Math.min(count, lines.length - 1 - startRow));
   console.error(`[batch-api] Processing ${total} products (rows ${startRow}-${startRow + total - 1})`);
 
   for (let i = startRow; i < startRow + total; i++) {
@@ -6633,15 +6743,137 @@ async function batchCreateViaAPI(params) {
 }
 
 // 全局进度追踪
-let currentProgress = { running: false, total: 0, completed: 0, current: "", results: [] };
+function getProgressTimestamp() {
+  return new Date().toLocaleString("zh-CN");
+}
+
+function summarizeProgressResults(results) {
+  const list = Array.isArray(results) ? results : [];
+  const successCount = list.filter((item) => item?.success).length;
+  return {
+    successCount,
+    failCount: list.length - successCount,
+  };
+}
+
+function createProgressState(patch = {}) {
+  const results = Array.isArray(patch.results) ? [...patch.results] : [];
+  const summary = summarizeProgressResults(results);
+  return {
+    taskId: typeof patch.taskId === "string" ? patch.taskId : "",
+    running: Boolean(patch.running),
+    paused: Boolean(patch.paused),
+    status: typeof patch.status === "string" ? patch.status : "idle",
+    total: Number(patch.total) || 0,
+    completed: Number(patch.completed) || 0,
+    current: typeof patch.current === "string" ? patch.current : "",
+    step: typeof patch.step === "string" ? patch.step : "",
+    results,
+    successCount: summary.successCount,
+    failCount: summary.failCount,
+    message: typeof patch.message === "string" ? patch.message : "",
+    csvPath: typeof patch.csvPath === "string" ? patch.csvPath : "",
+    startRow: Number(patch.startRow) || 0,
+    count: Number(patch.count) || 0,
+    createdAt: typeof patch.createdAt === "string" ? patch.createdAt : "",
+    startedAt: typeof patch.startedAt === "string" ? patch.startedAt : "",
+    updatedAt: typeof patch.updatedAt === "string" ? patch.updatedAt : "",
+    finishedAt: typeof patch.finishedAt === "string" ? patch.finishedAt : "",
+  };
+}
+
+const PROGRESS_HISTORY_LIMIT = 10;
+let currentProgress = createProgressState();
+let progressHistory = [];
 let pricingPaused = false;  // 暂停标志
+
+function shouldTrackProgressSnapshot(task) {
+  return Boolean(
+    task?.taskId
+    || task?.running
+    || task?.paused
+    || task?.completed
+    || (Array.isArray(task?.results) && task.results.length > 0)
+    || (typeof task?.status === "string" && task.status !== "idle")
+  );
+}
+
+function rememberProgressSnapshot(task) {
+  if (!shouldTrackProgressSnapshot(task)) return;
+  const snapshot = createProgressState(task);
+  progressHistory = [
+    snapshot,
+    ...progressHistory.filter((item) => item?.taskId !== snapshot.taskId),
+  ].slice(0, PROGRESS_HISTORY_LIMIT);
+}
+
+function replaceCurrentProgress(patch = {}) {
+  currentProgress = createProgressState(patch);
+  rememberProgressSnapshot(currentProgress);
+  return currentProgress;
+}
+
+function getProgressSnapshot(taskId) {
+  if (taskId) {
+    if (currentProgress.taskId === taskId) return currentProgress;
+    return progressHistory.find((item) => item?.taskId === taskId) || createProgressState({ taskId });
+  }
+  return currentProgress;
+}
+
+function listProgressSnapshots() {
+  if (!shouldTrackProgressSnapshot(currentProgress)) {
+    return [...progressHistory];
+  }
+  return [
+    currentProgress,
+    ...progressHistory.filter((item) => item?.taskId !== currentProgress.taskId),
+  ].slice(0, PROGRESS_HISTORY_LIMIT);
+}
+
+function updateCurrentProgress(patch = {}) {
+  const nextResults = Array.isArray(patch.results) ? [...patch.results] : currentProgress.results;
+  const summary = summarizeProgressResults(nextResults);
+  currentProgress = {
+    ...currentProgress,
+    ...patch,
+    results: nextResults,
+    successCount: summary.successCount,
+    failCount: summary.failCount,
+    updatedAt: typeof patch.updatedAt === "string" ? patch.updatedAt : getProgressTimestamp(),
+  };
+  rememberProgressSnapshot(currentProgress);
+  return currentProgress;
+}
+
+function syncCurrentProgressResults(results, patch = {}) {
+  return updateCurrentProgress({
+    ...patch,
+    completed: Array.isArray(results) ? results.length : currentProgress.completed,
+    results: Array.isArray(results) ? [...results] : currentProgress.results,
+  });
+}
+
+function isCurrentProgressTask(taskId) {
+  return !taskId || !currentProgress.taskId || currentProgress.taskId === taskId;
+}
 
 const server = http.createServer(async (req, res) => {
   // GET /progress - 实时进度查询
-  if (req.method === "GET" && req.url === "/progress") {
-    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-    res.end(JSON.stringify(currentProgress));
-    return;
+  if (req.method === "GET") {
+    const requestUrl = new URL(req.url, "http://127.0.0.1");
+    if (requestUrl.pathname === "/progress") {
+      const taskId = requestUrl.searchParams.get("taskId");
+      const snapshot = getProgressSnapshot(taskId);
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(snapshot));
+      return;
+    }
+    if (requestUrl.pathname === "/tasks") {
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(listProgressSnapshots()));
+      return;
+    }
   }
 
   if (req.method !== "POST") { res.writeHead(404); res.end(); return; }
