@@ -5,7 +5,6 @@ import {
   ACTIVE_ACCOUNT_CHANGED_EVENT,
   emitActiveAccountChanged,
   readActiveAccountId,
-  setActiveAccountAndSync,
   syncScopedDataToGlobalStore,
   writeActiveAccountId,
 } from "./utils/multiStore";
@@ -73,24 +72,28 @@ function App() {
       const accounts = await store.get(ACCOUNT_STORAGE_KEY);
       if (cancelled) return;
 
-      if (!Array.isArray(accounts) || accounts.length === 0) {
-        await writeActiveAccountId(store, null);
-        await syncScopedDataToGlobalStore(store, null);
-        emitActiveAccountChanged(null);
-        return;
-      }
-
       const activeAccountId = await readActiveAccountId(store);
       if (cancelled) return;
 
-      if (activeAccountId && accounts.some((account: { id?: string }) => account?.id === activeAccountId)) {
-        await setActiveAccountAndSync(store, accounts, activeAccountId);
+      if (!Array.isArray(accounts) || accounts.length === 0) {
+        if (activeAccountId) {
+          await writeActiveAccountId(store, null);
+          emitActiveAccountChanged(null);
+        }
+        await syncScopedDataToGlobalStore(store, null);
         return;
       }
 
-      await writeActiveAccountId(store, null);
+      if (activeAccountId && accounts.some((account: { id?: string }) => account?.id === activeAccountId)) {
+        await syncScopedDataToGlobalStore(store, activeAccountId);
+        return;
+      }
+
+      if (activeAccountId) {
+        await writeActiveAccountId(store, null);
+        emitActiveAccountChanged(null);
+      }
       await syncScopedDataToGlobalStore(store, null);
-      emitActiveAccountChanged(null);
     };
 
     restoreActiveAccountData().catch(() => {});

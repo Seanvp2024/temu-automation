@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, Menu } = require("electron");
 const path = require("path");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -179,13 +179,23 @@ async function shutdownOldWorker() {
         // 先尝试 shutdown 命令
         await httpPost(oldPort, { action: "shutdown" }).catch(() => {});
         await new Promise(r => setTimeout(r, 1000));
-        // 如果还在运行，用系统命令杀掉
+        // 如果还在运行，用系统命令杀掉（异步避免阻塞主线程）
         try {
-          const { execSync } = require("child_process");
-          const out = execSync(`netstat -ano | findstr :${oldPort} | findstr LISTENING`, { encoding: "utf8" });
+          const { exec } = require("child_process");
+          const out = await new Promise((resolve, reject) => {
+            exec(`netstat -ano | findstr :${oldPort} | findstr LISTENING`, { encoding: "utf8", timeout: 5000 }, (err, stdout) => {
+              if (err) return reject(err);
+              resolve(stdout);
+            });
+          });
           const pids = [...new Set(out.trim().split(/\n/).map(l => l.trim().split(/\s+/).pop()))];
           for (const pid of pids) {
-            try { execSync(`taskkill /F /PID ${pid}`); console.log(`[Main] Killed old worker PID ${pid}`); } catch {}
+            try {
+              await new Promise((resolve) => {
+                exec(`taskkill /F /PID ${pid}`, { timeout: 3000 }, () => resolve());
+              });
+              console.log(`[Main] Killed old worker PID ${pid}`);
+            } catch {}
           }
         } catch {}
         await new Promise(r => setTimeout(r, 500));
@@ -713,10 +723,36 @@ let imageStudioStatus = {
   port: AUTO_IMAGE_PORT,
   ready: false,
 };
+const IMAGE_STUDIO_EVENT_CHANNEL = "image-studio:event";
+const imageStudioGenerateControllers = new Map();
 
 function updateImageStudioStatus(patch = {}) {
   imageStudioStatus = { ...imageStudioStatus, ...patch, url: `http://${AUTO_IMAGE_HOST}:${AUTO_IMAGE_PORT}`, port: AUTO_IMAGE_PORT };
   return imageStudioStatus;
+}
+
+function readEnvKeyValueFile(filePath) {
+  const values = {};
+  if (!filePath || !fs.existsSync(filePath)) {
+    return values;
+  }
+
+  try {
+    const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx < 1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      const val = trimmed.slice(eqIdx + 1).trim();
+      values[key] = val;
+    }
+  } catch (error) {
+    console.error("[Main] Failed to read env file:", error.message);
+  }
+
+  return values;
 }
 
 function dedupePaths(paths) {
@@ -734,6 +770,18 @@ function dedupePaths(paths) {
 function getAutoImageProjectCandidates() {
   const appDir = app.getAppPath();
   const cwd = process.cwd();
+  const homeDir = require("os").homedir();
+
+  // 检测 git 仓库根目录（worktree 场景下 cwd 可能嵌套很深）
+  // 缓存 git 根目录避免重复 execSync 调用
+  if (typeof getAutoImageProjectCandidates._gitRoot === "undefined") {
+    try {
+      const { execSync } = require("child_process");
+      getAutoImageProjectCandidates._gitRoot = execSync("git rev-parse --show-toplevel", { cwd, encoding: "utf-8", timeout: 3000 }).trim();
+    } catch { getAutoImageProjectCandidates._gitRoot = ""; }
+  }
+  const gitRoot = getAutoImageProjectCandidates._gitRoot;
+
   return dedupePaths([
     process.env.AUTO_IMAGE_GEN_DIR,
     app.isPackaged ? path.join(process.resourcesPath, "auto-image-gen-runtime") : path.resolve(appDir, "build", "auto-image-gen-runtime"),
@@ -743,6 +791,11 @@ function getAutoImageProjectCandidates() {
     path.resolve(cwd, "auto-image-gen-dev"),
     path.resolve(cwd, "..", "auto-image-gen-dev"),
     path.resolve(cwd, "build", "auto-image-gen-runtime"),
+    // 用户主目录（auto-image-gen-dev 通常在这里）
+    path.resolve(homeDir, "auto-image-gen-dev"),
+    // git 仓库根目录（worktree 场景）
+    gitRoot ? path.resolve(gitRoot, "build", "auto-image-gen-runtime") : "",
+    gitRoot ? path.resolve(gitRoot, "..", "auto-image-gen-dev") : "",
     app.isPackaged ? path.join(process.resourcesPath, "auto-image-gen-runtime") : "",
   ]);
 }
@@ -827,7 +880,15 @@ async function ensureImageStudioService() {
   updateImageStudioStatus({ status: "starting", ready: false, message: "正在启动 AI 出图服务…" });
 
   const nodeExe = findNodeExe();
-  const env = { ...process.env, PORT: String(AUTO_IMAGE_PORT), HOSTNAME: AUTO_IMAGE_HOST, NODE_ENV: "production" };
+
+  // 读取项目目录下的 .env.local，注入 API Key 等配置（Next.js standalone 模式不自动加载）
+  const envLocalPath = path.join(projectInfo.projectPath, ".env.local");
+  const envLocalVars = readEnvKeyValueFile(envLocalPath);
+  if (Object.keys(envLocalVars).length > 0) {
+    console.log(`[Main] Loaded ${Object.keys(envLocalVars).length} vars from ${envLocalPath}`);
+  }
+
+  const env = { ...process.env, ...envLocalVars, PORT: String(AUTO_IMAGE_PORT), HOSTNAME: AUTO_IMAGE_HOST, NODE_ENV: "production" };
 
   const spawnArgs = projectInfo.mode === "packaged-runtime"
     ? [projectInfo.serverPath]
@@ -858,12 +919,260 @@ async function ensureImageStudioService() {
   return updateImageStudioStatus({ status: "ready", ready: true, message: "AI 出图服务已就绪" });
 }
 
+function getImageStudioProjectInfo() {
+  const resolved = resolveAutoImageProjectDir();
+  const projectPath = imageStudioStatus.projectPath || resolved?.projectPath || "";
+  return {
+    ...resolved,
+    projectPath,
+    envLocalPath: projectPath ? path.join(projectPath, ".env.local") : "",
+  };
+}
+
+function getImageStudioAuthHeaders(projectInfo = getImageStudioProjectInfo()) {
+  const envLocalVars = readEnvKeyValueFile(projectInfo.envLocalPath);
+  if (envLocalVars.API_SECRET) {
+    return {
+      Authorization: `Bearer ${envLocalVars.API_SECRET}`,
+    };
+  }
+  return {};
+}
+
+function getImageStudioWebContents(target) {
+  const candidate = target?.sender || mainWindow?.webContents || null;
+  if (!candidate || candidate.isDestroyed()) {
+    return null;
+  }
+  return candidate;
+}
+
+function emitImageStudioEvent(target, payload) {
+  const webContents = getImageStudioWebContents(target);
+  if (!webContents) return;
+  webContents.send(IMAGE_STUDIO_EVENT_CHANNEL, payload);
+}
+
+async function readImageStudioResponse(response) {
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    try {
+      return await response.json();
+    } catch {
+      return {};
+    }
+  }
+
+  try {
+    return await response.text();
+  } catch {
+    return "";
+  }
+}
+
+async function imageStudioFetch(routePath, init = {}) {
+  const status = await ensureImageStudioService();
+  const projectInfo = getImageStudioProjectInfo();
+  const headers = {
+    ...getImageStudioAuthHeaders(projectInfo),
+    ...(init.headers || {}),
+  };
+  return fetch(`${status.url}${routePath}`, {
+    ...init,
+    headers,
+  });
+}
+
+async function imageStudioJson(routePath, init = {}) {
+  const response = await imageStudioFetch(routePath, init);
+  const payload = await readImageStudioResponse(response);
+  if (!response.ok) {
+    const message = payload && typeof payload === "object" && typeof payload.error === "string"
+      ? payload.error
+      : (typeof payload === "string" && payload ? payload : `AI 出图服务请求失败 (${response.status})`);
+    throw new Error(message);
+  }
+  return payload;
+}
+
+function createImageStudioBlob(file) {
+  const buffer = Buffer.from(file?.buffer instanceof ArrayBuffer ? new Uint8Array(file.buffer) : []);
+  return new Blob([buffer], { type: file?.type || "application/octet-stream" });
+}
+
+function createImageStudioFormData(payload = {}) {
+  const formData = new FormData();
+  const files = Array.isArray(payload.files) ? payload.files : [];
+  files.forEach((file, index) => {
+    const blob = createImageStudioBlob(file);
+    formData.append("images", blob, file?.name || `image-${index + 1}.png`);
+  });
+
+  Object.entries(payload.fields || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    formData.append(key, typeof value === "string" ? value : JSON.stringify(value));
+  });
+
+  return formData;
+}
+
+function normalizeImageStudioHistoryList(payload) {
+  return Array.isArray(payload) ? payload : [];
+}
+
+function normalizeImageStudioPlanList(payload) {
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  if (Array.isArray(payload?.plans)) {
+    return payload.plans;
+  }
+  return [];
+}
+
+function parseImageStudioSseChunk(buffer, onEvent) {
+  let remaining = buffer;
+  let boundaryIndex = remaining.indexOf("\n\n");
+  while (boundaryIndex !== -1) {
+    const chunk = remaining.slice(0, boundaryIndex);
+    remaining = remaining.slice(boundaryIndex + 2);
+    const lines = chunk.split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(":") || !trimmed.startsWith("data:")) continue;
+      const payloadText = trimmed.slice(5).trim();
+      if (!payloadText) continue;
+      try {
+        onEvent(JSON.parse(payloadText));
+      } catch {}
+    }
+    boundaryIndex = remaining.indexOf("\n\n");
+  }
+  return remaining;
+}
+
+async function streamImageStudioGenerate(target, jobId, payload = {}) {
+  const controller = new AbortController();
+  imageStudioGenerateControllers.set(jobId, controller);
+  const generatedImages = [];
+  const emittedComplete = { current: false };
+
+  const emitComplete = () => {
+    if (emittedComplete.current) return;
+    emittedComplete.current = true;
+    emitImageStudioEvent(target, {
+      jobId,
+      type: "generate:complete",
+      results: generatedImages,
+    });
+  };
+
+  try {
+    emitImageStudioEvent(target, { jobId, type: "generate:started" });
+
+    const response = await imageStudioFetch("/api/generate", {
+      method: "POST",
+      body: createImageStudioFormData({
+        files: payload.files,
+        fields: {
+          plans: payload.plans,
+          productMode: payload.productMode,
+          imageLanguage: payload.imageLanguage,
+          imageSize: payload.imageSize,
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorPayload = await readImageStudioResponse(response);
+      const message = errorPayload && typeof errorPayload === "object" && typeof errorPayload.error === "string"
+        ? errorPayload.error
+        : (typeof errorPayload === "string" && errorPayload ? errorPayload : "AI 出图请求失败");
+      throw new Error(message);
+    }
+
+    if (!response.body) {
+      throw new Error("AI 出图服务未返回流式结果");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      buffer = parseImageStudioSseChunk(buffer, (eventPayload) => {
+        emitImageStudioEvent(target, {
+          jobId,
+          type: "generate:event",
+          event: eventPayload,
+        });
+
+        if (eventPayload?.status === "done" && eventPayload?.imageUrl) {
+          generatedImages.push({
+            imageType: eventPayload.imageType || "",
+            imageUrl: eventPayload.imageUrl,
+          });
+        }
+
+        if (eventPayload?.status === "complete") {
+          emitComplete();
+        }
+      });
+    }
+
+    buffer = parseImageStudioSseChunk(buffer, (eventPayload) => {
+      emitImageStudioEvent(target, {
+        jobId,
+        type: "generate:event",
+        event: eventPayload,
+      });
+      if (eventPayload?.status === "done" && eventPayload?.imageUrl) {
+        generatedImages.push({
+          imageType: eventPayload.imageType || "",
+          imageUrl: eventPayload.imageUrl,
+        });
+      }
+      if (eventPayload?.status === "complete") {
+        emitComplete();
+      }
+    });
+
+    emitComplete();
+  } catch (error) {
+    if (controller.signal.aborted) {
+      emitImageStudioEvent(target, {
+        jobId,
+        type: "generate:cancelled",
+        message: "已取消本次生成",
+      });
+      return;
+    }
+
+    emitImageStudioEvent(target, {
+      jobId,
+      type: "generate:error",
+      error: error?.message || "AI 出图失败",
+    });
+  } finally {
+    imageStudioGenerateControllers.delete(jobId);
+  }
+}
+
 // ============ 窗口 ============
 
 async function createWindow() {
+  Menu.setApplicationMenu(null);
+
   mainWindow = new BrowserWindow({
     width: 1280, height: 800,
     title: "Temu 自动化运营工具",
+    show: false,
+    backgroundColor: "#ffffff",
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -871,9 +1180,16 @@ async function createWindow() {
     },
   });
 
+  mainWindow.setMenuBarVisibility(false);
+
+  mainWindow.once("ready-to-show", () => {
+    mainWindow.show();
+  });
+
   // 开发模式：等待 Vite dev server 就绪（最多30秒）
   const devUrl = "http://localhost:1420";
-  const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
+  const forcedProduction = process.env.NODE_ENV === "production";
+  const isDev = !forcedProduction && (process.env.NODE_ENV === "development" || !app.isPackaged);
 
   if (isDev) {
     console.log("[Main] Dev mode: waiting for Vite server...");
@@ -1226,6 +1542,124 @@ ipcMain.handle("image-studio:open-external", async () => {
   return status.url;
 });
 
+ipcMain.handle("image-studio:get-config", async () => {
+  const payload = await imageStudioJson("/api/config");
+  return payload && typeof payload === "object" ? payload : {};
+});
+
+ipcMain.handle("image-studio:update-config", async (_event, payload) => {
+  const nextPayload = Object.fromEntries(
+    Object.entries(payload || {}).filter(([, value]) => typeof value === "string" && value.trim())
+  );
+  if (Object.keys(nextPayload).length === 0) {
+    return imageStudioJson("/api/config");
+  }
+  await imageStudioJson("/api/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(nextPayload),
+  });
+  return imageStudioJson("/api/config");
+});
+
+ipcMain.handle("image-studio:analyze", async (_event, payload) => {
+  return imageStudioJson("/api/analyze", {
+    method: "POST",
+    body: createImageStudioFormData({
+      files: payload?.files,
+      fields: {
+        productMode: payload?.productMode || "single",
+      },
+    }),
+  });
+});
+
+ipcMain.handle("image-studio:regenerate-analysis", async (_event, payload) => {
+  return imageStudioJson("/api/regenerate-analysis", {
+    method: "POST",
+    body: createImageStudioFormData({
+      files: payload?.files,
+      fields: {
+        productMode: payload?.productMode || "single",
+        analysis: payload?.analysis || {},
+      },
+    }),
+  });
+});
+
+ipcMain.handle("image-studio:generate-plans", async (_event, payload) => {
+  const plans = await imageStudioJson("/api/plans", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      analysis: payload?.analysis || {},
+      imageTypes: Array.isArray(payload?.imageTypes) ? payload.imageTypes : [],
+      salesRegion: payload?.salesRegion || "us",
+      imageSize: payload?.imageSize || "1000x1000",
+      productMode: payload?.productMode || "single",
+    }),
+  });
+  return normalizeImageStudioPlanList(plans);
+});
+
+ipcMain.handle("image-studio:start-generate", async (event, payload) => {
+  const jobId = typeof payload?.jobId === "string" && payload.jobId
+    ? payload.jobId
+    : `image_job_${Date.now()}`;
+
+  streamImageStudioGenerate(event, jobId, payload).catch((error) => {
+    emitImageStudioEvent(event, {
+      jobId,
+      type: "generate:error",
+      error: error?.message || "AI 出图失败",
+    });
+  });
+
+  return { jobId };
+});
+
+ipcMain.handle("image-studio:cancel-generate", async (_event, jobId) => {
+  const controller = imageStudioGenerateControllers.get(jobId);
+  if (controller) {
+    controller.abort();
+  }
+  return { cancelled: Boolean(controller), jobId };
+});
+
+ipcMain.handle("image-studio:list-history", async () => {
+  const payload = await imageStudioJson("/api/history");
+  return normalizeImageStudioHistoryList(payload);
+});
+
+ipcMain.handle("image-studio:get-history-item", async (_event, id) => {
+  if (!id) return null;
+  return imageStudioJson(`/api/history?id=${encodeURIComponent(id)}`);
+});
+
+ipcMain.handle("image-studio:save-history", async (_event, payload) => {
+  return imageStudioJson("/api/history", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      productName: payload?.productName || "未命名商品",
+      salesRegion: payload?.salesRegion || "us",
+      imageCount: Number(payload?.imageCount) || 0,
+      images: Array.isArray(payload?.images) ? payload.images : [],
+    }),
+  });
+});
+
+ipcMain.handle("image-studio:score-image", async (_event, payload) => {
+  return imageStudioJson("/api/score", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      imageUrl: payload?.imageUrl || "",
+      imageType: payload?.imageType || "main",
+    }),
+  });
+});
+
 ipcMain.handle("app:get-version", () => app.getVersion());
 
 ipcMain.handle("app:get-update-status", () => updateState);
@@ -1241,7 +1675,11 @@ ipcMain.handle("app:check-for-updates", async () => {
 });
 
 ipcMain.handle("app:download-update", async () => {
-  await autoUpdater.downloadUpdate();
+  try {
+    await autoUpdater.downloadUpdate();
+  } catch (error) {
+    broadcastUpdateState({ status: "error", message: error?.message || "下载更新失败", progressPercent: null });
+  }
   return updateState;
 });
 
@@ -1266,13 +1704,18 @@ function getStoreBackupPath(filePath) {
   return `${filePath}.bak`;
 }
 
-function readStoreJson(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+const fsPromises = require("fs").promises;
+
+// ---- 同步版本（供 readAutoPricingState / writeAutoPricingState 等同步函数使用）----
+
+function readStoreJsonSync(filePath) {
+  const content = fs.readFileSync(filePath, "utf-8");
+  return JSON.parse(content);
 }
 
 function writeStoreJsonAtomic(filePath, data, options = {}) {
   const { skipBackup = false, key } = options;
-  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
   const backupPath = getStoreBackupPath(filePath);
   const serialized = JSON.stringify(serializeStoreValue(key, data), null, 2);
 
@@ -1280,23 +1723,17 @@ function writeStoreJsonAtomic(filePath, data, options = {}) {
 
   try {
     fs.writeFileSync(tempPath, serialized);
-
     if (fs.existsSync(filePath)) {
       if (!skipBackup) {
-        try {
-          fs.copyFileSync(filePath, backupPath);
-        } catch (error) {
-          console.error("[Store] Failed to create backup:", error.message);
+        try { fs.copyFileSync(filePath, backupPath); } catch (e) {
+          console.error("[Store] Failed to create backup:", e.message);
         }
       }
       fs.rmSync(filePath, { force: true });
     }
-
     fs.renameSync(tempPath, filePath);
   } catch (error) {
-    try {
-      if (fs.existsSync(tempPath)) fs.rmSync(tempPath, { force: true });
-    } catch {}
+    try { fs.rmSync(tempPath, { force: true }); } catch {}
     throw error;
   }
 }
@@ -1306,18 +1743,16 @@ function readStoreJsonWithRecovery(filePath, key) {
 
   if (fs.existsSync(filePath)) {
     try {
-      return deserializeStoreValue(key, readStoreJson(filePath), filePath);
+      return deserializeStoreValue(key, readStoreJsonSync(filePath), filePath);
     } catch (error) {
       console.error(`[Store] Failed to read ${path.basename(filePath)}:`, error.message);
     }
   }
 
-  if (!fs.existsSync(backupPath)) {
-    return null;
-  }
+  if (!fs.existsSync(backupPath)) return null;
 
   try {
-    const restored = readStoreJson(backupPath);
+    const restored = readStoreJsonSync(backupPath);
     writeStoreJsonAtomic(filePath, restored, { skipBackup: true, key });
     console.error(`[Store] Restored ${path.basename(filePath)} from backup`);
     return deserializeStoreValue(key, restored, filePath);
@@ -1327,11 +1762,84 @@ function readStoreJsonWithRecovery(filePath, key) {
   }
 }
 
-ipcMain.handle("store:get", (_, key) => {
-  return readStoreJsonWithRecovery(getStoreFilePath(key), key);
+// ---- 异步版本（供 IPC handler 使用）----
+
+async function readStoreJsonAsync(filePath) {
+  const content = await fsPromises.readFile(filePath, "utf-8");
+  return JSON.parse(content);
+}
+
+async function writeStoreJsonAtomicAsync(filePath, data, options = {}) {
+  const { skipBackup = false, key } = options;
+  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+  const backupPath = getStoreBackupPath(filePath);
+  const serialized = JSON.stringify(serializeStoreValue(key, data), null, 2);
+
+  await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
+
+  try {
+    await fsPromises.writeFile(tempPath, serialized);
+
+    let fileExists = false;
+    try { await fsPromises.access(filePath); fileExists = true; } catch {}
+
+    if (fileExists) {
+      if (!skipBackup) {
+        try {
+          await fsPromises.copyFile(filePath, backupPath);
+        } catch (error) {
+          console.error("[Store] Failed to create backup:", error.message);
+        }
+      }
+      await fsPromises.rm(filePath, { force: true });
+    }
+
+    await fsPromises.rename(tempPath, filePath);
+  } catch (error) {
+    try {
+      await fsPromises.rm(tempPath, { force: true });
+    } catch {}
+    throw error;
+  }
+}
+
+async function readStoreJsonWithRecoveryAsync(filePath, key) {
+  const backupPath = getStoreBackupPath(filePath);
+
+  let fileExists = false;
+  try { await fsPromises.access(filePath); fileExists = true; } catch {}
+
+  if (fileExists) {
+    try {
+      return deserializeStoreValue(key, await readStoreJsonAsync(filePath), filePath);
+    } catch (error) {
+      console.error(`[Store] Failed to read ${path.basename(filePath)}:`, error.message);
+    }
+  }
+
+  let backupExists = false;
+  try { await fsPromises.access(backupPath); backupExists = true; } catch {}
+
+  if (!backupExists) {
+    return null;
+  }
+
+  try {
+    const restored = await readStoreJsonAsync(backupPath);
+    await writeStoreJsonAtomicAsync(filePath, restored, { skipBackup: true, key });
+    console.error(`[Store] Restored ${path.basename(filePath)} from backup`);
+    return deserializeStoreValue(key, restored, filePath);
+  } catch (error) {
+    console.error(`[Store] Failed to recover ${path.basename(filePath)} from backup:`, error.message);
+    return null;
+  }
+}
+
+ipcMain.handle("store:get", async (_, key) => {
+  return readStoreJsonWithRecoveryAsync(getStoreFilePath(key), key);
 });
 
-ipcMain.handle("store:set", (_, key, data) => {
-  writeStoreJsonAtomic(getStoreFilePath(key), data, { key });
+ipcMain.handle("store:set", async (_, key, data) => {
+  await writeStoreJsonAtomicAsync(getStoreFilePath(key), data, { key });
   return true;
 });

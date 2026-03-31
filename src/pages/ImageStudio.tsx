@@ -1,18 +1,102 @@
-import { useEffect, useMemo, useState } from "react";
-import { Alert, Button, Empty, Space, Spin, Tag, Tooltip, Typography, message } from "antd";
-import { ReloadOutlined, ExportOutlined, ThunderboltOutlined } from "@ant-design/icons";
+import { startTransition, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Alert,
+  Button,
+  Card,
+  Checkbox,
+  Col,
+  Descriptions,
+  Drawer,
+  Empty,
+  Image,
+  Input,
+  List,
+  Progress,
+  Row,
+  Select,
+  Space,
+  Spin,
+  Statistic,
+  Steps,
+  Tag,
+  Tooltip,
+  Typography,
+  Upload,
+  message,
+} from "antd";
+import type { UploadFile } from "antd/es/upload/interface";
+import {
+  CopyOutlined,
+  DownloadOutlined,
+  ExportOutlined,
+  HistoryOutlined,
+  PictureOutlined,
+  ReloadOutlined,
+  RocketOutlined,
+  SaveOutlined,
+  SettingOutlined,
+  StarOutlined,
+  StopOutlined,
+  ThunderboltOutlined,
+  UploadOutlined,
+} from "@ant-design/icons";
+import {
+  DEFAULT_IMAGE_TYPES,
+  EMPTY_IMAGE_STUDIO_ANALYSIS,
+  EMPTY_IMAGE_STUDIO_CONFIG,
+  IMAGE_LANGUAGE_OPTIONS,
+  IMAGE_SIZE_OPTIONS,
+  IMAGE_TYPE_LABELS,
+  PRODUCT_MODE_OPTIONS,
+  SALES_REGION_OPTIONS,
+  arrayToMultiline,
+  formatTimestamp,
+  getDefaultImageLanguageForRegion,
+  hasMaskedValue,
+  isConfigMissing,
+  multilineToArray,
+  normalizeImageStudioAnalysis,
+  type ImageStudioAnalysis,
+  type ImageStudioConfig,
+  type ImageStudioGeneratedImage,
+  type ImageStudioHistoryItem,
+  type ImageStudioHistorySummary,
+  type ImageStudioImageScore,
+  type ImageStudioPlan,
+  type ImageStudioStatus,
+  type NativeImagePayload,
+} from "../utils/imageStudio";
 
-type ImageStudioStatus = {
-  status: string;
-  message: string;
-  url: string;
-  projectPath: string;
-  port: number;
-  ready: boolean;
+const { Title, Text, Paragraph } = Typography;
+const { TextArea } = Input;
+const imageStudioAPI = window.electronAPI?.imageStudio;
+const TEMU_ORANGE = "#e55b00";
+const TEMU_SOFT = "#fff2e8";
+const TEMU_BORDER = "#f0f0f0";
+const TEMU_PAGE_BG = "#f7f8fa";
+const TEMU_TEXT = "#1f2329";
+const TEMU_MUTED = "#8c8c8c";
+const TEMU_CARD_RADIUS = 22;
+const TEMU_CARD_SHADOW = "0 12px 30px rgba(15, 23, 42, 0.08)";
+const TEMU_BUTTON_GRADIENT = "linear-gradient(135deg, #ff922b 0%, #ff6a00 100%)";
+const TEMU_BUTTON_SHADOW = "0 10px 24px rgba(255, 106, 0, 0.24)";
+const TEMU_UPLOAD_BG = "radial-gradient(circle at top, #fff9f3 0%, #ffffff 72%)";
+const IMAGE_STUDIO_FAST_MAX_SIDE = 1600;
+const IMAGE_STUDIO_FAST_RAW_BYTES = 2.5 * 1024 * 1024;
+const IMAGE_STUDIO_FAST_QUALITY = 0.88;
+
+type ResultStatus = "idle" | "queued" | "generating" | "done" | "error";
+
+type ResultState = {
+  status: ResultStatus;
+  warnings: string[];
+  imageUrl?: string;
+  error?: string;
+  score?: ImageStudioImageScore;
+  scoring?: boolean;
 };
 
-const { Text } = Typography;
-const imageStudioAPI = window.electronAPI?.imageStudio;
+type ResultStateMap = Record<string, ResultState>;
 
 const FALLBACK_STATUS: ImageStudioStatus = {
   status: "idle",
@@ -23,35 +107,389 @@ const FALLBACK_STATUS: ImageStudioStatus = {
   ready: false,
 };
 
+function createEmptyResultState(status: ResultStatus = "idle"): ResultState {
+  return {
+    status,
+    warnings: [],
+  };
+}
+
+function getResultState(map: ResultStateMap, imageType: string): ResultState {
+  return map[imageType] || createEmptyResultState();
+}
+
+function sortImagesBySelectedTypes(images: ImageStudioGeneratedImage[], selectedTypes: string[]) {
+  return [...images].sort((left, right) => {
+    const leftIndex = selectedTypes.indexOf(left.imageType);
+    const rightIndex = selectedTypes.indexOf(right.imageType);
+    return (leftIndex === -1 ? Number.MAX_SAFE_INTEGER : leftIndex) - (rightIndex === -1 ? Number.MAX_SAFE_INTEGER : rightIndex);
+  });
+}
+
+function buildConfigDraft(config: ImageStudioConfig) {
+  return {
+    analyzeModel: config.analyzeModel,
+    analyzeApiKey: "",
+    analyzeBaseUrl: config.analyzeBaseUrl,
+    generateModel: config.generateModel,
+    generateApiKey: "",
+    generateBaseUrl: config.generateBaseUrl,
+  };
+}
+
+async function buildNativeImagePayloads(fileList: UploadFile[]): Promise<NativeImagePayload[]> {
+  const validFiles = fileList.flatMap((item) => (item.originFileObj ? [item.originFileObj] : []));
+
+  return Promise.all(
+    validFiles.map((file) => optimizeImageStudioFile(file)),
+  );
+}
+
+async function optimizeImageStudioFile(file: File): Promise<NativeImagePayload> {
+  const rawPayload = {
+    name: file.name,
+    type: file.type || "application/octet-stream",
+    size: file.size,
+    buffer: await file.arrayBuffer(),
+  };
+
+  if (!file.type.startsWith("image/") || file.type === "image/gif" || file.size <= IMAGE_STUDIO_FAST_RAW_BYTES) {
+    return rawPayload;
+  }
+
+  const objectUrl = URL.createObjectURL(file);
+
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const element = new window.Image();
+      element.onload = () => resolve(element);
+      element.onerror = () => reject(new Error("图片预处理失败"));
+      element.src = objectUrl;
+    });
+
+    const maxSide = Math.max(image.naturalWidth, image.naturalHeight);
+    if (!maxSide || maxSide <= IMAGE_STUDIO_FAST_MAX_SIDE) {
+      return rawPayload;
+    }
+
+    const scale = IMAGE_STUDIO_FAST_MAX_SIDE / maxSide;
+    const targetWidth = Math.max(1, Math.round(image.naturalWidth * scale));
+    const targetHeight = Math.max(1, Math.round(image.naturalHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+
+    const context = canvas.getContext("2d");
+    if (!context) {
+      return rawPayload;
+    }
+
+    context.drawImage(image, 0, 0, targetWidth, targetHeight);
+    const outputType = ["image/jpeg", "image/png", "image/webp"].includes(file.type) ? file.type : "image/jpeg";
+    const blob = await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob(resolve, outputType, outputType === "image/png" ? undefined : IMAGE_STUDIO_FAST_QUALITY);
+    });
+
+    if (!blob || blob.size >= file.size) {
+      return rawPayload;
+    }
+
+    return {
+      name: file.name,
+      type: blob.type || outputType,
+      size: blob.size,
+      buffer: await blob.arrayBuffer(),
+    };
+  } catch {
+    return rawPayload;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+function hasAnalysisContent(analysis: ImageStudioAnalysis) {
+  return Boolean(
+    analysis.productName.trim()
+    || analysis.category.trim()
+    || analysis.materials.trim()
+    || analysis.colors.trim()
+    || analysis.estimatedDimensions.trim()
+    || analysis.sellingPoints.length > 0
+    || analysis.targetAudience.length > 0
+    || analysis.usageScenes.length > 0,
+  );
+}
+
+function dedupeTextList(values: string[]) {
+  const seen = new Set<string>();
+  return values
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .filter((value) => {
+      if (seen.has(value)) return false;
+      seen.add(value);
+      return true;
+    });
+}
+
+function trimTitle(text: string, maxLength: number) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 1).trim()}…`;
+}
+
+function buildTitleSuggestions(analysis: ImageStudioAnalysis) {
+  const productName = analysis.productName.trim() || analysis.category.trim() || "商品";
+  const category = analysis.category.trim();
+  const materials = analysis.materials.trim();
+  const colors = analysis.colors.trim();
+  const size = analysis.estimatedDimensions.trim();
+  const sellingPoints = dedupeTextList(analysis.sellingPoints).slice(0, 3);
+
+  const keywordFocused = trimTitle(
+    [productName, category, materials, colors, size, ...sellingPoints.slice(0, 2)].filter(Boolean).join(" | "),
+    96,
+  );
+  const benefitFocused = trimTitle(
+    [productName, ...sellingPoints, size].filter(Boolean).join("，"),
+    88,
+  );
+  const conciseFocused = trimTitle(
+    [productName, sellingPoints[0], colors || materials].filter(Boolean).join("，"),
+    72,
+  );
+
+  return [
+    { key: "keywords", label: "关键词优化版", text: keywordFocused },
+    { key: "benefits", label: "卖点突出版", text: benefitFocused },
+    { key: "concise", label: "简洁精炼版", text: conciseFocused },
+  ];
+}
+
+function sanitizeDownloadNamePart(value: string) {
+  const sanitized = value
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sanitized || "image";
+}
+
+function getImageExtensionFromMimeType(mimeType?: string) {
+  if (!mimeType) return "";
+  if (mimeType.includes("png")) return "png";
+  if (mimeType.includes("jpeg") || mimeType.includes("jpg")) return "jpg";
+  if (mimeType.includes("webp")) return "webp";
+  if (mimeType.includes("gif")) return "gif";
+  return "";
+}
+
+function getImageExtensionFromUrl(imageUrl: string) {
+  const dataUrlMatch = imageUrl.match(/^data:image\/([a-z0-9.+-]+);/i);
+  if (dataUrlMatch?.[1]) {
+    const dataExtension = dataUrlMatch[1].toLowerCase();
+    return dataExtension === "jpeg" ? "jpg" : dataExtension;
+  }
+
+  const cleanUrl = imageUrl.split("#")[0]?.split("?")[0] || "";
+  const extensionMatch = cleanUrl.match(/\.([a-z0-9]{2,5})$/i);
+  return extensionMatch?.[1]?.toLowerCase() || "";
+}
+
+function triggerImageDownload(href: string, fileName: string) {
+  const anchor = document.createElement("a");
+  anchor.href = href;
+  anchor.download = fileName;
+  anchor.rel = "noopener";
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+}
+
 export default function ImageStudio() {
   const [status, setStatus] = useState<ImageStudioStatus>(FALLBACK_STATUS);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [configOpen, setConfigOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [config, setConfig] = useState<ImageStudioConfig>(EMPTY_IMAGE_STUDIO_CONFIG);
+  const [configDraft, setConfigDraft] = useState(buildConfigDraft(EMPTY_IMAGE_STUDIO_CONFIG));
+  const [historyItems, setHistoryItems] = useState<ImageStudioHistorySummary[]>([]);
+  const [uploadFiles, setUploadFiles] = useState<UploadFile[]>([]);
+  const [productMode, setProductMode] = useState("single");
+  const [salesRegion, setSalesRegion] = useState("us");
+  const [imageLanguage, setImageLanguage] = useState(getDefaultImageLanguageForRegion("us"));
+  const [imageSize, setImageSize] = useState("1000x1000");
+  const [selectedImageTypes, setSelectedImageTypes] = useState<string[]>(DEFAULT_IMAGE_TYPES);
+  const [analysis, setAnalysis] = useState<ImageStudioAnalysis>(EMPTY_IMAGE_STUDIO_ANALYSIS);
+  const [plans, setPlans] = useState<ImageStudioPlan[]>([]);
+  const [results, setResults] = useState<ResultStateMap>({});
+  const [analyzing, setAnalyzing] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
+  const [planning, setPlanning] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [downloadingAll, setDownloadingAll] = useState(false);
+  const [downloadingTypes, setDownloadingTypes] = useState<Record<string, boolean>>({});
+  const [currentJobId, setCurrentJobId] = useState("");
+  const [activeStep, setActiveStep] = useState(0);
+
+  const currentJobIdRef = useRef("");
+  const productNameRef = useRef("");
+  const salesRegionRef = useRef("us");
+  const selectedImageTypesRef = useRef<string[]>(DEFAULT_IMAGE_TYPES);
+
+  useEffect(() => {
+    currentJobIdRef.current = currentJobId;
+  }, [currentJobId]);
+
+  useEffect(() => {
+    productNameRef.current = analysis.productName;
+  }, [analysis.productName]);
+
+  useEffect(() => {
+    salesRegionRef.current = salesRegion;
+  }, [salesRegion]);
+
+  useEffect(() => {
+    selectedImageTypesRef.current = selectedImageTypes;
+  }, [selectedImageTypes]);
 
   const refreshStatus = async (ensure = false) => {
-    setActionLoading(ensure);
     try {
       if (!imageStudioAPI) throw new Error("当前环境不支持 AI 出图服务");
+      setActionLoading(ensure);
       const nextStatus = ensure
         ? await imageStudioAPI.ensureRunning()
         : await imageStudioAPI.getStatus();
       setStatus(nextStatus);
+      return nextStatus;
     } catch (error) {
-      setStatus({
+      const nextStatus = {
         ...FALLBACK_STATUS,
         status: "error",
         message: error instanceof Error ? error.message : "AI 出图服务启动失败",
-      });
+      };
+      setStatus(nextStatus);
+      return nextStatus;
     } finally {
       setLoading(false);
       setActionLoading(false);
     }
   };
 
+  const loadConfig = async () => {
+    if (!imageStudioAPI) return;
+    setConfigLoading(true);
+    try {
+      const nextConfig = await imageStudioAPI.getConfig();
+      setConfig(nextConfig);
+      setConfigDraft(buildConfigDraft(nextConfig));
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "读取配置失败");
+    } finally {
+      setConfigLoading(false);
+    }
+  };
+
+  const loadHistory = async () => {
+    if (!imageStudioAPI) return;
+    setHistoryLoading(true);
+    try {
+      const list = await imageStudioAPI.listHistory();
+      setHistoryItems(Array.isArray(list) ? list : []);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "读取历史失败");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
   useEffect(() => {
-    refreshStatus(true);
-    const timer = window.setInterval(() => { refreshStatus(false).catch(() => {}); }, 8000);
-    return () => window.clearInterval(timer);
+    refreshStatus(true).then((nextStatus) => {
+      if (nextStatus.ready) {
+        loadConfig().catch(() => {});
+        loadHistory().catch(() => {});
+      }
+    }).catch(() => {});
+
+    const timer = window.setInterval(() => {
+      refreshStatus(false).catch(() => {});
+    }, 8000);
+
+    const unsubscribe = window.electronAPI?.onImageStudioEvent?.((payload) => {
+      if (!payload || payload.jobId !== currentJobIdRef.current) return;
+
+      if (payload.type === "generate:event" && payload.event?.imageType) {
+        startTransition(() => {
+          setResults((prev) => {
+            const next = { ...prev };
+            const imageType = payload.event?.imageType || "";
+            const current = getResultState(next, imageType);
+
+            if (payload.event?.status === "generating") {
+              next[imageType] = { ...current, status: "generating", error: "" };
+            } else if (payload.event?.status === "warning") {
+              next[imageType] = {
+                ...current,
+                warnings: Array.isArray(payload.event.warnings) ? payload.event.warnings : current.warnings,
+              };
+            } else if (payload.event?.status === "done") {
+              next[imageType] = {
+                ...current,
+                status: "done",
+                imageUrl: payload.event.imageUrl,
+                warnings: Array.isArray(payload.event.warnings) ? payload.event.warnings : current.warnings,
+                error: "",
+              };
+            } else if (payload.event?.status === "error") {
+              next[imageType] = {
+                ...current,
+                status: "error",
+                error: payload.event.error || "生成失败",
+              };
+            }
+
+            return next;
+          });
+        });
+      }
+
+      if (payload.type === "generate:complete") {
+        setGenerating(false);
+        setCurrentJobId("");
+        const images = sortImagesBySelectedTypes(Array.isArray(payload.results) ? payload.results : [], selectedImageTypesRef.current);
+        if (imageStudioAPI && images.length > 0) {
+          imageStudioAPI.saveHistory({
+            productName: productNameRef.current || "未命名商品",
+            salesRegion: salesRegionRef.current,
+            imageCount: images.length,
+            images,
+          }).then(() => {
+            loadHistory().catch(() => {});
+          }).catch(() => {});
+        }
+        message.success("AI 出图已完成");
+      }
+
+      if (payload.type === "generate:error") {
+        setGenerating(false);
+        setCurrentJobId("");
+        message.error(payload.error || "AI 出图失败");
+      }
+
+      if (payload.type === "generate:cancelled") {
+        setGenerating(false);
+        setCurrentJobId("");
+        message.info(payload.message || "已取消本次生成");
+      }
+    });
+
+    return () => {
+      window.clearInterval(timer);
+      unsubscribe?.();
+    };
   }, []);
 
   const handleRestart = async () => {
@@ -60,6 +498,7 @@ export default function ImageStudio() {
       if (!imageStudioAPI) throw new Error("当前环境不支持 AI 出图服务");
       const nextStatus = await imageStudioAPI.restart();
       setStatus(nextStatus);
+      await loadConfig();
       message.success("AI 出图服务已重启");
     } catch (error) {
       message.error(error instanceof Error ? error.message : "重启失败");
@@ -77,74 +516,1788 @@ export default function ImageStudio() {
     }
   };
 
-  // 服务就绪 → 直接全屏 iframe，无多余 UI
-  if (status.ready && !loading) {
-    return (
-      <div style={{ margin: -24, position: "relative" }}>
-        {/* 悬浮工具栏 */}
-        <div style={{
-          position: "absolute", top: 12, right: 16, zIndex: 10,
-          display: "flex", alignItems: "center", gap: 6,
-          background: "rgba(255,255,255,0.92)", borderRadius: 8,
-          padding: "4px 10px", boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
-        }}>
-          <div style={{ width: 6, height: 6, borderRadius: 3, background: "#52c41a" }} />
-          <Text type="secondary" style={{ fontSize: 12 }}>就绪</Text>
-          <Tooltip title="重启服务">
-            <Button type="text" size="small" icon={<ThunderboltOutlined />} onClick={handleRestart} loading={actionLoading} />
-          </Tooltip>
-          <Tooltip title="在浏览器中打开">
-            <Button type="text" size="small" icon={<ExportOutlined />} onClick={handleOpenExternal} />
-          </Tooltip>
-        </div>
-        <iframe
-          src={`${status.url}?_t=${Date.now()}`}
-          title="AI 出图工作台"
+  const handleOpenConfig = async () => {
+    setConfigOpen(true);
+    await loadConfig();
+  };
+
+  const handleSaveConfig = async () => {
+    if (!imageStudioAPI) return;
+    setConfigLoading(true);
+    try {
+      const nextConfig = await imageStudioAPI.updateConfig({
+        analyzeModel: configDraft.analyzeModel.trim(),
+        analyzeApiKey: configDraft.analyzeApiKey.trim(),
+        analyzeBaseUrl: configDraft.analyzeBaseUrl.trim(),
+        generateModel: configDraft.generateModel.trim(),
+        generateApiKey: configDraft.generateApiKey.trim(),
+        generateBaseUrl: configDraft.generateBaseUrl.trim(),
+      });
+      setConfig(nextConfig);
+      setConfigDraft(buildConfigDraft(nextConfig));
+      setConfigOpen(false);
+      message.success("AI 出图配置已更新");
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "保存配置失败");
+    } finally {
+      setConfigLoading(false);
+    }
+  };
+
+  const handleAnalyze = async () => {
+    if (!imageStudioAPI) return;
+    if (uploadFiles.length === 0) {
+      message.warning("请先上传商品素材图");
+      return;
+    }
+
+    setAnalyzing(true);
+    try {
+      const files = await buildNativeImagePayloads(uploadFiles);
+      const payload = await imageStudioAPI.analyze({ files, productMode });
+      setAnalysis(normalizeImageStudioAnalysis(payload));
+      setPlans([]);
+      setResults({});
+      setActiveStep(1);
+      message.success("商品分析已完成");
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "分析失败");
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const handleRegenerateAnalysis = async () => {
+    if (!imageStudioAPI) return;
+    if (uploadFiles.length === 0) {
+      message.warning("请先上传商品素材图");
+      return;
+    }
+    if (!analysis.productName.trim()) {
+      message.warning("请先完成一次分析，或先补充商品名称");
+      return;
+    }
+
+    setRegenerating(true);
+    try {
+      const files = await buildNativeImagePayloads(uploadFiles);
+      const payload = await imageStudioAPI.regenerateAnalysis({ files, productMode, analysis });
+      setAnalysis((prev) => ({
+        ...prev,
+        sellingPoints: Array.isArray(payload.sellingPoints) ? payload.sellingPoints : prev.sellingPoints,
+        targetAudience: Array.isArray(payload.targetAudience) ? payload.targetAudience : prev.targetAudience,
+        usageScenes: Array.isArray(payload.usageScenes) ? payload.usageScenes : prev.usageScenes,
+      }));
+      message.success("卖点、人群和场景已重新生成");
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "重新生成失败");
+    } finally {
+      setRegenerating(false);
+    }
+  };
+
+  const handleGeneratePlans = async () => {
+    if (!imageStudioAPI) return;
+    if (!analysis.productName.trim()) {
+      message.warning("请先完成商品分析或补充商品信息");
+      return;
+    }
+    if (selectedImageTypes.length === 0) {
+      message.warning("请至少选择一种出图类型");
+      return;
+    }
+
+    setPlanning(true);
+    try {
+      const nextPlans = await imageStudioAPI.generatePlans({
+        analysis,
+        imageTypes: selectedImageTypes,
+        salesRegion,
+        imageSize,
+        productMode,
+      });
+      const normalizedPlans = Array.isArray(nextPlans) ? nextPlans : [];
+      setPlans(normalizedPlans);
+      setResults({});
+      if (normalizedPlans.length > 0) {
+        setActiveStep(2);
+        message.success(`已生成 ${normalizedPlans.length} 条出图方案`);
+      } else {
+        message.warning("服务未返回可用方案，请检查分析结果或重试");
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "生成方案失败");
+    } finally {
+      setPlanning(false);
+    }
+  };
+
+  const handleStartGenerate = async () => {
+    if (!imageStudioAPI) return;
+    if (uploadFiles.length === 0) {
+      message.warning("请先上传商品素材图");
+      return;
+    }
+    if (plans.length === 0) {
+      message.warning("请先生成出图方案");
+      return;
+    }
+
+    const nextJobId = `image_job_${Date.now()}`;
+    setGenerating(true);
+    setCurrentJobId(nextJobId);
+    setResults(plans.reduce<ResultStateMap>((acc, plan) => {
+      acc[plan.imageType] = createEmptyResultState("queued");
+      return acc;
+    }, {}));
+
+    try {
+      const files = await buildNativeImagePayloads(uploadFiles);
+      setActiveStep(3);
+      await imageStudioAPI.startGenerate({
+        jobId: nextJobId,
+        files,
+        plans,
+        productMode,
+        imageLanguage,
+        imageSize,
+      });
+      message.success("AI 出图任务已开始");
+    } catch (error) {
+      setGenerating(false);
+      setCurrentJobId("");
+      message.error(error instanceof Error ? error.message : "启动出图失败");
+    }
+  };
+
+  const handleCancelGenerate = async () => {
+    if (!imageStudioAPI || !currentJobId) return;
+    try {
+      await imageStudioAPI.cancelGenerate(currentJobId);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "取消失败");
+    }
+  };
+
+  const handleOpenHistory = async () => {
+    setHistoryOpen(true);
+    await loadHistory();
+  };
+
+  const handleLoadHistoryItem = async (item: ImageStudioHistorySummary) => {
+    if (!imageStudioAPI) return;
+    try {
+      const detail = await imageStudioAPI.getHistoryItem(item.id);
+      if (!detail) {
+        message.warning("历史记录不存在或已失效");
+        return;
+      }
+
+      const historyItem = detail as ImageStudioHistoryItem;
+      setAnalysis((prev) => ({ ...prev, productName: historyItem.productName || prev.productName }));
+      setSalesRegion(historyItem.salesRegion || "us");
+      setImageLanguage(getDefaultImageLanguageForRegion(historyItem.salesRegion || "us"));
+      setSelectedImageTypes(historyItem.images.map((image) => image.imageType));
+      setPlans(historyItem.images.map((image) => ({ imageType: image.imageType, prompt: "" })));
+      setResults(historyItem.images.reduce<ResultStateMap>((acc, image) => {
+        acc[image.imageType] = { status: "done", imageUrl: image.imageUrl, warnings: [] };
+        return acc;
+      }, {}));
+      setActiveStep(3);
+      setHistoryOpen(false);
+      message.success("已载入历史出图结果");
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "读取历史详情失败");
+    }
+  };
+
+  const handleScoreImage = async (imageType: string) => {
+    if (!imageStudioAPI) return;
+    const result = results[imageType];
+    if (!result?.imageUrl) return;
+
+    setResults((prev) => ({
+      ...prev,
+      [imageType]: { ...getResultState(prev, imageType), scoring: true },
+    }));
+
+    try {
+      const score = await imageStudioAPI.scoreImage({ imageType, imageUrl: result.imageUrl });
+      setResults((prev) => ({
+        ...prev,
+        [imageType]: { ...getResultState(prev, imageType), scoring: false, score },
+      }));
+      message.success(`${IMAGE_TYPE_LABELS[imageType] || imageType} 评分完成`);
+    } catch (error) {
+      setResults((prev) => ({
+        ...prev,
+        [imageType]: { ...getResultState(prev, imageType), scoring: false },
+      }));
+      message.error(error instanceof Error ? error.message : "评分失败");
+    }
+  };
+
+  const updateAnalysisField = <K extends keyof ImageStudioAnalysis>(field: K, value: ImageStudioAnalysis[K]) => {
+    setAnalysis((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const updatePlanPrompt = (imageType: string, prompt: string) => {
+    setPlans((prev) => prev.map((plan) => (
+      plan.imageType === imageType
+        ? { ...plan, prompt }
+        : plan
+    )));
+  };
+
+  const copyText = async (value: string, successText = "已复制") => {
+    const nextValue = value.trim();
+    if (!nextValue) {
+      message.warning("没有可复制的内容");
+      return;
+    }
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(nextValue);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = nextValue;
+        textarea.setAttribute("readonly", "true");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+      }
+      message.success(successText);
+    } catch {
+      message.error("复制失败，请手动复制");
+    }
+  };
+
+  const downloadImage = async (image: ImageStudioGeneratedImage) => {
+    const baseName = sanitizeDownloadNamePart(analysis.productName || "temu-image");
+    const typeName = sanitizeDownloadNamePart(IMAGE_TYPE_LABELS[image.imageType] || image.imageType);
+
+    try {
+      const response = await fetch(image.imageUrl);
+      if (!response.ok) {
+        throw new Error(`下载失败（${response.status}）`);
+      }
+
+      const blob = await response.blob();
+      const extension = getImageExtensionFromMimeType(blob.type) || getImageExtensionFromUrl(image.imageUrl) || "png";
+      const objectUrl = URL.createObjectURL(blob);
+
+      try {
+        triggerImageDownload(objectUrl, `${baseName}-${typeName}.${extension}`);
+      } finally {
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      }
+    } catch {
+      const fallbackExtension = getImageExtensionFromUrl(image.imageUrl) || "png";
+      triggerImageDownload(image.imageUrl, `${baseName}-${typeName}.${fallbackExtension}`);
+    }
+  };
+
+  const generatedImages = useMemo(() => {
+    const list = Object.entries(results)
+      .filter(([, result]) => result.imageUrl)
+      .map(([imageType, result]) => ({ imageType, imageUrl: result.imageUrl || "" }));
+    return sortImagesBySelectedTypes(list, selectedImageTypes);
+  }, [results, selectedImageTypes]);
+
+  const planCount = plans.length || selectedImageTypes.length;
+  const completedCount = useMemo(
+    () => Object.values(results).filter((result) => result.status === "done" || result.status === "error").length,
+    [results],
+  );
+  const successCount = useMemo(
+    () => Object.values(results).filter((result) => result.status === "done").length,
+    [results],
+  );
+  const progressPercent = planCount > 0 ? Math.round((completedCount / planCount) * 100) : 0;
+  const hasUploads = uploadFiles.length > 0;
+  const hasAnalysis = useMemo(() => hasAnalysisContent(analysis), [analysis]);
+  const hasPlans = plans.length > 0;
+  const maxUnlockedStep = generating || generatedImages.length > 0 || hasPlans ? 3 : hasAnalysis ? 2 : hasUploads ? 1 : 0;
+  const nextStepHint = !hasUploads
+    ? "先上传商品素材图"
+    : !hasAnalysis
+      ? "先分析商品"
+      : !hasPlans
+        ? "先生成方案"
+        : generating
+          ? "正在生成图片"
+          : "可以开始出图";
+  const selectedTypeLabels = useMemo(
+    () => selectedImageTypes.map((type) => IMAGE_TYPE_LABELS[type] || type),
+    [selectedImageTypes],
+  );
+  const titleSuggestions = useMemo(() => buildTitleSuggestions(analysis), [analysis]);
+  const stepItems = [
+    { title: "上传图片", description: "上传商品素材并选择市场" },
+    { title: "AI 分析", description: "确认商品信息和卖点" },
+    { title: "确认方案", description: "确认每张图的出图方案" },
+    { title: "生成图片", description: "执行生成并查看结果" },
+  ];
+
+  const renderStatusTag = () => {
+    if (status.ready) return <Tag color={configAlertNeeded ? "orange" : "success"}>{serviceLabel}</Tag>;
+    if (status.status === "starting") return <Tag color="processing">{serviceLabel}</Tag>;
+    if (status.status === "error") return <Tag color="error">{serviceLabel}</Tag>;
+    return <Tag>{serviceLabel}</Tag>;
+  };
+
+  const configAlertNeeded = status.ready && isConfigMissing(config);
+  const serviceLabel = status.ready ? (configAlertNeeded ? "待配置" : "已就绪") : status.status === "error" ? "服务异常" : "启动中";
+  const serviceColor = status.ready ? (configAlertNeeded ? TEMU_ORANGE : "#16a34a") : status.status === "error" ? "#ff4d4f" : "#faad14";
+
+  const handleStepChange = (nextStep: number) => {
+    if (nextStep <= maxUnlockedStep) {
+      setActiveStep(nextStep);
+    }
+  };
+
+  const regionCards = [
+    { value: "us", code: "US", label: "美国" },
+    { value: "eu", code: "EU", label: "欧洲" },
+    { value: "uk", code: "GB", label: "英国" },
+    { value: "jp", code: "JP", label: "日本" },
+    { value: "kr", code: "KR", label: "韩国" },
+    { value: "cn", code: "CN", label: "中国" },
+    { value: "sea", code: "TH", label: "东南亚" },
+    { value: "me", code: "SA", label: "中东" },
+    { value: "latam", code: "MX", label: "拉美" },
+    { value: "br", code: "BR", label: "巴西" },
+  ];
+
+  const saveCurrentHistory = async () => {
+    if (!imageStudioAPI) return;
+    if (generatedImages.length === 0) {
+      message.warning("当前还没有可保存的图片结果");
+      return;
+    }
+
+    try {
+      await imageStudioAPI.saveHistory({
+        productName: analysis.productName || "未命名商品",
+        salesRegion,
+        imageCount: generatedImages.length,
+        images: generatedImages,
+      });
+      message.success("当前结果已保存到历史记录");
+      loadHistory().catch(() => {});
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "保存历史失败");
+    }
+  };
+
+  const handleDownloadImage = async (image: ImageStudioGeneratedImage) => {
+    setDownloadingTypes((prev) => ({ ...prev, [image.imageType]: true }));
+
+    try {
+      await downloadImage(image);
+      message.success(`${IMAGE_TYPE_LABELS[image.imageType] || image.imageType} 已开始下载`);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "下载图片失败");
+    } finally {
+      setDownloadingTypes((prev) => {
+        const next = { ...prev };
+        delete next[image.imageType];
+        return next;
+      });
+    }
+  };
+
+  const handleDownloadAllImages = async () => {
+    if (generatedImages.length === 0) {
+      message.warning("当前还没有可下载的图片");
+      return;
+    }
+
+    setDownloadingAll(true);
+    let success = 0;
+
+    try {
+      for (const image of generatedImages) {
+        try {
+          await downloadImage(image);
+          success += 1;
+          await new Promise((resolve) => window.setTimeout(resolve, 120));
+        } catch {
+          // Continue downloading the remaining images so one bad image doesn't block the batch.
+        }
+      }
+
+      if (success === generatedImages.length) {
+        message.success(`已开始下载 ${success} 张图片`);
+      } else if (success > 0) {
+        message.warning(`已开始下载 ${success}/${generatedImages.length} 张图片，剩余图片请单独重试`);
+      } else {
+        message.error("批量下载失败，请重试");
+      }
+    } finally {
+      setDownloadingAll(false);
+    }
+  };
+
+  const resetStudio = () => {
+    setUploadFiles([]);
+    setAnalysis(EMPTY_IMAGE_STUDIO_ANALYSIS);
+    setPlans([]);
+    setResults({});
+    setGenerating(false);
+    setCurrentJobId("");
+    setActiveStep(0);
+  };
+
+  const renderStepZero = () => (
+    <Card
+      style={{
+        borderRadius: TEMU_CARD_RADIUS,
+        borderColor: "#f1e5da",
+        boxShadow: TEMU_CARD_SHADOW,
+        background: "#ffffff",
+      }}
+      bodyStyle={{ padding: hasUploads ? 22 : 28 }}
+    >
+      <Space direction="vertical" size={hasUploads ? 22 : 18} style={{ width: "100%" }}>
+        <div
           style={{
+            maxWidth: 680,
             width: "100%",
-            height: "calc(100vh - 108px)",
-            border: "none",
-            display: "block",
+            margin: "0 auto",
+            border: "1.5px dashed #ff9f5a",
+            borderRadius: 28,
+            background: TEMU_UPLOAD_BG,
+            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.9)",
+            padding: hasUploads ? "26px 24px 22px" : "56px 24px 46px",
+            textAlign: "center",
           }}
-        />
+        >
+          <div
+            style={{
+              width: 58,
+              height: 58,
+              borderRadius: 18,
+              margin: "0 auto 18px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: TEMU_BUTTON_GRADIENT,
+              boxShadow: TEMU_BUTTON_SHADOW,
+            }}
+          >
+            <UploadOutlined style={{ color: "#fff", fontSize: 28 }} />
+          </div>
+
+          <Title level={4} style={{ marginBottom: 8, color: TEMU_TEXT }}>拖拽商品图片到此处</Title>
+          <Text type="secondary" style={{ fontSize: 14 }}>
+            支持多张图片（最多 5 张），适合组合装/套装
+          </Text>
+
+          <div style={{ marginTop: 22 }}>
+            <Upload
+              accept="image/*"
+              listType="picture"
+              multiple
+              beforeUpload={() => false}
+              fileList={uploadFiles}
+              maxCount={5}
+              onChange={({ fileList }) => setUploadFiles(fileList.slice(-5))}
+              showUploadList={false}
+            >
+              <Button
+                type="primary"
+                size="large"
+                icon={<UploadOutlined />}
+                style={{
+                  minWidth: 128,
+                  height: 42,
+                  borderRadius: 14,
+                  border: "none",
+                  background: TEMU_BUTTON_GRADIENT,
+                  boxShadow: TEMU_BUTTON_SHADOW,
+                }}
+              >
+                {hasUploads ? "继续添加" : "选择图片"}
+              </Button>
+            </Upload>
+          </div>
+
+          {hasUploads ? (
+            <div style={{ marginTop: 22 }}>
+              <Text type="secondary">已上传 {uploadFiles.length}/5 张商品图</Text>
+              <div style={{ display: "flex", justifyContent: "center", marginTop: 14 }}>
+                <Upload
+                  accept="image/*"
+                  listType="picture-card"
+                  multiple
+                  beforeUpload={() => false}
+                  fileList={uploadFiles}
+                  maxCount={5}
+                  onChange={({ fileList }) => setUploadFiles(fileList.slice(-5))}
+                >
+                  {uploadFiles.length < 5 ? (
+                    <div>
+                      <UploadOutlined />
+                      <div style={{ marginTop: 6, fontSize: 12 }}>添加</div>
+                    </div>
+                  ) : null}
+                </Upload>
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        {hasUploads ? (
+          <div style={{ maxWidth: 680, margin: "0 auto", width: "100%" }}>
+            <Card
+              size="small"
+              style={{
+                borderRadius: 18,
+                background: "#fbfdff",
+                borderColor: "#dfe7f3",
+                boxShadow: "none",
+              }}
+              bodyStyle={{ padding: 18 }}
+            >
+              <Text strong style={{ display: "block", marginBottom: 14, color: TEMU_TEXT }}>
+                销售地区
+                <Text type="secondary" style={{ marginLeft: 8, fontWeight: 400 }}>
+                  决定图片语言和风格
+                </Text>
+              </Text>
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 10 }}>
+                {regionCards.map((region) => {
+                  const isSelected = salesRegion === region.value;
+                  return (
+                    <button
+                      key={region.value}
+                      type="button"
+                      onClick={() => {
+                        setSalesRegion(region.value);
+                        setImageLanguage(getDefaultImageLanguageForRegion(region.value));
+                      }}
+                      style={{
+                        minHeight: 64,
+                        padding: "10px 8px",
+                        borderRadius: 12,
+                        border: isSelected ? "1px solid #ff8c3a" : "1px solid #d9e1ea",
+                        background: isSelected ? TEMU_BUTTON_GRADIENT : "#ffffff",
+                        color: isSelected ? "#ffffff" : "#314156",
+                        cursor: "pointer",
+                        textAlign: "center",
+                        boxShadow: isSelected ? "0 10px 20px rgba(255, 106, 0, 0.18)" : "none",
+                        transition: "background-color 0.2s, color 0.2s, box-shadow 0.2s, border-color 0.2s",
+                      }}
+                    >
+                      <div style={{ fontSize: 15, fontWeight: 700 }}>{region.code}</div>
+                      <div style={{ fontSize: 12, marginTop: 4 }}>{region.label}</div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div
+                style={{
+                  marginTop: 14,
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  background: "#f5f8ff",
+                  color: "#7a8ca8",
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                }}
+              >
+                当前地区：
+                {regionCards.find((region) => region.value === salesRegion)?.label || salesRegion}
+                ，图片语言
+                {IMAGE_LANGUAGE_OPTIONS.find((option) => option.value === imageLanguage)?.label || imageLanguage}
+              </div>
+            </Card>
+
+            <div style={{ textAlign: "center", marginTop: 24 }}>
+              <Button
+                type="primary"
+                size="large"
+                icon={<RocketOutlined />}
+                onClick={handleAnalyze}
+                loading={analyzing}
+                disabled={!hasUploads}
+                style={{
+                  minWidth: 260,
+                  height: 48,
+                  fontSize: 16,
+                  borderRadius: 16,
+                  border: "none",
+                  background: TEMU_BUTTON_GRADIENT,
+                  boxShadow: TEMU_BUTTON_SHADOW,
+                }}
+              >
+                {"开始 AI 分析（" + uploadFiles.length + " 张图）"}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        <div style={{ textAlign: "center" }}>
+          <Text type="secondary">上传 1-5 张商品图，支持组合装/套装多商品</Text>
+        </div>
+      </Space>
+    </Card>
+  );
+
+  const renderStepOne = () => (
+    <Space direction="vertical" size={18} style={{ width: "100%" }}>
+      <Card
+        size="small"
+        style={{
+          borderRadius: TEMU_CARD_RADIUS,
+          borderColor: "#eceff3",
+          boxShadow: "0 8px 22px rgba(15, 23, 42, 0.06)",
+        }}
+        bodyStyle={{ padding: 20 }}
+      >
+        <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
+          上传的商品图（{uploadFiles.length} 张）
+        </Text>
+        <Space size={10} wrap>
+          {uploadFiles.map((file) => (
+            <div
+              key={file.uid}
+              style={{
+                width: 108,
+                height: 108,
+                borderRadius: 16,
+                overflow: "hidden",
+                border: "1px solid #eef1f4",
+                background: "#fafafa",
+              }}
+            >
+              <img
+                src={file.thumbUrl || (file.originFileObj ? URL.createObjectURL(file.originFileObj) : "")}
+                alt={file.name}
+                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+              />
+            </div>
+          ))}
+        </Space>
+      </Card>
+
+      <Card
+        style={{
+          borderRadius: TEMU_CARD_RADIUS,
+          borderColor: "#eceff3",
+          boxShadow: TEMU_CARD_SHADOW,
+        }}
+        bodyStyle={{ padding: 24 }}
+      >
+        <Space direction="vertical" size={22} style={{ width: "100%" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <Space size={10}>
+              <span style={{ color: "#ff8a1f", fontSize: 22, lineHeight: 1 }}>✦</span>
+              <Title level={4} style={{ margin: 0, color: TEMU_TEXT }}>AI 分析结果</Title>
+            </Space>
+            <Space size={8} wrap>
+              <Button
+                onClick={handleRegenerateAnalysis}
+                loading={regenerating}
+                disabled={!hasAnalysis}
+                style={{ borderRadius: 14 }}
+              >
+                AI 重新生成
+              </Button>
+              <Button
+                icon={<ReloadOutlined />}
+                onClick={handleAnalyze}
+                loading={analyzing}
+                style={{ borderRadius: 14 }}
+              >
+                {hasAnalysis ? "重新分析" : "开始分析"}
+              </Button>
+            </Space>
+          </div>
+
+          <Row gutter={[14, 14]}>
+            <Col xs={24} md={12}>
+              <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 6 }}>商品名称</Text>
+              <Input value={analysis.productName} onChange={(e) => updateAnalysisField("productName", e.target.value)} placeholder="输入商品名称…" style={{ borderRadius: 14 }} />
+            </Col>
+            <Col xs={24} md={12}>
+              <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 6 }}>商品类目</Text>
+              <Input value={analysis.category} onChange={(e) => updateAnalysisField("category", e.target.value)} placeholder="输入商品类目…" style={{ borderRadius: 14 }} />
+            </Col>
+            <Col xs={24} md={8}>
+              <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 6 }}>材质</Text>
+              <Input value={analysis.materials} onChange={(e) => updateAnalysisField("materials", e.target.value)} placeholder="输入材质…" style={{ borderRadius: 14 }} />
+            </Col>
+            <Col xs={24} md={8}>
+              <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 6 }}>颜色</Text>
+              <Input value={analysis.colors} onChange={(e) => updateAnalysisField("colors", e.target.value)} placeholder="输入颜色 / 色值…" style={{ borderRadius: 14 }} />
+            </Col>
+            <Col xs={24} md={8}>
+              <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 6 }}>尺寸</Text>
+              <Input value={analysis.estimatedDimensions} onChange={(e) => updateAnalysisField("estimatedDimensions", e.target.value)} placeholder="输入尺寸…" style={{ borderRadius: 14 }} />
+            </Col>
+          </Row>
+
+          <div style={{ borderTop: "1px solid #eef1f4", paddingTop: 18 }}>
+            <Row gutter={[14, 16]}>
+              <Col xs={24} lg={8}>
+                <Text strong style={{ display: "block", marginBottom: 8 }}>核心卖点</Text>
+                <TextArea autoSize={{ minRows: 7, maxRows: 12 }} value={arrayToMultiline(analysis.sellingPoints)} onChange={(event) => updateAnalysisField("sellingPoints", multilineToArray(event.target.value))} placeholder="一行一个卖点…" style={{ borderRadius: 14 }} />
+              </Col>
+              <Col xs={24} lg={8}>
+                <Text strong style={{ display: "block", marginBottom: 8 }}>目标人群</Text>
+                <TextArea autoSize={{ minRows: 7, maxRows: 12 }} value={arrayToMultiline(analysis.targetAudience)} onChange={(event) => updateAnalysisField("targetAudience", multilineToArray(event.target.value))} placeholder="一行一个目标人群…" style={{ borderRadius: 14 }} />
+              </Col>
+              <Col xs={24} lg={8}>
+                <Text strong style={{ display: "block", marginBottom: 8 }}>使用场景</Text>
+                <TextArea autoSize={{ minRows: 7, maxRows: 12 }} value={arrayToMultiline(analysis.usageScenes)} onChange={(event) => updateAnalysisField("usageScenes", multilineToArray(event.target.value))} placeholder="一行一个使用场景…" style={{ borderRadius: 14 }} />
+              </Col>
+            </Row>
+          </div>
+
+          <div style={{ borderTop: "1px solid #eef1f4", paddingTop: 18 }}>
+            <Row gutter={[14, 14]}>
+              <Col xs={24} md={8}>
+                <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 6 }}>商品模式</Text>
+                <Select value={productMode} onChange={setProductMode} options={PRODUCT_MODE_OPTIONS.map((option) => ({ label: option.label, value: option.value }))} style={{ width: "100%" }} />
+              </Col>
+              <Col xs={24} md={8}>
+                <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 6 }}>文字语言</Text>
+                <Select value={imageLanguage} onChange={setImageLanguage} options={IMAGE_LANGUAGE_OPTIONS as unknown as { value: string; label: string }[]} style={{ width: "100%" }} />
+              </Col>
+              <Col xs={24} md={8}>
+                <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 6 }}>画布尺寸</Text>
+                <Select value={imageSize} onChange={setImageSize} options={IMAGE_SIZE_OPTIONS as unknown as { value: string; label: string }[]} style={{ width: "100%" }} />
+              </Col>
+            </Row>
+
+            <div style={{ marginTop: 18 }}>
+              <Text strong style={{ display: "block", marginBottom: 10 }}>需要生成的图片类型</Text>
+              <Checkbox.Group
+                style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}
+                value={selectedImageTypes}
+                options={DEFAULT_IMAGE_TYPES.map((type) => ({ label: IMAGE_TYPE_LABELS[type], value: type }))}
+                onChange={(values) => setSelectedImageTypes(values.map(String))}
+              />
+            </div>
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, paddingTop: 8, flexWrap: "wrap" }}>
+            <Button onClick={() => setActiveStep(0)} style={{ borderRadius: 14 }}>上一步</Button>
+            <Button
+              type="primary"
+              icon={<RocketOutlined />}
+              onClick={handleGeneratePlans}
+              loading={planning}
+              disabled={!hasAnalysis}
+              style={{
+                minWidth: 180,
+                height: 44,
+                borderRadius: 14,
+                border: "none",
+                background: TEMU_BUTTON_GRADIENT,
+                boxShadow: TEMU_BUTTON_SHADOW,
+              }}
+            >
+              生成出图方案
+            </Button>
+          </div>
+        </Space>
+      </Card>
+    </Space>
+  );
+
+  const renderStepTwo = () => (
+    <Card
+      style={{
+        borderRadius: TEMU_CARD_RADIUS,
+        borderColor: "#eceff3",
+        boxShadow: TEMU_CARD_SHADOW,
+      }}
+      bodyStyle={{ padding: 24 }}
+    >
+      <Space direction="vertical" size={18} style={{ width: "100%" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+          <div>
+            <Title level={4} style={{ margin: 0, color: TEMU_TEXT }}>图片生成方案</Title>
+            <Text type="secondary" style={{ display: "block", marginTop: 6 }}>
+              AI 已根据商品分析生成每张图的方向，你可以直接确认，也可以继续微调描述。
+            </Text>
+          </div>
+          <Space wrap>
+            <Button onClick={() => setActiveStep(1)} style={{ borderRadius: 14 }}>上一步</Button>
+            <Button onClick={handleGeneratePlans} loading={planning} disabled={!hasAnalysis} style={{ borderRadius: 14 }}>
+              {hasPlans ? "重新生成方案" : "生成方案"}
+            </Button>
+            <Button
+              type="primary"
+              disabled={!hasPlans}
+              onClick={() => setActiveStep(3)}
+              style={{
+                minWidth: 132,
+                borderRadius: 14,
+                border: "none",
+                background: TEMU_BUTTON_GRADIENT,
+                boxShadow: TEMU_BUTTON_SHADOW,
+              }}
+            >
+              下一步
+            </Button>
+          </Space>
+        </div>
+
+        {plans.length > 0 ? (
+          <Space direction="vertical" size={12} style={{ width: "100%" }}>
+            {plans.map((plan, index) => (
+              <div
+                key={plan.imageType}
+                style={{
+                  border: "1px solid #eef1f4",
+                  borderRadius: 18,
+                  padding: 18,
+                  background: "#ffffff",
+                  boxShadow: "0 8px 20px rgba(15, 23, 42, 0.05)",
+                }}
+              >
+                <Space direction="vertical" size={10} style={{ width: "100%" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+                    <Space size={12} align="center">
+                      <div
+                        style={{
+                          width: 30,
+                          height: 30,
+                          borderRadius: 999,
+                          background: TEMU_BUTTON_GRADIENT,
+                          color: "#fff",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          fontWeight: 700,
+                          boxShadow: "0 10px 18px rgba(255, 106, 0, 0.18)",
+                        }}
+                      >
+                        {index + 1}
+                      </div>
+                      <div>
+                        <Text strong style={{ color: TEMU_TEXT }}>{IMAGE_TYPE_LABELS[plan.imageType] || plan.imageType}</Text>
+                        <Text type="secondary" style={{ display: "block", fontSize: 12, marginTop: 2 }}>
+                          {plan.title || plan.headline || "AI 自动方案"}
+                        </Text>
+                      </div>
+                    </Space>
+                    <Button
+                      size="small"
+                      icon={<CopyOutlined />}
+                      onClick={() => copyText(plan.prompt, `${IMAGE_TYPE_LABELS[plan.imageType] || plan.imageType}方案已复制`)}
+                      style={{ borderRadius: 12 }}
+                    >
+                      复制
+                    </Button>
+                  </div>
+                  <Paragraph
+                    style={{ marginBottom: 0, color: "#5f6b7c", whiteSpace: "pre-wrap" }}
+                    ellipsis={{ rows: 2, expandable: true, symbol: "展开完整方案" }}
+                  >
+                    {plan.prompt}
+                  </Paragraph>
+                  <TextArea
+                    autoSize={{ minRows: 3, maxRows: 8 }}
+                    value={plan.prompt}
+                    onChange={(event) => updatePlanPrompt(plan.imageType, event.target.value)}
+                    placeholder="这里可以手动微调每张图的 Prompt…"
+                    style={{ borderRadius: 14 }}
+                  />
+                </Space>
+              </div>
+            ))}
+          </Space>
+        ) : (
+          <Card style={{ borderRadius: 18, borderColor: "#edf0f4" }}>
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="先生成方案，再确认每张图的 Prompt" />
+          </Card>
+        )}
+      </Space>
+    </Card>
+  );
+
+  const renderStepThree = () => (
+    <Space direction="vertical" size={18} style={{ width: "100%" }}>
+      <Card
+        style={{
+          borderRadius: TEMU_CARD_RADIUS,
+          borderColor: "#eceff3",
+          boxShadow: TEMU_CARD_SHADOW,
+        }}
+        bodyStyle={{ padding: 24 }}
+      >
+        <Space direction="vertical" size={18} style={{ width: "100%" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <div>
+              <Title level={4} style={{ margin: 0, color: TEMU_TEXT }}>生成结果</Title>
+              <Text type="secondary" style={{ display: "block", marginTop: 6 }}>
+                {generatedImages.length > 0
+                  ? `当前已完成 ${successCount}/${planCount} 张图片，可以继续评分、保存和复制标题。`
+                  : "方案确认后开始生成图片，并在下方查看完成结果。"}
+              </Text>
+            </div>
+            <Space wrap>
+              <Button onClick={() => setActiveStep(2)} disabled={generating} style={{ borderRadius: 14 }}>上一步</Button>
+              {generatedImages.length > 0 ? (
+                <Button onClick={saveCurrentHistory} style={{ borderRadius: 14 }}>
+                  保存结果
+                </Button>
+              ) : null}
+              <Button danger icon={<StopOutlined />} onClick={handleCancelGenerate} disabled={!generating || !currentJobId} style={{ borderRadius: 14 }}>
+                取消任务
+              </Button>
+              <Button
+                type="primary"
+                icon={<RocketOutlined />}
+                onClick={handleStartGenerate}
+                loading={generating}
+                disabled={plans.length === 0 || uploadFiles.length === 0}
+                style={{
+                  minWidth: 144,
+                  borderRadius: 14,
+                  border: "none",
+                  background: TEMU_BUTTON_GRADIENT,
+                  boxShadow: TEMU_BUTTON_SHADOW,
+                }}
+              >
+                {generating ? "生成中…" : "开始出图"}
+              </Button>
+            </Space>
+          </div>
+
+          <Progress percent={progressPercent} status={generating ? "active" : "normal"} strokeColor={TEMU_ORANGE} />
+
+          {plans.length > 0 ? (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
+              {plans.map((plan) => {
+                const result = getResultState(results, plan.imageType);
+                return (
+                  <div
+                    key={plan.imageType}
+                    style={{
+                      border: "1px solid #edf0f4",
+                      borderRadius: 16,
+                      padding: 16,
+                      background: "#fff",
+                    }}
+                  >
+                    <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                        <Text strong style={{ color: TEMU_TEXT }}>{IMAGE_TYPE_LABELS[plan.imageType] || plan.imageType}</Text>
+                        {result.status === "queued" ? <Tag style={{ borderRadius: 999 }}>排队中</Tag> : null}
+                        {result.status === "done" ? <Tag color="success" style={{ borderRadius: 999 }}>已完成</Tag> : null}
+                        {result.status === "generating" ? <Tag color="processing" style={{ borderRadius: 999 }}>生成中</Tag> : null}
+                        {result.status === "error" ? <Tag color="error" style={{ borderRadius: 999 }}>失败</Tag> : null}
+                      </div>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        {plan.title || plan.headline || "AI 自动方案"}
+                      </Text>
+                      <Paragraph style={{ marginBottom: 0, color: "#5f6b7c", whiteSpace: "pre-wrap" }} ellipsis={{ rows: 2 }}>
+                        {plan.prompt}
+                      </Paragraph>
+                      {result.warnings.length > 0 ? <Text type="secondary">注意：{result.warnings.join("；")}</Text> : null}
+                      {result.error ? <Text type="danger">{result.error}</Text> : null}
+                    </Space>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <Card style={{ borderRadius: 18, borderColor: "#edf0f4" }}>
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有出图方案，请先回到上一步生成方案" />
+            </Card>
+          )}
+        </Space>
+      </Card>
+
+      {generatedImages.length > 0 ? (
+        <>
+          <Card
+            style={{
+              borderRadius: TEMU_CARD_RADIUS,
+              borderColor: "#eceff3",
+              boxShadow: "0 8px 22px rgba(15, 23, 42, 0.06)",
+            }}
+            bodyStyle={{ padding: 24 }}
+          >
+            <Space direction="vertical" size={18} style={{ width: "100%" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <Title level={4} style={{ margin: 0, color: TEMU_TEXT }}>图片结果</Title>
+                <Space wrap>
+                  <Tag color="success" style={{ borderRadius: 999, paddingInline: 12 }}>
+                    已完成 {successCount}/{planCount}
+                  </Tag>
+                  <Button icon={<DownloadOutlined />} onClick={handleDownloadAllImages} loading={downloadingAll} style={{ borderRadius: 14 }}>
+                    全部下载
+                  </Button>
+                  <Button onClick={saveCurrentHistory} style={{ borderRadius: 14 }}>
+                    保存到历史
+                  </Button>
+                </Space>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
+                {generatedImages.map((image) => {
+                  const result = getResultState(results, image.imageType);
+                  return (
+                    <Card
+                      key={image.imageType}
+                      size="small"
+                      style={{
+                        borderRadius: 18,
+                        borderColor: "#eceff3",
+                        boxShadow: "0 10px 26px rgba(15, 23, 42, 0.06)",
+                        overflow: "hidden",
+                      }}
+                      bodyStyle={{ padding: 12 }}
+                    >
+                      <Space direction="vertical" size={12} style={{ width: "100%" }}>
+                        <div style={{ position: "relative" }}>
+                          <div
+                            style={{
+                              position: "absolute",
+                              top: 10,
+                              left: 10,
+                              padding: "4px 10px",
+                              borderRadius: 999,
+                              background: "rgba(31, 35, 41, 0.66)",
+                              color: "#fff",
+                              fontSize: 12,
+                              zIndex: 1,
+                            }}
+                          >
+                            {IMAGE_TYPE_LABELS[image.imageType] || image.imageType}
+                          </div>
+                          <Image src={image.imageUrl} alt={image.imageType} style={{ width: "100%", borderRadius: 14, objectFit: "cover" }} />
+                        </div>
+
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                          <Text strong style={{ color: TEMU_TEXT }}>{IMAGE_TYPE_LABELS[image.imageType] || image.imageType}</Text>
+                          <Space size={8}>
+                            <Button
+                              size="small"
+                              icon={<DownloadOutlined />}
+                              onClick={() => handleDownloadImage(image)}
+                              loading={Boolean(downloadingTypes[image.imageType])}
+                              style={{ borderRadius: 12 }}
+                            >
+                              下载
+                            </Button>
+                            <Button
+                              size="small"
+                              icon={<StarOutlined />}
+                              onClick={() => handleScoreImage(image.imageType)}
+                              loading={result.scoring}
+                              style={{ borderRadius: 12 }}
+                            >
+                              评分
+                            </Button>
+                          </Space>
+                        </div>
+
+                        {result.score ? (
+                          <Row gutter={[8, 8]}>
+                            <Col span={8}><Statistic title="综合" value={result.score.overall} precision={1} /></Col>
+                            <Col span={8}><Statistic title="合规" value={result.score.compliance} precision={1} /></Col>
+                            <Col span={8}><Statistic title="吸引力" value={result.score.appeal} precision={1} /></Col>
+                          </Row>
+                        ) : null}
+
+                        {result.score?.suggestions?.length ? (
+                          <Text type="secondary">优化建议：{result.score.suggestions.join("；")}</Text>
+                        ) : null}
+                      </Space>
+                    </Card>
+                  );
+                })}
+              </div>
+            </Space>
+          </Card>
+
+          <Card
+            style={{
+              borderRadius: TEMU_CARD_RADIUS,
+              borderColor: "#eceff3",
+              boxShadow: "0 8px 22px rgba(15, 23, 42, 0.06)",
+            }}
+            bodyStyle={{ padding: 24 }}
+          >
+            <Space direction="vertical" size={18} style={{ width: "100%" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <div>
+                  <Title level={4} style={{ margin: 0, color: TEMU_TEXT }}>商品标题</Title>
+                  <Text type="secondary" style={{ display: "block", marginTop: 6 }}>
+                    结合本次分析自动生成标题方案，支持直接复制到 Temu 或其他平台。
+                  </Text>
+                </div>
+                <Button onClick={() => copyText(titleSuggestions.map((item) => `${item.label}：${item.text}`).join("\n\n"), "标题方案已全部复制")} style={{ borderRadius: 14 }}>
+                  全部复制
+                </Button>
+              </div>
+
+              <Space direction="vertical" size={14} style={{ width: "100%" }}>
+                {titleSuggestions.map((item, index) => (
+                  <div
+                    key={item.key}
+                    style={{
+                      border: index === 1 ? "1px solid #ffb279" : "1px solid #edf0f4",
+                      background: index === 1 ? "#fff8f2" : "#fff",
+                      borderRadius: 18,
+                      padding: 18,
+                      boxShadow: index === 1 ? "0 10px 24px rgba(255, 106, 0, 0.08)" : "none",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
+                      <div>
+                        <Tag color={index === 1 ? "orange" : "default"} style={{ borderRadius: 999, paddingInline: 12, marginBottom: 10 }}>
+                          {item.label}
+                        </Tag>
+                        <Paragraph style={{ marginBottom: 10, color: TEMU_TEXT, fontSize: 15, lineHeight: 1.7 }}>
+                          {item.text}
+                        </Paragraph>
+                        <Text type="secondary">{item.text.length} 字符</Text>
+                      </div>
+                      <Button
+                        type="text"
+                        icon={<CopyOutlined />}
+                        onClick={() => copyText(item.text, `${item.label}已复制`)}
+                        style={{ color: "#7a8ca8" }}
+                      >
+                        复制
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </Space>
+
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 12,
+                  flexWrap: "wrap",
+                  paddingTop: 4,
+                }}
+              >
+                <Text type="secondary">不满意当前结果？可以重新开始或返回方案页继续微调。</Text>
+                <Space wrap>
+                  <Button onClick={resetStudio} style={{ borderRadius: 14 }}>
+                    重新开始
+                  </Button>
+                  <Button icon={<DownloadOutlined />} onClick={handleDownloadAllImages} loading={downloadingAll} style={{ borderRadius: 14 }}>
+                    全部下载
+                  </Button>
+                  <Button
+                    type="primary"
+                    onClick={saveCurrentHistory}
+                    style={{
+                      minWidth: 144,
+                      borderRadius: 14,
+                      border: "none",
+                      background: TEMU_BUTTON_GRADIENT,
+                      boxShadow: TEMU_BUTTON_SHADOW,
+                    }}
+                  >
+                    保存到历史
+                  </Button>
+                </Space>
+              </div>
+            </Space>
+          </Card>
+        </>
+      ) : (
+        <Card style={{ borderRadius: TEMU_CARD_RADIUS, borderColor: "#eceff3" }}>
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="生成完成后，结果会在这里展示" />
+        </Card>
+      )}
+    </Space>
+  );
+
+  const renderStepContent = () => {
+    if (activeStep === 0) return renderStepZero();
+    if (activeStep === 1) return renderStepOne();
+    if (activeStep === 2) return renderStepTwo();
+    return renderStepThree();
+  };
+
+  if (loading && !status.ready) {
+    return (
+      <div style={{ display: "flex", minHeight: 420, alignItems: "center", justifyContent: "center" }}>
+        <Space direction="vertical" size={16} align="center">
+          <Spin size="large" />
+          <Text type="secondary">{status.message || "正在启动 AI 出图服务…"}</Text>
+        </Space>
       </div>
     );
   }
 
-  // 加载中 / 启动中 / 错误状态
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 400, gap: 20 }}>
-      {(loading || status.status === "starting") ? (
-        <>
-          <Spin size="large" />
-          <Text type="secondary">{status.message || "正在启动 AI 出图服务…"}</Text>
-        </>
-      ) : status.status === "error" ? (
-        <>
-          <Alert
-            type="error"
-            showIcon
-            message="AI 出图服务启动失败"
-            description={status.message}
-            style={{ maxWidth: 500 }}
-          />
-          <Space>
-            <Button type="primary" icon={<ReloadOutlined />} onClick={() => refreshStatus(true)} loading={actionLoading}>
-              重新启动
-            </Button>
-            <Button icon={<ExportOutlined />} onClick={handleOpenExternal}>
-              浏览器打开
-            </Button>
-          </Space>
-        </>
-      ) : (
-        <>
-          <Empty description="AI 出图服务未启动" image={Empty.PRESENTED_IMAGE_SIMPLE} />
-          <Button type="primary" icon={<ReloadOutlined />} onClick={() => refreshStatus(true)} loading={actionLoading}>
-            启动服务
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 22,
+        padding: "4px 0 20px",
+        background: TEMU_PAGE_BG,
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16, flexWrap: "wrap" }}>
+        <div>
+          <Title level={3} style={{ margin: 0, color: TEMU_TEXT, fontWeight: 700 }}>亚马逊商品图片生成器</Title>
+          <Text type="secondary" style={{ display: "block", marginTop: 4, color: "#8a97ab" }}>
+            AI 智能生成高转化率 Listing 图片
+          </Text>
+        </div>
+        <Space size={10} wrap>
+          <Button icon={<HistoryOutlined />} onClick={handleOpenHistory} style={{ height: 40, borderRadius: 16 }}>
+            历史记录
           </Button>
-        </>
+          <Button icon={<SettingOutlined />} onClick={handleOpenConfig} loading={configLoading} style={{ height: 40, borderRadius: 16 }}>
+            服务设置
+          </Button>
+        </Space>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        {stepItems.map((item, index) => {
+          const active = index === activeStep;
+          const done = index < activeStep;
+          const disabled = index > maxUnlockedStep;
+          return (
+            <Space key={item.title} size={12} align="center">
+              <button
+                type="button"
+                onClick={() => handleStepChange(index)}
+                disabled={disabled}
+                style={{
+                  height: 28,
+                  padding: "0 14px",
+                  borderRadius: 999,
+                  border: "none",
+                  background: active ? TEMU_BUTTON_GRADIENT : done ? "#e9fff0" : "transparent",
+                  color: active ? "#ffffff" : done ? "#16a34a" : "#93a1b4",
+                  fontSize: 13,
+                  fontWeight: active ? 700 : 500,
+                  cursor: disabled ? "not-allowed" : "pointer",
+                  boxShadow: active ? "0 8px 18px rgba(255, 106, 0, 0.2)" : "none",
+                  opacity: disabled ? 0.6 : 1,
+                  transition: "background-color 0.2s, color 0.2s, box-shadow 0.2s, opacity 0.2s",
+                }}
+              >
+                {index + 1 + ". " + item.title}
+              </button>
+              {index < stepItems.length - 1 ? <div style={{ width: 30, height: 1, background: "#dbe3ee" }} /> : null}
+            </Space>
+          );
+        })}
+      </div>
+
+      {!status.ready ? (
+        <Card style={{ borderRadius: TEMU_CARD_RADIUS, borderColor: "#eceff3", boxShadow: TEMU_CARD_SHADOW }}>
+          {status.status === "error" ? (
+            <Space direction="vertical" size={16}>
+              <Alert type="error" showIcon message="AI 出图服务启动失败" description={status.message} />
+              <Space>
+                <Button type="primary" icon={<ReloadOutlined />} onClick={() => refreshStatus(true)} loading={actionLoading}>重新启动</Button>
+                <Button icon={<ExportOutlined />} onClick={handleOpenExternal}>浏览器打开</Button>
+              </Space>
+            </Space>
+          ) : (
+            <Space direction="vertical" size={16}>
+              <Spin />
+              <Text type="secondary">{status.message || "正在启动 AI 出图服务…"}</Text>
+            </Space>
+          )}
+        </Card>
+      ) : (
+        <div style={{ maxWidth: 1120, margin: "0 auto", width: "100%" }}>
+          {renderStepContent()}
+        </div>
       )}
+
+      {false ? (
+        <Row gutter={[20, 20]} style={{ maxWidth: 980, margin: "0 auto" }}>
+          <Col xs={24} xl={activeStep === 0 ? 24 : 9}>
+            <Space direction="vertical" size={16} style={{ width: "100%" }}>
+              <Card
+                title={activeStep === 0 ? null : `当前步骤 · ${stepItems[activeStep]?.title || "AI 出图"}`}
+                style={{ borderRadius: 12, borderColor: TEMU_BORDER, boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}
+                bodyStyle={activeStep === 0 ? { padding: 0 } : undefined}
+              >
+                <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                  {activeStep !== 0 ? (
+                    <Text type="secondary" style={{ fontSize: 13 }}>
+                      {stepItems[activeStep]?.description}
+                    </Text>
+                  ) : null}
+
+                  {activeStep === 0 ? (
+                    <>
+                      <div
+                        style={{
+                          border: "1px dashed #ffb38a",
+                          borderRadius: 24,
+                          background: "radial-gradient(circle at top, #fffaf5 0%, #ffffff 70%)",
+                          padding: "44px 24px 32px",
+                          textAlign: "center",
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: 64,
+                            height: 64,
+                            borderRadius: 12,
+                            margin: "0 auto 18px",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            background: "linear-gradient(135deg, #ff7a1a 0%, #ff5a00 100%)",
+                            boxShadow: "0 10px 24px rgba(255, 90, 0, 0.18)",
+                          }}
+                        >
+                          <UploadOutlined style={{ color: "#fff", fontSize: 28 }} />
+                        </div>
+
+                        <Title level={4} style={{ marginBottom: 8 }}>拖拽商品图片到此处</Title>
+                        <Text type="secondary">支持多张图片（最多 5 张），适合组合装/套装</Text>
+
+                        <div style={{ marginTop: 24 }}>
+                          <Upload
+                            accept="image/*"
+                            listType="picture"
+                            multiple
+                            beforeUpload={() => false}
+                            fileList={uploadFiles}
+                            maxCount={5}
+                            onChange={({ fileList }) => setUploadFiles(fileList.slice(-5))}
+                          >
+                            <Button type="primary" size="large" icon={<UploadOutlined />} style={{ borderRadius: 8, minWidth: 132 }}>
+                              选择图片
+                            </Button>
+                          </Upload>
+                        </div>
+
+                        <div style={{ marginTop: 18 }}>
+                          <Text type="secondary">上传 1-5 张商品图，支持组合装/套装商品</Text>
+                        </div>
+                      </div>
+
+                      <div style={{ padding: 24 }}>
+                        <Space direction="vertical" size={18} style={{ width: "100%" }}>
+                          <Row gutter={[12, 12]}>
+                            <Col xs={24} md={12} xl={6}>
+                              <Text type="secondary">商品模式</Text>
+                              <Select
+                                style={{ width: "100%", marginTop: 8 }}
+                                value={productMode}
+                                onChange={setProductMode}
+                                options={PRODUCT_MODE_OPTIONS.map((option) => ({
+                                  label: option.label,
+                                  value: option.value,
+                                }))}
+                              />
+                            </Col>
+                            <Col xs={24} md={12} xl={6}>
+                              <Text type="secondary">销售区域</Text>
+                              <Select
+                                style={{ width: "100%", marginTop: 8 }}
+                                value={salesRegion}
+                                onChange={(value) => {
+                                  setSalesRegion(value);
+                                  setImageLanguage(getDefaultImageLanguageForRegion(value));
+                                }}
+                                options={SALES_REGION_OPTIONS as unknown as { value: string; label: string }[]}
+                              />
+                            </Col>
+                            <Col xs={24} md={12} xl={6}>
+                              <Text type="secondary">文字语言</Text>
+                              <Select
+                                style={{ width: "100%", marginTop: 8 }}
+                                value={imageLanguage}
+                                onChange={setImageLanguage}
+                                options={IMAGE_LANGUAGE_OPTIONS as unknown as { value: string; label: string }[]}
+                              />
+                            </Col>
+                            <Col xs={24} md={12} xl={6}>
+                              <Text type="secondary">画布尺寸</Text>
+                              <Select
+                                style={{ width: "100%", marginTop: 8 }}
+                                value={imageSize}
+                                onChange={setImageSize}
+                                options={IMAGE_SIZE_OPTIONS as unknown as { value: string; label: string }[]}
+                              />
+                            </Col>
+                          </Row>
+
+                          <div>
+                            <Text type="secondary">需要生成的图片类型</Text>
+                            <Checkbox.Group
+                              style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 14 }}
+                              value={selectedImageTypes}
+                              options={DEFAULT_IMAGE_TYPES.map((type) => ({ label: IMAGE_TYPE_LABELS[type], value: type }))}
+                              onChange={(values) => setSelectedImageTypes(values.map(String))}
+                            />
+                          </div>
+
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                            <Space wrap size={[8, 8]}>
+                              {selectedTypeLabels.map((label) => (
+                                <Tag key={label} color="orange" style={{ borderRadius: 8 }}>{label}</Tag>
+                              ))}
+                            </Space>
+                            <Button type="primary" size="large" style={{ borderRadius: 8, minWidth: 144 }} disabled={!hasUploads} onClick={() => setActiveStep(1)}>
+                              下一步
+                            </Button>
+                          </div>
+                        </Space>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <Space wrap size={[8, 8]}>
+                        <Tag color="orange">素材 {uploadFiles.length} 张</Tag>
+                        <Tag>{selectedTypeLabels.length || 0} 种图类型</Tag>
+                        <Tag>{SALES_REGION_OPTIONS.find((option) => option.value === salesRegion)?.label || salesRegion}</Tag>
+                        <Tag>{IMAGE_LANGUAGE_OPTIONS.find((option) => option.value === imageLanguage)?.label || imageLanguage}</Tag>
+                        <Tag>{imageSize}</Tag>
+                      </Space>
+
+                      <Space direction="vertical" size={10} style={{ width: "100%" }}>
+                        <Button block onClick={() => setActiveStep(Math.max(activeStep - 1, 0))}>上一步</Button>
+                        {activeStep === 1 ? (
+                          <>
+                            <Button block type="primary" icon={<PictureOutlined />} onClick={handleAnalyze} loading={analyzing}>
+                              {hasAnalysis ? "重新分析商品" : "开始分析商品"}
+                            </Button>
+                            <Button block icon={<ReloadOutlined />} onClick={handleRegenerateAnalysis} loading={regenerating} disabled={!hasAnalysis}>
+                              {regenerating ? "重生中…" : "重生卖点"}
+                            </Button>
+                            <Button block type="primary" disabled={!hasAnalysis} onClick={() => setActiveStep(2)}>
+                              下一步：生成方案
+                            </Button>
+                          </>
+                        ) : null}
+                        {activeStep === 2 ? (
+                          <>
+                            <Button block type="primary" icon={<RocketOutlined />} onClick={handleGeneratePlans} loading={planning} disabled={!hasAnalysis}>
+                              {planning ? "生成中…" : hasPlans ? "重新生成方案" : "生成方案"}
+                            </Button>
+                            <Button block type="primary" disabled={!hasPlans} onClick={() => setActiveStep(3)}>
+                              下一步：开始出图
+                            </Button>
+                          </>
+                        ) : null}
+                        {activeStep === 3 ? (
+                          <>
+                            <Button
+                              block
+                              type="primary"
+                              icon={<RocketOutlined />}
+                              onClick={handleStartGenerate}
+                              loading={generating}
+                              disabled={plans.length === 0 || uploadFiles.length === 0}
+                            >
+                              {generating ? "正在生图…" : "开始原生生图"}
+                            </Button>
+                            <Button block danger icon={<StopOutlined />} onClick={handleCancelGenerate} disabled={!generating || !currentJobId}>
+                              取消任务
+                            </Button>
+                          </>
+                        ) : null}
+                      </Space>
+                    </>
+                  )}
+                </Space>
+              </Card>
+            </Space>
+          </Col>
+
+          {activeStep !== 0 ? (
+          <Col xs={24} xl={15}>
+            {activeStep === 1 ? (
+              <Card title="确认商品分析">
+                <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                  {!hasAnalysis ? (
+                    <Text type="secondary">先点左侧“开始分析商品”，这里会自动填充商品信息。</Text>
+                  ) : null}
+
+                  <Input value={analysis.productName} onChange={(event) => updateAnalysisField("productName", event.target.value)} placeholder="商品名称" />
+                  <Row gutter={12}>
+                    <Col span={12}>
+                      <Input value={analysis.category} onChange={(event) => updateAnalysisField("category", event.target.value)} placeholder="商品类目" />
+                    </Col>
+                    <Col span={12}>
+                      <Input value={analysis.estimatedDimensions} onChange={(event) => updateAnalysisField("estimatedDimensions", event.target.value)} placeholder="尺寸信息" />
+                    </Col>
+                  </Row>
+                  <Input value={analysis.materials} onChange={(event) => updateAnalysisField("materials", event.target.value)} placeholder="材质" />
+                  <Input value={analysis.colors} onChange={(event) => updateAnalysisField("colors", event.target.value)} placeholder="颜色 / 色值" />
+                  <Row gutter={12}>
+                    <Col xs={24} xxl={8}>
+                      <Text type="secondary">卖点</Text>
+                      <TextArea
+                        autoSize={{ minRows: 4, maxRows: 10 }}
+                        value={arrayToMultiline(analysis.sellingPoints)}
+                        onChange={(event) => updateAnalysisField("sellingPoints", multilineToArray(event.target.value))}
+                        placeholder="一行一个卖点"
+                      />
+                    </Col>
+                    <Col xs={24} xxl={8}>
+                      <Text type="secondary">目标人群</Text>
+                      <TextArea
+                        autoSize={{ minRows: 4, maxRows: 10 }}
+                        value={arrayToMultiline(analysis.targetAudience)}
+                        onChange={(event) => updateAnalysisField("targetAudience", multilineToArray(event.target.value))}
+                        placeholder="一行一个人群"
+                      />
+                    </Col>
+                    <Col xs={24} xxl={8}>
+                      <Text type="secondary">使用场景</Text>
+                      <TextArea
+                        autoSize={{ minRows: 4, maxRows: 10 }}
+                        value={arrayToMultiline(analysis.usageScenes)}
+                        onChange={(event) => updateAnalysisField("usageScenes", multilineToArray(event.target.value))}
+                        placeholder="一行一个场景"
+                      />
+                    </Col>
+                  </Row>
+                </Space>
+              </Card>
+            ) : null}
+
+            {activeStep === 2 ? (
+              <Card title="确认出图方案">
+                <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                  {plans.length > 0 ? (
+                    <List
+                      size="small"
+                      dataSource={plans}
+                      renderItem={(plan) => (
+                        <List.Item>
+                          <Space direction="vertical" size={10} style={{ width: "100%" }}>
+                            <Space style={{ justifyContent: "space-between", width: "100%" }} wrap>
+                              <Tag color="blue">{IMAGE_TYPE_LABELS[plan.imageType] || plan.imageType}</Tag>
+                              <Text type="secondary">{plan.title || plan.headline || "自动方案"}</Text>
+                            </Space>
+                            <TextArea
+                              autoSize={{ minRows: 4, maxRows: 10 }}
+                              value={plan.prompt}
+                              onChange={(event) => updatePlanPrompt(plan.imageType, event.target.value)}
+                              placeholder="这里可以手动微调每张图的 Prompt"
+                            />
+                          </Space>
+                        </List.Item>
+                      )}
+                    />
+                  ) : (
+                    <Text type="secondary">点左侧“生成方案”后，这里会列出每张图的 Prompt。</Text>
+                  )}
+                </Space>
+              </Card>
+            ) : null}
+
+            {activeStep === 3 ? (
+              <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                <Card
+                  title="执行出图任务"
+                  extra={<Space><Tag color={generating ? "processing" : "default"}>{generating ? "生成中" : "空闲"}</Tag><Text type="secondary">{completedCount}/{planCount}</Text></Space>}
+                >
+                  <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                    <Progress percent={progressPercent} status={generating ? "active" : "normal"} />
+
+                    {plans.length > 0 ? (
+                      <List
+                        size="small"
+                        bordered
+                        dataSource={plans}
+                        renderItem={(plan) => {
+                          const result = getResultState(results, plan.imageType);
+                          return (
+                            <List.Item>
+                              <Space direction="vertical" size={6} style={{ width: "100%" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+                                  <Space>
+                                    <Tag color="blue">{IMAGE_TYPE_LABELS[plan.imageType] || plan.imageType}</Tag>
+                                    {result.status === "queued" ? <Tag>排队中</Tag> : null}
+                                    {result.status === "done" ? <Tag color="success">已完成</Tag> : null}
+                                    {result.status === "generating" ? <Tag color="processing">生成中</Tag> : null}
+                                    {result.status === "error" ? <Tag color="error">失败</Tag> : null}
+                                  </Space>
+                                  <Text type="secondary">{plan.title || plan.headline || "自动方案"}</Text>
+                                </div>
+                                <Paragraph style={{ marginBottom: 0, whiteSpace: "pre-wrap" }} ellipsis={{ rows: 2, expandable: true, symbol: "展开" }}>
+                                  {plan.prompt}
+                                </Paragraph>
+                                {result.warnings.length > 0 ? (
+                                  <Text type="secondary">注意：{result.warnings.join("；")}</Text>
+                                ) : null}
+                                {result.error ? (
+                                  <Text type="danger">{result.error}</Text>
+                                ) : null}
+                              </Space>
+                            </List.Item>
+                          );
+                        }}
+                      />
+                    ) : (
+                      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有出图方案，请先回到上一步生成方案" />
+                    )}
+                  </Space>
+                </Card>
+
+                {generatedImages.length > 0 ? (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16 }}>
+                    {generatedImages.map((image) => {
+                      const result = getResultState(results, image.imageType);
+                      return (
+                        <Card
+                          key={image.imageType}
+                          size="small"
+                          title={IMAGE_TYPE_LABELS[image.imageType] || image.imageType}
+                          extra={<Button size="small" icon={<StarOutlined />} onClick={() => handleScoreImage(image.imageType)} loading={result.scoring}>评分</Button>}
+                        >
+                          <Space direction="vertical" size={12} style={{ width: "100%" }}>
+                            <Image src={image.imageUrl} alt={image.imageType} style={{ width: "100%", borderRadius: 8, objectFit: "cover" }} />
+                            {result.score ? (
+                              <Row gutter={[8, 8]}>
+                                <Col span={8}><Statistic title="综合" value={result.score.overall} precision={1} /></Col>
+                                <Col span={8}><Statistic title="合规" value={result.score.compliance} precision={1} /></Col>
+                                <Col span={8}><Statistic title="吸引力" value={result.score.appeal} precision={1} /></Col>
+                              </Row>
+                            ) : null}
+                            {result.score?.suggestions?.length ? (
+                              <Text type="secondary">优化建议：{result.score.suggestions.join("；")}</Text>
+                            ) : null}
+                            <Button
+                              icon={<SaveOutlined />}
+                              onClick={() => {
+                                if (!imageStudioAPI) return;
+                                imageStudioAPI.saveHistory({
+                                  productName: analysis.productName || "未命名商品",
+                                  salesRegion,
+                                  imageCount: generatedImages.length,
+                                  images: generatedImages,
+                                }).then(() => {
+                                  message.success("当前结果已保存到历史记录");
+                                  loadHistory().catch(() => {});
+                                }).catch((error) => {
+                                  message.error(error instanceof Error ? error.message : "保存历史失败");
+                                });
+                              }}
+                            >
+                              保存到历史
+                            </Button>
+                          </Space>
+                        </Card>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <Card>
+                    <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="生成完成后，结果会在这里原生展示" />
+                  </Card>
+                )}
+              </Space>
+            ) : null}
+
+            {activeStep === 0 ? (
+              <Card title="本次出图">
+                <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                  <div>
+                    <Text type="secondary">图片类型</Text>
+                    <div style={{ marginTop: 10 }}>
+                      <Space wrap size={[8, 8]}>
+                        {selectedTypeLabels.map((label) => (
+                          <Tag key={label} color="orange">{label}</Tag>
+                        ))}
+                      </Space>
+                    </div>
+                  </div>
+
+                  <div>
+                    <Text type="secondary">已上传素材</Text>
+                    <div style={{ marginTop: 10 }}>
+                      {uploadFiles.length > 0 ? (
+                        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                          {uploadFiles.map((file) => (
+                            <div
+                              key={file.uid}
+                              style={{
+                                padding: "12px 14px",
+                                border: `1px solid ${TEMU_BORDER}`,
+                                borderRadius: 14,
+                                background: "#fff",
+                              }}
+                            >
+                              <Text>{file.name}</Text>
+                            </div>
+                          ))}
+                        </Space>
+                      ) : (
+                        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="上传后的素材会显示在这里" />
+                      )}
+                    </div>
+                  </div>
+                </Space>
+              </Card>
+            ) : null}
+          </Col>
+          ) : null}
+        </Row>
+      ) : null}
+
+      <Drawer
+        title="AI 出图配置"
+        width={480}
+        open={configOpen}
+        onClose={() => setConfigOpen(false)}
+        extra={<Button type="primary" onClick={handleSaveConfig} loading={configLoading}>保存配置</Button>}
+      >
+        <Space direction="vertical" size={16} style={{ width: "100%" }}>
+          <Input value={configDraft.analyzeModel} onChange={(event) => setConfigDraft((prev) => ({ ...prev, analyzeModel: event.target.value }))} placeholder={config.analyzeModel || "分析模型"} />
+          <Input.Password value={configDraft.analyzeApiKey} onChange={(event) => setConfigDraft((prev) => ({ ...prev, analyzeApiKey: event.target.value }))} placeholder={hasMaskedValue(config.analyzeApiKey) ? "已配置分析 API Key，如需更新请重新输入" : "分析 API Key"} />
+          <Input value={configDraft.analyzeBaseUrl} onChange={(event) => setConfigDraft((prev) => ({ ...prev, analyzeBaseUrl: event.target.value }))} placeholder={config.analyzeBaseUrl || "分析 Base URL"} />
+          <Input value={configDraft.generateModel} onChange={(event) => setConfigDraft((prev) => ({ ...prev, generateModel: event.target.value }))} placeholder={config.generateModel || "出图模型"} />
+          <Input.Password value={configDraft.generateApiKey} onChange={(event) => setConfigDraft((prev) => ({ ...prev, generateApiKey: event.target.value }))} placeholder={hasMaskedValue(config.generateApiKey) ? "已配置出图 API Key，如需更新请重新输入" : "出图 API Key"} />
+          <Input value={configDraft.generateBaseUrl} onChange={(event) => setConfigDraft((prev) => ({ ...prev, generateBaseUrl: event.target.value }))} placeholder={config.generateBaseUrl || "出图 Base URL"} />
+        </Space>
+      </Drawer>
+
+      <Drawer title="历史记录" width={420} open={historyOpen} onClose={() => setHistoryOpen(false)}>
+        {historyLoading ? (
+          <div style={{ display: "flex", justifyContent: "center", padding: "48px 0" }}><Spin /></div>
+        ) : historyItems.length > 0 ? (
+          <List
+            itemLayout="vertical"
+            dataSource={historyItems}
+            renderItem={(item) => (
+              <List.Item
+                key={item.id}
+                actions={[<Button key="load" type="link" onClick={() => handleLoadHistoryItem(item)}>加载结果</Button>]}
+              >
+                <List.Item.Meta
+                  title={item.productName}
+                  description={`${item.imageCount} 张图片 · ${item.salesRegion.toUpperCase()} · ${formatTimestamp(item.timestamp)}`}
+                />
+              </List.Item>
+            )}
+          />
+        ) : (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有历史记录" />
+        )}
+      </Drawer>
     </div>
   );
 }

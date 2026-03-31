@@ -8,13 +8,26 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "build" / "auto-image-gen-runtime"
-BOOTSTRAP_CONTENT = """const path = require('path');
+BOOTSTRAP_CONTENT = """const fs = require('fs');
+const path = require('path');
 const Module = require('module');
 
-const runtimeNodeModules = path.join(__dirname, 'runtime_node_modules');
+const packagedNodeModules = path.join(__dirname, 'node_modules');
+const legacyRuntimeNodeModules = path.join(__dirname, 'runtime_node_modules');
+
+// Older bundles renamed node_modules to runtime_node_modules, which breaks ESM package resolution.
+// Recreate a standard node_modules path when possible so dynamic imports inside Next routes keep working.
+if (!fs.existsSync(packagedNodeModules) && fs.existsSync(legacyRuntimeNodeModules)) {
+  try {
+    fs.symlinkSync(legacyRuntimeNodeModules, packagedNodeModules, 'junction');
+  } catch {}
+}
+
+const moduleRoots = [packagedNodeModules, legacyRuntimeNodeModules].filter((item) => fs.existsSync(item));
 const existingNodePath = process.env.NODE_PATH ? process.env.NODE_PATH.split(path.delimiter) : [];
-if (!existingNodePath.includes(runtimeNodeModules)) {
-  process.env.NODE_PATH = [runtimeNodeModules, ...existingNodePath].filter(Boolean).join(path.delimiter);
+const mergedNodePath = [...moduleRoots, ...existingNodePath.filter(Boolean)].filter((item, index, list) => list.indexOf(item) === index);
+if (mergedNodePath.length > 0) {
+  process.env.NODE_PATH = mergedNodePath.join(path.delimiter);
   Module._initPaths();
 }
 
@@ -101,13 +114,6 @@ def main() -> None:
       else:
         ensure_dir(target.parent)
         shutil.copy2(child, target)
-
-    packaged_node_modules = OUTPUT / "node_modules"
-    runtime_node_modules = OUTPUT / "runtime_node_modules"
-    if packaged_node_modules.exists():
-        if runtime_node_modules.exists():
-            shutil.rmtree(runtime_node_modules)
-        packaged_node_modules.rename(runtime_node_modules)
 
     copy_tree(static_root, OUTPUT / ".next" / "static")
     copy_tree(public_root, OUTPUT / "public")

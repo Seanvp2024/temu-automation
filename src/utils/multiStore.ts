@@ -128,20 +128,21 @@ export async function syncScopedDataToGlobalStore(store: StoreLike, accountId: s
   if (!store) return;
 
   if (!accountId) {
-    await Promise.all(ACCOUNT_SCOPED_BASE_KEYS.map(baseKey => store.set(baseKey, null)));
+    for (const baseKey of ACCOUNT_SCOPED_BASE_KEYS) {
+      await store.set(baseKey, null);
+    }
     return;
   }
 
-  // Parallel read all scoped values
-  const scopedEntries = await Promise.all(
-    ACCOUNT_SCOPED_BASE_KEYS.map(async (baseKey) => {
-      const value = await store.get(buildScopedStoreKey(accountId, baseKey));
-      return [baseKey, value ?? null] as const;
-    })
-  );
+  const scopedEntries: Array<readonly [string, any]> = [];
+  for (const baseKey of ACCOUNT_SCOPED_BASE_KEYS) {
+    const value = await store.get(buildScopedStoreKey(accountId, baseKey));
+    scopedEntries.push([baseKey, value ?? null] as const);
+  }
 
-  // Parallel write all global values
-  await Promise.all(scopedEntries.map(([baseKey, value]) => store.set(baseKey, value)));
+  for (const [baseKey, value] of scopedEntries) {
+    await store.set(baseKey, value);
+  }
 }
 
 export async function setActiveAccountAndSync(store: StoreLike, accounts: MultiStoreAccount[], accountId?: string | null) {

@@ -11,7 +11,7 @@ import {
   message,
   notification,
 } from "antd";
-import { PlusOutlined, LoginOutlined, DeleteOutlined, LogoutOutlined, EyeOutlined } from "@ant-design/icons";
+import { PlusOutlined, LoginOutlined, DeleteOutlined, LogoutOutlined, EyeOutlined, LoadingOutlined } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import {
   ACTIVE_ACCOUNT_CHANGED_EVENT,
@@ -75,22 +75,34 @@ export default function AccountManager() {
 
   // 启动时从文件加载账号
   useEffect(() => {
+    let cancelled = false;
+
     if (store) {
-      store.get(STORAGE_KEY).then(async (data: Account[] | null) => {
+      store.get(STORAGE_KEY).then((data: Account[] | null) => {
         if (data && Array.isArray(data)) {
           const nextAccounts = data.map((a: Account) => ({ ...a, status: "offline" as const }));
-          setAccounts(nextAccounts);
-          await restoreActiveAccountData(nextAccounts);
+          if (!cancelled) {
+            setAccounts(nextAccounts);
+          }
+          restoreActiveAccountData(nextAccounts).catch(() => {});
         } else {
-          await clearActiveAccount();
+          clearActiveAccount().catch(() => {});
         }
-        setHydrated(true);
+        if (!cancelled) {
+          setHydrated(true);
+        }
       }).catch(() => {
-        setHydrated(true);
+        if (!cancelled) {
+          setHydrated(true);
+        }
       });
     } else {
       setHydrated(true);
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [store]);
 
   // 账号变化时保存到文件
@@ -321,6 +333,15 @@ export default function AccountManager() {
     }
     message.success("账号已删除");
   };
+
+  if (!hydrated) {
+    return (
+      <div style={{ textAlign: "center", padding: "80px 0" }}>
+        <LoadingOutlined style={{ fontSize: 24 }} />
+        <div style={{ marginTop: 12, color: "#999" }}>加载账号数据...</div>
+      </div>
+    );
+  }
 
   return (
     <div>

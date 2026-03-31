@@ -1,3 +1,15 @@
+import type {
+  ImageStudioAnalysis,
+  ImageStudioConfig,
+  ImageStudioGeneratedImage,
+  ImageStudioHistoryItem,
+  ImageStudioHistorySummary,
+  ImageStudioImageScore,
+  ImageStudioPlan,
+  ImageStudioStatus,
+  NativeImagePayload,
+} from "../utils/imageStudio";
+
 interface AutomationAPI {
   login: (accountId: string, phone: string, password: string) => Promise<{ success: boolean; matchedStoreName?: string }>;
   scrapeProducts: () => Promise<any>;
@@ -30,18 +42,38 @@ interface AutomationAPI {
   listDrafts: () => Promise<any>;
   retryDraft: (draftId: string) => Promise<any>;
   deleteDraft: (draftId: string) => Promise<any>;
-  fetchProductDetailData: (params: any) => Promise<any>;
   close: () => Promise<{ status: string }>;
   ping: () => Promise<{ status: string }>;
 }
 
-interface ImageStudioStatus {
-  status: string;
-  message: string;
-  url: string;
-  projectPath: string;
-  port: number;
-  ready: boolean;
+interface ImageStudioGenerateStarted {
+  jobId: string;
+}
+
+interface ImageStudioGenerateRuntimeEvent {
+  imageType?: string;
+  status?: string;
+  imageUrl?: string;
+  error?: string;
+  warnings?: string[];
+}
+
+interface ImageStudioEventPayload {
+  jobId: string;
+  type: "generate:started" | "generate:event" | "generate:complete" | "generate:error" | "generate:cancelled";
+  event?: ImageStudioGenerateRuntimeEvent;
+  results?: ImageStudioGeneratedImage[];
+  error?: string;
+  message?: string;
+}
+
+interface ImageStudioConfigUpdatePayload {
+  analyzeModel?: string;
+  analyzeApiKey?: string;
+  analyzeBaseUrl?: string;
+  generateModel?: string;
+  generateApiKey?: string;
+  generateBaseUrl?: string;
 }
 
 interface ImageStudioAPI {
@@ -49,6 +81,17 @@ interface ImageStudioAPI {
   ensureRunning: () => Promise<ImageStudioStatus>;
   restart: () => Promise<ImageStudioStatus>;
   openExternal: () => Promise<string>;
+  getConfig: () => Promise<ImageStudioConfig>;
+  updateConfig: (payload: ImageStudioConfigUpdatePayload) => Promise<ImageStudioConfig>;
+  analyze: (payload: { files: NativeImagePayload[]; productMode: string }) => Promise<ImageStudioAnalysis>;
+  regenerateAnalysis: (payload: { files: NativeImagePayload[]; productMode: string; analysis: ImageStudioAnalysis }) => Promise<Pick<ImageStudioAnalysis, "sellingPoints" | "targetAudience" | "usageScenes">>;
+  generatePlans: (payload: { analysis: ImageStudioAnalysis; imageTypes: string[]; salesRegion: string; imageSize: string; productMode: string }) => Promise<ImageStudioPlan[]>;
+  startGenerate: (payload: { jobId?: string; files: NativeImagePayload[]; plans: ImageStudioPlan[]; productMode: string; imageLanguage: string; imageSize: string }) => Promise<ImageStudioGenerateStarted>;
+  cancelGenerate: (jobId: string) => Promise<{ cancelled: boolean; jobId: string }>;
+  listHistory: () => Promise<ImageStudioHistorySummary[]>;
+  getHistoryItem: (id: string) => Promise<ImageStudioHistoryItem | null>;
+  saveHistory: (payload: { productName: string; salesRegion: string; imageCount: number; images: ImageStudioGeneratedImage[] }) => Promise<{ id: string }>;
+  scoreImage: (payload: { imageUrl: string; imageType: string }) => Promise<ImageStudioImageScore>;
 }
 
 interface AppAPI {
@@ -74,6 +117,7 @@ interface ElectronAPI {
   store: StoreAPI;
   onAutomationEvent: (callback: (data: any) => void) => void;
   onUpdateStatus?: (callback: (data: any) => void) => (() => void);
+  onImageStudioEvent?: (callback: (data: ImageStudioEventPayload) => void) => (() => void);
 }
 
 declare global {

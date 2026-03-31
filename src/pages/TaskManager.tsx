@@ -634,18 +634,20 @@ export default function TaskManager() {
       title: "任务名称",
       dataIndex: "name",
       key: "name",
-      width: 150,
+      width: 110,
     },
     {
       title: "说明",
       dataIndex: "description",
       key: "description",
+      onCell: () => ({ style: { minWidth: 200 } }),
+      onHeaderCell: () => ({ style: { minWidth: 200 } }) as any,
     },
     {
       title: "状态",
       dataIndex: "status",
       key: "status",
-      width: 110,
+      width: 80,
       render: (status: TaskStatus) => {
         const map: Record<TaskStatus, { color: string; text: string }> = {
           idle: { color: "default", text: "待执行" },
@@ -661,27 +663,28 @@ export default function TaskManager() {
       title: "最近执行",
       dataIndex: "lastRun",
       key: "lastRun",
-      width: 170,
+      width: 150,
       render: (value?: string) => value || <Text type="secondary">未执行</Text>,
     },
     {
       title: "数据量",
       dataIndex: "count",
       key: "count",
-      width: 100,
+      width: 70,
       render: (value?: number) => typeof value === "number" ? value : <Text type="secondary">-</Text>,
     },
     {
       title: "最近结果",
       dataIndex: "lastMessage",
       key: "lastMessage",
-      width: 260,
+      width: 160,
+      ellipsis: true,
       render: (value?: string) => value || <Text type="secondary">暂无结果</Text>,
     },
     {
       title: "操作",
       key: "action",
-      width: 140,
+      width: 120,
       render: (_, record) => (
         <Button
           type="primary"

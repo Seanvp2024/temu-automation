@@ -78,6 +78,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ensureRunning: () => ipcRenderer.invoke("image-studio:ensure-running"),
     restart: () => ipcRenderer.invoke("image-studio:restart"),
     openExternal: () => ipcRenderer.invoke("image-studio:open-external"),
+    getConfig: () => ipcRenderer.invoke("image-studio:get-config"),
+    updateConfig: (payload) => ipcRenderer.invoke("image-studio:update-config", payload),
+    analyze: (payload) => ipcRenderer.invoke("image-studio:analyze", payload),
+    regenerateAnalysis: (payload) => ipcRenderer.invoke("image-studio:regenerate-analysis", payload),
+    generatePlans: (payload) => ipcRenderer.invoke("image-studio:generate-plans", payload),
+    startGenerate: (payload) => ipcRenderer.invoke("image-studio:start-generate", payload),
+    cancelGenerate: (jobId) => ipcRenderer.invoke("image-studio:cancel-generate", jobId),
+    listHistory: () => ipcRenderer.invoke("image-studio:list-history"),
+    getHistoryItem: (id) => ipcRenderer.invoke("image-studio:get-history-item", id),
+    saveHistory: (payload) => ipcRenderer.invoke("image-studio:save-history", payload),
+    scoreImage: (payload) => ipcRenderer.invoke("image-studio:score-image", payload),
   },
 
   app: {
@@ -90,12 +101,19 @@ contextBridge.exposeInMainWorld("electronAPI", {
   },
 
   onAutomationEvent: (callback) => {
-    ipcRenderer.on("automation-event", (_, data) => callback(data));
+    const listener = (_, data) => callback(data);
+    ipcRenderer.on("automation-event", listener);
+    return () => ipcRenderer.removeListener("automation-event", listener);
   },
   onUpdateStatus: (callback) => {
     const listener = (_, data) => callback(data);
     ipcRenderer.on("app:update-status", listener);
     return () => ipcRenderer.removeListener("app:update-status", listener);
+  },
+  onImageStudioEvent: (callback) => {
+    const listener = (_, data) => callback(data);
+    ipcRenderer.on("image-studio:event", listener);
+    return () => ipcRenderer.removeListener("image-studio:event", listener);
   },
 
   store: {
