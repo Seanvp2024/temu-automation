@@ -1,7 +1,7 @@
 {
   "name": "temu-automation",
   "private": true,
-  "version": "0.1.19",
+  "version": "0.1.20",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -45,7 +45,14 @@
       "!test_*.json"
     ],
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "icon": "build/icon.ico",
       "signAndEditExecutable": false,
       "artifactName": "temu-automation-setup-${version}.${ext}"
@@ -65,6 +72,7 @@
     "concurrently": "^9.2.1",
     "dayjs": "^1.11.12",
     "electron-store": "^11.0.2",
+    "electron-updater": "^6.8.3",
     "playwright": "^1.58.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

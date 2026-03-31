@@ -53,6 +53,10 @@ interface ImageStudioAPI {
 
 interface AppAPI {
   getVersion: () => Promise<string>;
+  getUpdateStatus: () => Promise<any>;
+  checkForUpdates: () => Promise<any>;
+  downloadUpdate: () => Promise<any>;
+  quitAndInstallUpdate: () => Promise<boolean>;
   openLogDirectory: () => Promise<string>;
 }
 
@@ -69,6 +73,7 @@ interface ElectronAPI {
   app: AppAPI;
   store: StoreAPI;
   onAutomationEvent: (callback: (data: any) => void) => void;
+  onUpdateStatus?: (callback: (data: any) => void) => (() => void);
 }
 
 declare global {

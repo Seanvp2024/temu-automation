@@ -3,6 +3,7 @@ const path = require("path");
 const { spawn } = require("child_process");
 const http = require("http");
 const fs = require("fs");
+const { autoUpdater } = require("electron-updater");
 
 // 全局捕获未处理异常，防止 EPIPE 等 pipe 错误崩溃 Electron
 process.on("uncaughtException", (err) => {
@@ -17,6 +18,73 @@ let mainWindow = null;
 let worker = null;
 let workerPort = 19280;
 let workerReady = false;
+
+// ============ 自动更新 ============
+
+const GITHUB_UPDATE_OWNER = "9619221";
+const GITHUB_UPDATE_REPO = "temu-automation";
+
+let updateState = {
+  status: "idle",
+  version: null,
+  message: "未检查更新",
+  releaseVersion: null,
+  progressPercent: null,
+};
+
+function broadcastUpdateState(patch) {
+  updateState = { ...updateState, ...patch };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("app:update-status", updateState);
+  }
+}
+
+function configureAutoUpdater() {
+  if (!app.isPackaged) {
+    broadcastUpdateState({ status: "dev", message: "开发环境不支持自动更新" });
+    return;
+  }
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.setFeedURL({
+    provider: "github",
+    owner: GITHUB_UPDATE_OWNER,
+    repo: GITHUB_UPDATE_REPO,
+  });
+  broadcastUpdateState({ message: `更新源: GitHub ${GITHUB_UPDATE_OWNER}/${GITHUB_UPDATE_REPO}` });
+}
+
+autoUpdater.on("checking-for-update", () => {
+  broadcastUpdateState({ status: "checking", message: "正在检查更新…" });
+});
+autoUpdater.on("update-available", (info) => {
+  broadcastUpdateState({ status: "available", message: `发现新版本 ${info?.version || ""}`, releaseVersion: info?.version });
+  autoUpdater.downloadUpdate().catch(() => {});
+});
+autoUpdater.on("update-not-available", () => {
+  broadcastUpdateState({ status: "up-to-date", message: "当前已是最新版本", releaseVersion: null, progressPercent: null });
+});
+autoUpdater.on("download-progress", (progress) => {
+  broadcastUpdateState({ status: "downloading", message: `正在下载 ${Math.round(progress?.percent || 0)}%`, progressPercent: Math.round(progress?.percent || 0) });
+});
+autoUpdater.on("update-downloaded", (info) => {
+  broadcastUpdateState({ status: "downloaded", message: `${info?.version || ""} 已下载，重启即可安装`, releaseVersion: info?.version, progressPercent: 100 });
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    dialog.showMessageBox(mainWindow, {
+      type: "info",
+      title: "更新已就绪",
+      message: `新版本 ${info?.version || ""} 已下载`,
+      detail: "重启应用即可安装。",
+      buttons: ["稍后", "立即重启"],
+      defaultId: 1,
+    }).then(({ response }) => {
+      if (response === 1) autoUpdater.quitAndInstall(false, true);
+    }).catch(() => {});
+  }
+});
+autoUpdater.on("error", (error) => {
+  broadcastUpdateState({ status: "error", message: error?.message || "检查更新失败", progressPercent: null });
+});
 
 // ============ Worker 管理（HTTP 通信，彻底避免 stdio 继承） ============
 
@@ -236,11 +304,11 @@ function getAutoImageProjectCandidates() {
   const appDir = app.getAppPath();
   const workspaceRoot = path.resolve(appDir, "..");
   return [
-    app.isPackaged ? path.join(process.resourcesPath, "auto-image-gen-runtime") : "",
     process.env.AUTO_IMAGE_GEN_DIR,
     "C:/Users/Administrator/auto-image-gen-dev",
     path.resolve(workspaceRoot, "auto-image-gen-dev"),
     path.resolve(workspaceRoot, "../auto-image-gen-dev"),
+    app.isPackaged ? path.join(process.resourcesPath, "auto-image-gen-runtime") : "",
   ].filter(Boolean);
 }
 
@@ -407,12 +475,18 @@ async function createWindow() {
 
 app.whenReady().then(async () => {
   await createWindow();
-  // 启动时自动启动 worker，这样用户操作时不用等待
   try {
     await startWorker();
     console.log("[Main] Worker auto-started successfully");
   } catch (e) {
     console.error("[Main] Worker auto-start failed (will retry on demand):", e.message);
+  }
+  // 自动检查更新（延迟5秒，避免阻塞启动）
+  configureAutoUpdater();
+  if (app.isPackaged) {
+    setTimeout(() => {
+      autoUpdater.checkForUpdates().catch(() => {});
+    }, 5000);
   }
 });
 app.on("window-all-closed", () => { stopWorker(); stopImageStudioService(); app.quit(); });
@@ -575,6 +649,28 @@ ipcMain.handle("image-studio:open-external", async () => {
 });
 
 ipcMain.handle("app:get-version", () => app.getVersion());
+
+ipcMain.handle("app:get-update-status", () => updateState);
+
+ipcMain.handle("app:check-for-updates", async () => {
+  try {
+    await autoUpdater.checkForUpdates();
+    return updateState;
+  } catch (e) {
+    broadcastUpdateState({ status: "error", message: e?.message || "检查更新失败" });
+    return updateState;
+  }
+});
+
+ipcMain.handle("app:download-update", async () => {
+  await autoUpdater.downloadUpdate();
+  return updateState;
+});
+
+ipcMain.handle("app:quit-and-install-update", () => {
+  autoUpdater.quitAndInstall(false, true);
+  return true;
+});
 
 ipcMain.handle("app:open-log-directory", async () => {
   const logDir = app.getPath("userData");

@@ -76,11 +76,20 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   app: {
     getVersion: () => ipcRenderer.invoke("app:get-version"),
+    getUpdateStatus: () => ipcRenderer.invoke("app:get-update-status"),
+    checkForUpdates: () => ipcRenderer.invoke("app:check-for-updates"),
+    downloadUpdate: () => ipcRenderer.invoke("app:download-update"),
+    quitAndInstallUpdate: () => ipcRenderer.invoke("app:quit-and-install-update"),
     openLogDirectory: () => ipcRenderer.invoke("app:open-log-directory"),
   },
 
   onAutomationEvent: (callback) => {
     ipcRenderer.on("automation-event", (_, data) => callback(data));
+  },
+  onUpdateStatus: (callback) => {
+    const listener = (_, data) => callback(data);
+    ipcRenderer.on("app:update-status", listener);
+    return () => ipcRenderer.removeListener("app:update-status", listener);
   },
 
   store: {
