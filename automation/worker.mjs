@@ -1449,7 +1449,7 @@ async function batchCreateFromCSV(params) {
  * @returns {string[]} 生成的图片文件路径数组
  */
 async function generateAIImages(sourceImagePath, productTitle, imageTypes = ["hero", "lifestyle"]) {
-  const AI_SERVER = process.env.AI_IMAGE_SERVER || "http://localhost:3000";
+  const AI_SERVER = process.env.AI_IMAGE_SERVER || "http://localhost:3210";
   const outputDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "ai-images");
   fs.mkdirSync(outputDir, { recursive: true });
 
@@ -5017,8 +5017,8 @@ const IMAGE_TYPE_ORDER = [
   "lifestyle2", // 5. A+ 收束图
 ];
 
-const AI_IMAGE_GEN_URL = "http://localhost:3000";
-const AI_AUTH_HEADERS = { "sec-fetch-site": "same-origin", "origin": "http://localhost:3000" };
+const AI_IMAGE_GEN_URL = "http://localhost:3210";
+const AI_AUTH_HEADERS = { "sec-fetch-site": "same-origin", "origin": "http://localhost:3210" };
 
 /**
  * 调用 AI 生图服务：分析 + 生成 10 张图

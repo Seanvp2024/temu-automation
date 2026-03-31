@@ -8,6 +8,8 @@ import ProductDetail from "./pages/ProductDetail";
 import TaskManager from "./pages/TaskManager";
 import Settings from "./pages/Settings";
 import ProductCreate from "./pages/ProductCreate";
+import ImageStudio from "./pages/ImageStudio";
+import Logs from "./pages/Logs";
 import { CollectionProvider } from "./contexts/CollectionContext";
 
 function App() {
@@ -20,9 +22,11 @@ function App() {
           <Route path="products" element={<ProductList />} />
           <Route path="products/:id" element={<ProductDetail />} />
           <Route path="create-product" element={<ProductCreate />} />
+          <Route path="image-studio" element={<ImageStudio />} />
           <Route path="collect" element={<Dashboard />} />
           <Route path="accounts" element={<AccountManager />} />
           <Route path="tasks" element={<TaskManager />} />
+          <Route path="logs" element={<Logs />} />
           <Route path="settings" element={<Settings />} />
           {/* Legacy routes */}
           <Route path="dashboard" element={<Navigate to="/shop" replace />} />

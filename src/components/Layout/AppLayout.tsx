@@ -12,6 +12,8 @@ import {
   LoadingOutlined,
   CheckCircleOutlined,
   PlusCircleOutlined,
+  PictureOutlined,
+  FileTextOutlined,
 } from "@ant-design/icons";
 import { useCollection, COLLECT_TASKS } from "../../contexts/CollectionContext";
 
@@ -22,9 +24,11 @@ const menuItems = [
   { key: "/shop", icon: <DashboardOutlined />, label: "店铺概览" },
   { key: "/products", icon: <ShoppingOutlined />, label: "商品管理" },
   { key: "/create-product", icon: <PlusCircleOutlined />, label: "上品管理" },
+  { key: "/image-studio", icon: <PictureOutlined />, label: "AI 出图" },
   { key: "/collect", icon: <SyncOutlined />, label: "数据采集" },
   { key: "/accounts", icon: <UserOutlined />, label: "账号管理" },
   { key: "/tasks", icon: <ScheduleOutlined />, label: "任务管理" },
+  { key: "/logs", icon: <FileTextOutlined />, label: "日志中心" },
   { key: "/settings", icon: <SettingOutlined />, label: "设置" },
 ];
 

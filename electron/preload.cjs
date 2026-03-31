@@ -67,6 +67,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("automation:ping"),
   },
 
+  imageStudio: {
+    getStatus: () => ipcRenderer.invoke("image-studio:get-status"),
+    ensureRunning: () => ipcRenderer.invoke("image-studio:ensure-running"),
+    restart: () => ipcRenderer.invoke("image-studio:restart"),
+    openExternal: () => ipcRenderer.invoke("image-studio:open-external"),
+  },
+
+  app: {
+    getVersion: () => ipcRenderer.invoke("app:get-version"),
+    openLogDirectory: () => ipcRenderer.invoke("app:open-log-directory"),
+  },
+
   onAutomationEvent: (callback) => {
     ipcRenderer.on("automation-event", (_, data) => callback(data));
   },

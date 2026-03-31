@@ -1,16 +1,15 @@
 interface AutomationAPI {
-  launch: (accountId: string, headless?: boolean) => Promise<{ status: string }>;
-  login: (accountId: string, email: string, password: string) => Promise<{ success: boolean }>;
-  scrapeProducts: () => Promise<{ products: ScrapedProduct[] }>;
-  scrapeOrders: () => Promise<{ orders: ScrapedOrder[] }>;
-  scrapeSales: () => Promise<{ sales: { summary: any; items: any[] } }>;
-  scrapeFlux: () => Promise<{ flux: { mallSummary: any; goods: any[] } }>;
-  scrapeDashboard: () => Promise<{ dashboard: any }>;
-  scrapeAfterSales: () => Promise<{ afterSales: any[] }>;
-  scrapeSoldOut: () => Promise<{ soldOut: any }>;
-  scrapeGoodsData: () => Promise<{ goodsData: any }>;
-  scrapeActivity: () => Promise<{ activity: any }>;
-  scrapePerformance: () => Promise<{ performance: any }>;
+  login: (accountId: string, phone: string, password: string) => Promise<{ success: boolean; matchedStoreName?: string }>;
+  scrapeProducts: () => Promise<any>;
+  scrapeOrders: () => Promise<any>;
+  scrapeSales: () => Promise<any>;
+  scrapeFlux: () => Promise<any>;
+  scrapeDashboard: () => Promise<any>;
+  scrapeAfterSales: () => Promise<any>;
+  scrapeSoldOut: () => Promise<any>;
+  scrapeGoodsData: () => Promise<any>;
+  scrapeActivity: () => Promise<any>;
+  scrapePerformance: () => Promise<any>;
   scrapeAll: () => Promise<any>;
   readScrapeData: (key: string) => Promise<any>;
   scrapeLifecycle: () => Promise<any>;
@@ -21,30 +20,40 @@ interface AutomationAPI {
   scrapeUSRetrieval: () => Promise<any>;
   scrapeDelivery: () => Promise<any>;
   createProduct: (params: any) => Promise<any>;
-  batchCreateFromCsv: (params: any) => Promise<any>;
-  autoPricing: (params: { csvPath: string; startRow?: number; count?: number }) => Promise<any>;
+  autoPricing: (params: any) => Promise<any>;
+  startAutoPricing: (params: any) => Promise<any>;
+  getProgress: () => Promise<any>;
+  getTaskProgress: (taskId?: string) => Promise<any>;
+  listTasks: () => Promise<any>;
+  pausePricing: (taskId?: string) => Promise<any>;
+  resumePricing: (taskId?: string) => Promise<any>;
+  listDrafts: () => Promise<any>;
+  retryDraft: (draftId: string) => Promise<any>;
+  deleteDraft: (draftId: string) => Promise<any>;
+  fetchProductDetailData: (params: any) => Promise<any>;
   close: () => Promise<{ status: string }>;
   ping: () => Promise<{ status: string }>;
 }
 
-interface ScrapedProduct {
-  temuProductId?: string;
-  title: string;
-  sku: string;
-  price: number;
-  stock: number;
+interface ImageStudioStatus {
   status: string;
-  category?: string;
-  imageUrl?: string;
+  message: string;
+  url: string;
+  projectPath: string;
+  port: number;
+  ready: boolean;
 }
 
-interface ScrapedOrder {
-  orderId: string;
-  productTitle: string;
-  quantity: number;
-  amount: number;
-  status: string;
-  orderTime: string;
+interface ImageStudioAPI {
+  getStatus: () => Promise<ImageStudioStatus>;
+  ensureRunning: () => Promise<ImageStudioStatus>;
+  restart: () => Promise<ImageStudioStatus>;
+  openExternal: () => Promise<string>;
+}
+
+interface AppAPI {
+  getVersion: () => Promise<string>;
+  openLogDirectory: () => Promise<string>;
 }
 
 interface StoreAPI {
@@ -54,10 +63,12 @@ interface StoreAPI {
 
 interface ElectronAPI {
   getAppPath: () => Promise<string>;
+  selectFile: (filters?: any) => Promise<string | null>;
   automation: AutomationAPI;
+  imageStudio: ImageStudioAPI;
+  app: AppAPI;
   store: StoreAPI;
   onAutomationEvent: (callback: (data: any) => void) => void;
-  onAutomationLog: (callback: (data: string) => void) => void;
 }
 
 declare global {

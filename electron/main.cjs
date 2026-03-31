@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
 const path = require("path");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -124,22 +124,39 @@ async function startWorker() {
   // 先尝试关闭旧的 worker
   await shutdownOldWorker();
 
-  const nodeExe = findNodeExe();
-  const workerPath = path.join(__dirname, "../automation/worker.mjs");
+  // 打包模式优先用 ELECTRON_RUN_AS_NODE（能读 asar），否则用外部 Node
+  const workerPath = app.isPackaged
+    ? path.join(process.resourcesPath, "app.asar", "automation", "worker-entry.cjs")
+    : path.join(__dirname, "../automation/worker.mjs");
 
-  console.log(`[Main] Starting worker: ${nodeExe} ${workerPath} (port ${workerPort})`);
-
-  // 关键：stdio 全部 ignore，不继承任何 handle
-  worker = spawn(nodeExe, [workerPath], {
-    stdio: ["ignore", "ignore", "pipe"],
-    detached: true,
-    windowsHide: true,
-    env: {
+  let nodeExe, childEnv;
+  if (app.isPackaged) {
+    nodeExe = process.execPath; // Electron 自身
+    childEnv = {
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(([k]) => !k.startsWith("ELECTRON"))
+      ),
+      ELECTRON_RUN_AS_NODE: "1",
+      WORKER_PORT: String(workerPort),
+      APP_USER_DATA: app.getPath("userData"),
+    };
+  } else {
+    nodeExe = findNodeExe();
+    childEnv = {
       ...Object.fromEntries(
         Object.entries(process.env).filter(([k]) => !k.startsWith("ELECTRON"))
       ),
       WORKER_PORT: String(workerPort),
-    },
+    };
+  }
+
+  console.log(`[Main] Starting worker: ${nodeExe} ${workerPath} (port ${workerPort}) packaged=${app.isPackaged}`);
+
+  worker = spawn(nodeExe, [workerPath], {
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: false,
+    windowsHide: true,
+    env: childEnv,
   });
 
   // 只读 stderr 用于调试日志（安全处理 EPIPE）
@@ -192,6 +209,147 @@ function stopWorker() {
     worker = null;
     workerReady = false;
   }
+}
+
+// ============ AI 出图服务管理 ============
+
+const AUTO_IMAGE_HOST = "127.0.0.1";
+const AUTO_IMAGE_PORT = 3210;
+const AUTO_IMAGE_HEALTH_PATH = "/api/config";
+
+let imageStudioProcess = null;
+let imageStudioStatus = {
+  status: "idle",
+  message: "AI 出图服务未启动",
+  url: `http://${AUTO_IMAGE_HOST}:${AUTO_IMAGE_PORT}`,
+  projectPath: "",
+  port: AUTO_IMAGE_PORT,
+  ready: false,
+};
+
+function updateImageStudioStatus(patch = {}) {
+  imageStudioStatus = { ...imageStudioStatus, ...patch, url: `http://${AUTO_IMAGE_HOST}:${AUTO_IMAGE_PORT}`, port: AUTO_IMAGE_PORT };
+  return imageStudioStatus;
+}
+
+function getAutoImageProjectCandidates() {
+  const appDir = app.getAppPath();
+  const workspaceRoot = path.resolve(appDir, "..");
+  return [
+    app.isPackaged ? path.join(process.resourcesPath, "auto-image-gen-runtime") : "",
+    process.env.AUTO_IMAGE_GEN_DIR,
+    "C:/Users/Administrator/auto-image-gen-dev",
+    path.resolve(workspaceRoot, "auto-image-gen-dev"),
+    path.resolve(workspaceRoot, "../auto-image-gen-dev"),
+  ].filter(Boolean);
+}
+
+function resolveAutoImageProjectDir() {
+  for (const candidate of getAutoImageProjectCandidates()) {
+    try {
+      const standaloneServerPath = path.join(candidate, "server.js");
+      const standaloneBootstrapPath = path.join(candidate, "bootstrap.cjs");
+      const packageJsonPath = path.join(candidate, "package.json");
+      const nextBinPath = path.join(candidate, "node_modules", "next", "dist", "bin", "next");
+      if (fs.existsSync(standaloneServerPath)) {
+        return {
+          projectPath: candidate,
+          mode: "packaged-runtime",
+          serverPath: fs.existsSync(standaloneBootstrapPath) ? standaloneBootstrapPath : standaloneServerPath,
+        };
+      }
+      if (fs.existsSync(packageJsonPath) && fs.existsSync(nextBinPath)) {
+        return { projectPath: candidate, mode: "dev-project", nextBinPath };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function httpGet(url, timeout = 5000) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, { timeout }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => resolve({ statusCode: res.statusCode || 0, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(new Error("timeout")); });
+  });
+}
+
+async function isImageStudioHealthy() {
+  try {
+    const response = await httpGet(`http://${AUTO_IMAGE_HOST}:${AUTO_IMAGE_PORT}${AUTO_IMAGE_HEALTH_PATH}`);
+    return response.statusCode >= 200 && response.statusCode < 500;
+  } catch { return false; }
+}
+
+async function waitForImageStudio(maxWait = 90000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWait) {
+    if (await isImageStudioHealthy()) return true;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  throw new Error("AI 出图服务启动超时");
+}
+
+function stopImageStudioService() {
+  if (imageStudioProcess) {
+    try { imageStudioProcess.kill(); } catch {}
+    imageStudioProcess = null;
+  }
+  updateImageStudioStatus({ status: "stopped", ready: false, message: "AI 出图服务已停止" });
+}
+
+async function ensureImageStudioService() {
+  const projectInfo = resolveAutoImageProjectDir();
+  if (!projectInfo) {
+    throw new Error("未找到 AI 出图运行时，请确认 auto-image-gen-dev 项目存在");
+  }
+  updateImageStudioStatus({ projectPath: projectInfo.projectPath });
+
+  if (await isImageStudioHealthy()) {
+    return updateImageStudioStatus({ status: "ready", ready: true, message: "AI 出图服务已就绪" });
+  }
+
+  if (imageStudioProcess) {
+    try { imageStudioProcess.kill(); } catch {}
+    imageStudioProcess = null;
+  }
+
+  updateImageStudioStatus({ status: "starting", ready: false, message: "正在启动 AI 出图服务…" });
+
+  const nodeExe = findNodeExe();
+  const env = { ...process.env, PORT: String(AUTO_IMAGE_PORT), HOSTNAME: AUTO_IMAGE_HOST, NODE_ENV: "production" };
+
+  const spawnArgs = projectInfo.mode === "packaged-runtime"
+    ? [projectInfo.serverPath]
+    : [projectInfo.nextBinPath, "start", "-p", String(AUTO_IMAGE_PORT), "--hostname", AUTO_IMAGE_HOST];
+
+  console.log(`[Main] Starting image studio: ${nodeExe} ${spawnArgs.join(" ")} (${projectInfo.mode})`);
+
+  imageStudioProcess = spawn(nodeExe, spawnArgs, {
+    cwd: projectInfo.projectPath,
+    env,
+    stdio: "ignore",
+    windowsHide: true,
+    detached: false,
+  });
+
+  imageStudioProcess.on("error", (error) => {
+    console.error("[Main] Image studio spawn error:", error.message);
+  });
+  imageStudioProcess.on("exit", (code) => {
+    console.log(`[Main] Image studio exited: ${code}`);
+    if (imageStudioProcess) {
+      imageStudioProcess = null;
+      updateImageStudioStatus({ status: "error", ready: false, message: `AI 出图服务已退出（code=${code ?? "unknown"}）` });
+    }
+  });
+
+  await waitForImageStudio();
+  return updateImageStudioStatus({ status: "ready", ready: true, message: "AI 出图服务已就绪" });
 }
 
 // ============ 窗口 ============
@@ -257,7 +415,7 @@ app.whenReady().then(async () => {
     console.error("[Main] Worker auto-start failed (will retry on demand):", e.message);
   }
 });
-app.on("window-all-closed", () => { stopWorker(); app.quit(); });
+app.on("window-all-closed", () => { stopWorker(); stopImageStudioService(); app.quit(); });
 app.on("activate", () => { if (!mainWindow) createWindow(); });
 
 // ============ IPC ============
@@ -385,6 +543,43 @@ ipcMain.handle("automation:close", async () => {
 
 ipcMain.handle("automation:ping", async () => {
   return sendCmd("ping");
+});
+
+// ============ AI 出图 IPC ============
+
+ipcMain.handle("image-studio:get-status", async () => {
+  const projectInfo = resolveAutoImageProjectDir();
+  const projectPath = imageStudioStatus.projectPath || projectInfo?.projectPath || "";
+  const healthy = await isImageStudioHealthy();
+  return updateImageStudioStatus({
+    projectPath,
+    ready: healthy,
+    status: healthy ? "ready" : imageStudioStatus.status,
+    message: healthy ? "AI 出图服务已就绪" : imageStudioStatus.message,
+  });
+});
+
+ipcMain.handle("image-studio:ensure-running", async () => {
+  return ensureImageStudioService();
+});
+
+ipcMain.handle("image-studio:restart", async () => {
+  stopImageStudioService();
+  return ensureImageStudioService();
+});
+
+ipcMain.handle("image-studio:open-external", async () => {
+  const status = await ensureImageStudioService();
+  await shell.openExternal(status.url);
+  return status.url;
+});
+
+ipcMain.handle("app:get-version", () => app.getVersion());
+
+ipcMain.handle("app:open-log-directory", async () => {
+  const logDir = app.getPath("userData");
+  await shell.openPath(logDir);
+  return logDir;
 });
 
 // ============ 文件存储 IPC ============

@@ -1,5 +1,5 @@
 node_modules/
-dist/
+# dist/ 不排除，electron-builder 需要打包
 target/
 automation/dist/
 automation/node_modules/

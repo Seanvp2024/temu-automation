@@ -1,16 +1,62 @@
 {
   "name": "temu-automation",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.19",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "dev:electron": "concurrently \"vite\" \"wait-on http://localhost:1420 && cross-env NODE_ENV=development electron .\"",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build --base ./",
+    "dist:win": "npm run build && electron-builder --win nsis",
+    "pack:win": "npm run build && electron-builder --win dir",
     "preview": "vite preview",
     "electron": "cross-env NODE_ENV=development electron .",
     "tauri": "tauri"
+  },
+  "build": {
+    "appId": "com.temu.automation",
+    "productName": "Temu 自动化运营工具",
+    "asar": true,
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "extraResources": [
+      {
+        "from": "C:/New Folder/node.exe",
+        "to": "node-runtime/node.exe"
+      },
+      {
+        "from": "build/auto-image-gen-runtime",
+        "to": "auto-image-gen-runtime"
+      }
+    ],
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "automation/**/*",
+      "node_modules/**/*",
+      "package.json",
+      "!src/**/*",
+      "!src-tauri/**/*",
+      "!docs/**/*",
+      "!*.log",
+      "!test_*.json"
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "artifactName": "temu-automation-setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Temu 自动化运营工具"
+    }
   },
   "dependencies": {
     "@ant-design/icons": "^5.4.0",
