@@ -221,6 +221,6 @@ export async function login(phone, password) {
       }
     }
 
-    return true;
+    return { success: true };
   } catch (err) { await page.close(); throw err; }
 }

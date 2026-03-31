@@ -1,15 +1,20 @@
 {
   "name": "temu-automation",
   "private": true,
-  "version": "0.1.20",
+  "version": "0.1.21",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "dev:electron": "concurrently \"vite\" \"wait-on http://localhost:1420 && cross-env NODE_ENV=development electron .\"",
+    "build:resources": "python scripts/generate_brand_assets.py",
+    "build:image-studio": "python scripts/prepare_image_studio_bundle.py",
+    "prepare:update-site": "python scripts/prepare_static_update_site.py",
+    "verify:release": "node scripts/verify-release-prereqs.cjs",
+    "smoke:desktop": "node scripts/smoke-desktop.cjs",
     "build": "tsc && vite build --base ./",
-    "dist:win": "npm run build && electron-builder --win nsis",
-    "pack:win": "npm run build && electron-builder --win dir",
+    "dist:win": "npm run build:resources && npm run build:image-studio && npm run verify:release && npm run build && npm run smoke:desktop && electron-builder --win nsis",
+    "pack:win": "npm run build:resources && npm run build:image-studio && npm run verify:release && npm run build && npm run smoke:desktop && electron-builder --win dir",
     "preview": "vite preview",
     "electron": "cross-env NODE_ENV=development electron .",
     "tauri": "tauri"
