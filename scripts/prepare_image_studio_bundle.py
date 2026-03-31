@@ -108,7 +108,8 @@ def main() -> None:
 
     # standalone 根目录本身就是一个可启动运行时，直接复制其内容。
     for child in standalone_root.iterdir():
-      target = OUTPUT / child.name
+      target_name = "runtime_node_modules" if child.name == "node_modules" else child.name
+      target = OUTPUT / target_name
       if child.is_dir():
         shutil.copytree(child, target)
       else:
