@@ -98,6 +98,13 @@ type ResultState = {
 
 type ResultStateMap = Record<string, ResultState>;
 
+type ImageVariant = ImageStudioGeneratedImage & {
+  score?: ImageStudioImageScore;
+  scoring?: boolean;
+};
+
+type ImageVariantMap = Record<string, ImageVariant[]>;
+
 const FALLBACK_STATUS: ImageStudioStatus = {
   status: "idle",
   message: "AI 出图服务未启动",
@@ -124,6 +131,72 @@ function sortImagesBySelectedTypes(images: ImageStudioGeneratedImage[], selected
     const rightIndex = selectedTypes.indexOf(right.imageType);
     return (leftIndex === -1 ? Number.MAX_SAFE_INTEGER : leftIndex) - (rightIndex === -1 ? Number.MAX_SAFE_INTEGER : rightIndex);
   });
+}
+
+function buildImageVariant(
+  image: ImageStudioGeneratedImage,
+  options: Partial<ImageVariant> = {},
+): ImageVariant {
+  return {
+    ...image,
+    variantId: options.variantId || image.variantId || `${image.imageType}_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
+    prompt: options.prompt ?? image.prompt ?? "",
+    suggestion: options.suggestion ?? image.suggestion ?? "",
+    createdAt: options.createdAt ?? image.createdAt ?? Date.now(),
+    active: options.active ?? image.active ?? false,
+    score: options.score,
+    scoring: options.scoring,
+  };
+}
+
+function appendVariantToMap(
+  previous: ImageVariantMap,
+  image: ImageStudioGeneratedImage,
+  options: Partial<ImageVariant> = {},
+): ImageVariantMap {
+  const imageType = image.imageType || "";
+  if (!imageType || !image.imageUrl) return previous;
+
+  const current = Array.isArray(previous[imageType]) ? previous[imageType] : [];
+  if (current.some((item) => item.imageUrl === image.imageUrl)) {
+    return previous;
+  }
+
+  return {
+    ...previous,
+    [imageType]: [...current, buildImageVariant(image, options)],
+  };
+}
+
+function flattenVariantMap(variantMap: ImageVariantMap, selectedTypes: string[], activeVariantIds: Record<string, string>) {
+  const allImages = selectedTypes.flatMap((imageType) => {
+    const variants = Array.isArray(variantMap[imageType]) ? variantMap[imageType] : [];
+    return variants.map((variant) => ({
+      imageType: variant.imageType,
+      imageUrl: variant.imageUrl,
+      variantId: variant.variantId,
+      prompt: variant.prompt,
+      suggestion: variant.suggestion,
+      createdAt: variant.createdAt,
+      active: activeVariantIds[imageType]
+        ? activeVariantIds[imageType] === variant.variantId
+        : variants[variants.length - 1]?.variantId === variant.variantId,
+    }));
+  });
+
+  return sortImagesBySelectedTypes(allImages, selectedTypes);
+}
+
+function buildRedrawPrompt(basePrompt: string, suggestion: string, imageType: string) {
+  return [
+    basePrompt.trim(),
+    "",
+    `请基于同一商品和同一出图目标，重绘这张${IMAGE_TYPE_LABELS[imageType] || imageType}。`,
+    "保留原本的商品主体、平台适配要求和整体卖点方向，并严格执行下面这些修改意见：",
+    suggestion.trim(),
+    "",
+    "除上述修改外，其他内容尽量保持一致，输出 1 张新的候选版本。",
+  ].filter(Boolean).join("\n");
 }
 
 function buildConfigDraft(config: ImageStudioConfig) {
@@ -326,12 +399,16 @@ export default function ImageStudio() {
   const [analysis, setAnalysis] = useState<ImageStudioAnalysis>(EMPTY_IMAGE_STUDIO_ANALYSIS);
   const [plans, setPlans] = useState<ImageStudioPlan[]>([]);
   const [results, setResults] = useState<ResultStateMap>({});
+  const [imageVariants, setImageVariants] = useState<ImageVariantMap>({});
+  const [activeVariantIds, setActiveVariantIds] = useState<Record<string, string>>({});
+  const [redrawSuggestions, setRedrawSuggestions] = useState<Record<string, string>>({});
   const [analyzing, setAnalyzing] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
   const [planning, setPlanning] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [downloadingAll, setDownloadingAll] = useState(false);
   const [downloadingTypes, setDownloadingTypes] = useState<Record<string, boolean>>({});
+  const [redrawingTypes, setRedrawingTypes] = useState<Record<string, boolean>>({});
   const [currentJobId, setCurrentJobId] = useState("");
   const [activeStep, setActiveStep] = useState(0);
 
@@ -339,6 +416,11 @@ export default function ImageStudio() {
   const productNameRef = useRef("");
   const salesRegionRef = useRef("us");
   const selectedImageTypesRef = useRef<string[]>(DEFAULT_IMAGE_TYPES);
+  const plansRef = useRef<ImageStudioPlan[]>([]);
+  const imageVariantsRef = useRef<ImageVariantMap>({});
+  const activeVariantIdsRef = useRef<Record<string, string>>({});
+  const currentJobModeRef = useRef<"full" | "redraw">("full");
+  const currentRedrawMetaRef = useRef<{ imageType: string; suggestion: string; prompt: string } | null>(null);
 
   useEffect(() => {
     currentJobIdRef.current = currentJobId;
@@ -355,6 +437,18 @@ export default function ImageStudio() {
   useEffect(() => {
     selectedImageTypesRef.current = selectedImageTypes;
   }, [selectedImageTypes]);
+
+  useEffect(() => {
+    plansRef.current = plans;
+  }, [plans]);
+
+  useEffect(() => {
+    imageVariantsRef.current = imageVariants;
+  }, [imageVariants]);
+
+  useEffect(() => {
+    activeVariantIdsRef.current = activeVariantIds;
+  }, [activeVariantIds]);
 
   const refreshStatus = async (ensure = false) => {
     try {
@@ -406,6 +500,46 @@ export default function ImageStudio() {
     }
   };
 
+  const persistHistorySnapshot = async (overrideVariants?: ImageVariantMap, overrideActiveVariantIds?: Record<string, string>) => {
+    if (!imageStudioAPI) return;
+    const variantSnapshot = overrideVariants || imageVariantsRef.current;
+    const activeSnapshot = overrideActiveVariantIds || activeVariantIdsRef.current;
+    const flattenedImages = flattenVariantMap(variantSnapshot, selectedImageTypesRef.current, activeSnapshot);
+    if (flattenedImages.length === 0) return;
+
+    await imageStudioAPI.saveHistory({
+      productName: productNameRef.current || "未命名商品",
+      salesRegion: salesRegionRef.current,
+      imageCount: flattenedImages.length,
+      images: flattenedImages,
+    });
+  };
+
+  const appendGeneratedVariant = (
+    image: ImageStudioGeneratedImage,
+    options: { prompt?: string; suggestion?: string; activate?: boolean } = {},
+  ) => {
+    const nextVariant = buildImageVariant(image, {
+      prompt: options.prompt,
+      suggestion: options.suggestion,
+    });
+
+    setImageVariants((prev) => appendVariantToMap(prev, nextVariant, nextVariant));
+    if (options.activate !== false) {
+      setActiveVariantIds((prev) => ({
+        ...prev,
+        [image.imageType]: nextVariant.variantId || "",
+      }));
+    }
+  };
+
+  const getActiveVariant = (imageType: string) => {
+    const variants = imageVariants[imageType] || [];
+    if (variants.length === 0) return null;
+    const activeVariantId = activeVariantIds[imageType];
+    return variants.find((item) => item.variantId === activeVariantId) || variants[variants.length - 1];
+  };
+
   useEffect(() => {
     refreshStatus(true).then((nextStatus) => {
       if (nextStatus.ready) {
@@ -422,10 +556,10 @@ export default function ImageStudio() {
       if (!payload || payload.jobId !== currentJobIdRef.current) return;
 
       if (payload.type === "generate:event" && payload.event?.imageType) {
+        const imageType = payload.event?.imageType || "";
         startTransition(() => {
           setResults((prev) => {
             const next = { ...prev };
-            const imageType = payload.event?.imageType || "";
             const current = getResultState(next, imageType);
 
             if (payload.event?.status === "generating") {
@@ -454,34 +588,82 @@ export default function ImageStudio() {
             return next;
           });
         });
+
+        if (payload.event?.status === "done" && payload.event?.imageUrl) {
+          const isRedraw = currentJobModeRef.current === "redraw" && currentRedrawMetaRef.current?.imageType === imageType;
+          const currentPlan = plansRef.current.find((plan) => plan.imageType === imageType);
+          appendGeneratedVariant(
+            {
+              imageType,
+              imageUrl: payload.event.imageUrl,
+            },
+            {
+              prompt: isRedraw ? currentRedrawMetaRef.current?.prompt : currentPlan?.prompt,
+              suggestion: isRedraw ? currentRedrawMetaRef.current?.suggestion : "",
+              activate: true,
+            },
+          );
+        }
       }
 
       if (payload.type === "generate:complete") {
         setGenerating(false);
         setCurrentJobId("");
-        const images = sortImagesBySelectedTypes(Array.isArray(payload.results) ? payload.results : [], selectedImageTypesRef.current);
-        if (imageStudioAPI && images.length > 0) {
-          imageStudioAPI.saveHistory({
-            productName: productNameRef.current || "未命名商品",
-            salesRegion: salesRegionRef.current,
-            imageCount: images.length,
-            images,
-          }).then(() => {
-            loadHistory().catch(() => {});
-          }).catch(() => {});
+        const redrawMeta = currentRedrawMetaRef.current;
+        const wasRedraw = currentJobModeRef.current === "redraw";
+        const completedImages = sortImagesBySelectedTypes(Array.isArray(payload.results) ? payload.results : [], selectedImageTypesRef.current);
+        const nextVariantMap = completedImages.reduce<ImageVariantMap>((acc, item) => {
+          const currentPlan = plansRef.current.find((plan) => plan.imageType === item.imageType);
+          return appendVariantToMap(acc, item, {
+            prompt: wasRedraw && redrawMeta?.imageType === item.imageType ? redrawMeta.prompt : currentPlan?.prompt,
+            suggestion: wasRedraw && redrawMeta?.imageType === item.imageType ? redrawMeta.suggestion : "",
+          });
+        }, imageVariantsRef.current);
+        const nextActiveVariantIds = { ...activeVariantIdsRef.current };
+        completedImages.forEach((item) => {
+          const latestVariant = nextVariantMap[item.imageType]?.[nextVariantMap[item.imageType].length - 1];
+          if (latestVariant?.variantId) {
+            nextActiveVariantIds[item.imageType] = latestVariant.variantId;
+          }
+        });
+        setImageVariants(nextVariantMap);
+        setActiveVariantIds(nextActiveVariantIds);
+        if (redrawMeta?.imageType) {
+          setRedrawingTypes((prev) => ({ ...prev, [redrawMeta.imageType]: false }));
         }
-        message.success("AI 出图已完成");
+        currentJobModeRef.current = "full";
+        currentRedrawMetaRef.current = null;
+        persistHistorySnapshot(nextVariantMap, nextActiveVariantIds).then(() => {
+          loadHistory().catch(() => {});
+        }).catch(() => {});
+        if (wasRedraw && redrawMeta?.imageType) {
+          message.success(`${IMAGE_TYPE_LABELS[redrawMeta.imageType] || redrawMeta.imageType} 已新增一个候选版本`);
+        } else {
+          message.success("AI 出图已完成");
+        }
       }
 
       if (payload.type === "generate:error") {
         setGenerating(false);
         setCurrentJobId("");
+        const redrawMeta = currentRedrawMetaRef.current;
+        if (redrawMeta?.imageType) {
+          setRedrawingTypes((prev) => ({ ...prev, [redrawMeta.imageType]: false }));
+        }
+        currentJobModeRef.current = "full";
+        currentRedrawMetaRef.current = null;
         message.error(payload.error || "AI 出图失败");
       }
 
       if (payload.type === "generate:cancelled") {
         setGenerating(false);
         setCurrentJobId("");
+        const redrawMeta = currentRedrawMetaRef.current;
+        if (redrawMeta?.imageType) {
+          setRedrawingTypes((prev) => ({ ...prev, [redrawMeta.imageType]: false }));
+        }
+        currentJobModeRef.current = "full";
+        currentRedrawMetaRef.current = null;
         message.info(payload.message || "已取消本次生成");
       }
     });
@@ -558,6 +740,10 @@ export default function ImageStudio() {
       setAnalysis(normalizeImageStudioAnalysis(payload));
       setPlans([]);
       setResults({});
+      setImageVariants({});
+      setActiveVariantIds({});
+      setRedrawSuggestions({});
+      setRedrawingTypes({});
       setActiveStep(1);
       message.success("商品分析已完成");
     } catch (error) {
@@ -596,18 +782,17 @@ export default function ImageStudio() {
     }
   };
 
-  const handleGeneratePlans = async () => {
+  const generatePlansForCurrentAnalysis = async () => {
     if (!imageStudioAPI) return;
     if (!analysis.productName.trim()) {
       message.warning("请先完成商品分析或补充商品信息");
-      return;
+      return null;
     }
     if (selectedImageTypes.length === 0) {
       message.warning("请至少选择一种出图类型");
-      return;
+      return null;
     }
 
-    setPlanning(true);
     try {
       const nextPlans = await imageStudioAPI.generatePlans({
         analysis,
@@ -618,11 +803,26 @@ export default function ImageStudio() {
       });
       const normalizedPlans = Array.isArray(nextPlans) ? nextPlans : [];
       setPlans(normalizedPlans);
+      return normalizedPlans;
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "生成方案失败");
+      return null;
+    }
+  };
+
+  const handleGeneratePlans = async () => {
+    setPlanning(true);
+    try {
+      const normalizedPlans = await generatePlansForCurrentAnalysis();
       setResults({});
-      if (normalizedPlans.length > 0) {
+      setImageVariants({});
+      setActiveVariantIds({});
+      setRedrawSuggestions({});
+      setRedrawingTypes({});
+      if (normalizedPlans && normalizedPlans.length > 0) {
         setActiveStep(2);
         message.success(`已生成 ${normalizedPlans.length} 条出图方案`);
-      } else {
+      } else if (normalizedPlans) {
         message.warning("服务未返回可用方案，请检查分析结果或重试");
       }
     } catch (error) {
@@ -642,14 +842,19 @@ export default function ImageStudio() {
       message.warning("请先生成出图方案");
       return;
     }
-
     const nextJobId = `image_job_${Date.now()}`;
     setGenerating(true);
     setCurrentJobId(nextJobId);
+    currentJobModeRef.current = "full";
+    currentRedrawMetaRef.current = null;
     setResults(plans.reduce<ResultStateMap>((acc, plan) => {
       acc[plan.imageType] = createEmptyResultState("queued");
       return acc;
     }, {}));
+    setImageVariants({});
+    setActiveVariantIds({});
+    setRedrawSuggestions({});
+    setRedrawingTypes({});
 
     try {
       const files = await buildNativeImagePayloads(uploadFiles);
@@ -694,13 +899,39 @@ export default function ImageStudio() {
       }
 
       const historyItem = detail as ImageStudioHistoryItem;
+      const nextSelectedTypes = Array.from(new Set(historyItem.images.map((image) => image.imageType).filter(Boolean)));
+      const nextVariants = historyItem.images.reduce<ImageVariantMap>((acc, image) => {
+        const variant = buildImageVariant(image, image);
+        const current = Array.isArray(acc[variant.imageType]) ? acc[variant.imageType] : [];
+        acc[variant.imageType] = [...current, variant];
+        return acc;
+      }, {});
+      const nextActiveVariantIds = Object.fromEntries(
+        Object.entries(nextVariants).map(([imageType, variants]) => {
+          const activeVariant = variants.find((variant) => variant.active) || variants[variants.length - 1];
+          return [imageType, activeVariant?.variantId || ""];
+        }),
+      );
+
       setAnalysis((prev) => ({ ...prev, productName: historyItem.productName || prev.productName }));
       setSalesRegion(historyItem.salesRegion || "us");
       setImageLanguage(getDefaultImageLanguageForRegion(historyItem.salesRegion || "us"));
-      setSelectedImageTypes(historyItem.images.map((image) => image.imageType));
-      setPlans(historyItem.images.map((image) => ({ imageType: image.imageType, prompt: "" })));
-      setResults(historyItem.images.reduce<ResultStateMap>((acc, image) => {
-        acc[image.imageType] = { status: "done", imageUrl: image.imageUrl, warnings: [] };
+      setSelectedImageTypes(nextSelectedTypes);
+      setPlans(nextSelectedTypes.map((imageType) => {
+        const activeVariant = nextVariants[imageType]?.find((variant) => variant.variantId === nextActiveVariantIds[imageType]) || nextVariants[imageType]?.[nextVariants[imageType].length - 1];
+        return { imageType, prompt: activeVariant?.prompt || "" };
+      }));
+      setImageVariants(nextVariants);
+      setActiveVariantIds(nextActiveVariantIds);
+      setRedrawSuggestions(Object.fromEntries(
+        nextSelectedTypes.map((imageType) => {
+          const activeVariant = nextVariants[imageType]?.find((variant) => variant.variantId === nextActiveVariantIds[imageType]) || nextVariants[imageType]?.[nextVariants[imageType].length - 1];
+          return [imageType, activeVariant?.suggestion || ""];
+        }),
+      ));
+      setResults(nextSelectedTypes.reduce<ResultStateMap>((acc, imageType) => {
+        const activeVariant = nextVariants[imageType]?.find((variant) => variant.variantId === nextActiveVariantIds[imageType]) || nextVariants[imageType]?.[nextVariants[imageType].length - 1];
+        acc[imageType] = { status: "done", imageUrl: activeVariant?.imageUrl || "", warnings: [] };
         return acc;
       }, {}));
       setActiveStep(3);
@@ -711,27 +942,40 @@ export default function ImageStudio() {
     }
   };
 
-  const handleScoreImage = async (imageType: string) => {
+  const handleScoreImage = async (imageType: string, variantId?: string) => {
     if (!imageStudioAPI) return;
-    const result = results[imageType];
-    if (!result?.imageUrl) return;
+    const variants = imageVariants[imageType] || [];
+    const targetVariant = variants.find((item) => item.variantId === variantId) || getActiveVariant(imageType);
+    if (!targetVariant?.imageUrl) return;
 
-    setResults((prev) => ({
+    setImageVariants((prev) => ({
       ...prev,
-      [imageType]: { ...getResultState(prev, imageType), scoring: true },
+      [imageType]: (prev[imageType] || []).map((variant) => (
+        variant.variantId === targetVariant.variantId
+          ? { ...variant, scoring: true }
+          : variant
+      )),
     }));
 
     try {
-      const score = await imageStudioAPI.scoreImage({ imageType, imageUrl: result.imageUrl });
-      setResults((prev) => ({
+      const score = await imageStudioAPI.scoreImage({ imageType, imageUrl: targetVariant.imageUrl });
+      setImageVariants((prev) => ({
         ...prev,
-        [imageType]: { ...getResultState(prev, imageType), scoring: false, score },
+        [imageType]: (prev[imageType] || []).map((variant) => (
+          variant.variantId === targetVariant.variantId
+            ? { ...variant, scoring: false, score }
+            : variant
+        )),
       }));
       message.success(`${IMAGE_TYPE_LABELS[imageType] || imageType} 评分完成`);
     } catch (error) {
-      setResults((prev) => ({
+      setImageVariants((prev) => ({
         ...prev,
-        [imageType]: { ...getResultState(prev, imageType), scoring: false },
+        [imageType]: (prev[imageType] || []).map((variant) => (
+          variant.variantId === targetVariant.variantId
+            ? { ...variant, scoring: false }
+            : variant
+        )),
       }));
       message.error(error instanceof Error ? error.message : "评分失败");
     }
@@ -776,6 +1020,69 @@ export default function ImageStudio() {
     }
   };
 
+  const handleSingleRedraw = async (imageType: string) => {
+    if (!imageStudioAPI) return;
+    if (generating) {
+      message.warning("当前还有生成任务在运行，请先等待完成或取消");
+      return;
+    }
+    if (uploadFiles.length === 0) {
+      message.warning("请先上传商品素材图");
+      return;
+    }
+
+    const suggestion = (redrawSuggestions[imageType] || "").trim();
+    if (!suggestion) {
+      message.warning("先输入你的修改建议，再重绘这张图");
+      return;
+    }
+
+    const basePlan = plans.find((plan) => plan.imageType === imageType);
+    if (!basePlan) {
+      message.warning("当前图类型还没有出图方案，请先生成方案");
+      return;
+    }
+
+    const activeVariant = getActiveVariant(imageType);
+    const nextPrompt = buildRedrawPrompt(activeVariant?.prompt?.trim() || basePlan.prompt, suggestion, imageType);
+    const redrawPlan: ImageStudioPlan = {
+      ...basePlan,
+      prompt: nextPrompt,
+      title: `${basePlan.title || IMAGE_TYPE_LABELS[imageType] || imageType} · 候选重绘`,
+    };
+    const nextJobId = `image_redraw_${imageType}_${Date.now()}`;
+
+    setGenerating(true);
+    setCurrentJobId(nextJobId);
+    currentJobModeRef.current = "redraw";
+    currentRedrawMetaRef.current = { imageType, suggestion, prompt: nextPrompt };
+    setRedrawingTypes((prev) => ({ ...prev, [imageType]: true }));
+    setResults((prev) => ({
+      ...prev,
+      [imageType]: { ...getResultState(prev, imageType), status: "generating", error: "" },
+    }));
+
+    try {
+      const files = await buildNativeImagePayloads(uploadFiles);
+      await imageStudioAPI.startGenerate({
+        jobId: nextJobId,
+        files,
+        plans: [redrawPlan],
+        productMode,
+        imageLanguage,
+        imageSize,
+      });
+      message.success(`已开始重绘 ${IMAGE_TYPE_LABELS[imageType] || imageType}`);
+    } catch (error) {
+      setGenerating(false);
+      setCurrentJobId("");
+      currentJobModeRef.current = "full";
+      currentRedrawMetaRef.current = null;
+      setRedrawingTypes((prev) => ({ ...prev, [imageType]: false }));
+      message.error(error instanceof Error ? error.message : "启动重绘失败");
+    }
+  };
+
   const downloadImage = async (image: ImageStudioGeneratedImage) => {
     const baseName = sanitizeDownloadNamePart(analysis.productName || "temu-image");
     const typeName = sanitizeDownloadNamePart(IMAGE_TYPE_LABELS[image.imageType] || image.imageType);
@@ -802,11 +1109,18 @@ export default function ImageStudio() {
   };
 
   const generatedImages = useMemo(() => {
-    const list = Object.entries(results)
-      .filter(([, result]) => result.imageUrl)
-      .map(([imageType, result]) => ({ imageType, imageUrl: result.imageUrl || "" }));
+    const list = selectedImageTypes.flatMap((imageType) => {
+      const variants = imageVariants[imageType] || [];
+      const activeVariantId = activeVariantIds[imageType];
+      const activeVariant = variants.find((item) => item.variantId === activeVariantId) || variants[variants.length - 1];
+      if (activeVariant?.imageUrl) {
+        return [activeVariant];
+      }
+      const result = results[imageType];
+      return result?.imageUrl ? [{ imageType, imageUrl: result.imageUrl }] : [];
+    });
     return sortImagesBySelectedTypes(list, selectedImageTypes);
-  }, [results, selectedImageTypes]);
+  }, [activeVariantIds, imageVariants, results, selectedImageTypes]);
 
   const planCount = plans.length || selectedImageTypes.length;
   const completedCount = useMemo(
@@ -875,7 +1189,8 @@ export default function ImageStudio() {
 
   const saveCurrentHistory = async () => {
     if (!imageStudioAPI) return;
-    if (generatedImages.length === 0) {
+    const historyImages = flattenVariantMap(imageVariants, selectedImageTypes, activeVariantIds);
+    if (historyImages.length === 0) {
       message.warning("当前还没有可保存的图片结果");
       return;
     }
@@ -884,8 +1199,8 @@ export default function ImageStudio() {
       await imageStudioAPI.saveHistory({
         productName: analysis.productName || "未命名商品",
         salesRegion,
-        imageCount: generatedImages.length,
-        images: generatedImages,
+        imageCount: historyImages.length,
+        images: historyImages,
       });
       message.success("当前结果已保存到历史记录");
       loadHistory().catch(() => {});
@@ -895,7 +1210,8 @@ export default function ImageStudio() {
   };
 
   const handleDownloadImage = async (image: ImageStudioGeneratedImage) => {
-    setDownloadingTypes((prev) => ({ ...prev, [image.imageType]: true }));
+    const downloadKey = image.variantId || `${image.imageType}:${image.imageUrl}`;
+    setDownloadingTypes((prev) => ({ ...prev, [downloadKey]: true }));
 
     try {
       await downloadImage(image);
@@ -905,7 +1221,7 @@ export default function ImageStudio() {
     } finally {
       setDownloadingTypes((prev) => {
         const next = { ...prev };
-        delete next[image.imageType];
+        delete next[downloadKey];
         return next;
       });
     }
@@ -948,8 +1264,14 @@ export default function ImageStudio() {
     setAnalysis(EMPTY_IMAGE_STUDIO_ANALYSIS);
     setPlans([]);
     setResults({});
+    setImageVariants({});
+    setActiveVariantIds({});
+    setRedrawSuggestions({});
+    setRedrawingTypes({});
     setGenerating(false);
     setCurrentJobId("");
+    currentJobModeRef.current = "full";
+    currentRedrawMetaRef.current = null;
     setActiveStep(0);
   };
 
@@ -1427,6 +1749,13 @@ export default function ImageStudio() {
     </Card>
   );
 
+  const renderGenerateStatusText = (status: string) => {
+    if (status === "done") return "图片已生成，可在下方查看结果";
+    if (status === "generating") return "正在生成图片，请稍候";
+    if (status === "error") return "本张图片生成失败，可根据错误提示重试";
+    return "等待开始生成";
+  };
+
   const renderStepThree = () => (
     <Space direction="vertical" size={18} style={{ width: "100%" }}>
       <Card
@@ -1440,7 +1769,7 @@ export default function ImageStudio() {
         <Space direction="vertical" size={18} style={{ width: "100%" }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
             <div>
-              <Title level={4} style={{ margin: 0, color: TEMU_TEXT }}>生成结果</Title>
+              <Title level={4} style={{ margin: 0, color: TEMU_TEXT }}>生图进度</Title>
               <Text type="secondary" style={{ display: "block", marginTop: 6 }}>
                 {generatedImages.length > 0
                   ? `当前已完成 ${successCount}/${planCount} 张图片，可以继续评分、保存和复制标题。`
@@ -1501,11 +1830,8 @@ export default function ImageStudio() {
                         {result.status === "error" ? <Tag color="error" style={{ borderRadius: 999 }}>失败</Tag> : null}
                       </div>
                       <Text type="secondary" style={{ fontSize: 12 }}>
-                        {plan.title || plan.headline || "AI 自动方案"}
+                        {renderGenerateStatusText(result.status)}
                       </Text>
-                      <Paragraph style={{ marginBottom: 0, color: "#5f6b7c", whiteSpace: "pre-wrap" }} ellipsis={{ rows: 2 }}>
-                        {plan.prompt}
-                      </Paragraph>
                       {result.warnings.length > 0 ? <Text type="secondary">注意：{result.warnings.join("；")}</Text> : null}
                       {result.error ? <Text type="danger">{result.error}</Text> : null}
                     </Space>
@@ -1550,9 +1876,12 @@ export default function ImageStudio() {
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
                 {generatedImages.map((image) => {
                   const result = getResultState(results, image.imageType);
+                  const variants = imageVariants[image.imageType] || [];
+                  const activeVariant = variants.find((item) => item.variantId === activeVariantIds[image.imageType]) || variants[variants.length - 1];
+                  const downloadKey = image.variantId || `${image.imageType}:${image.imageUrl}`;
                   return (
                     <Card
-                      key={image.imageType}
+                      key={`${image.imageType}:${image.variantId || image.imageUrl}`}
                       size="small"
                       style={{
                         borderRadius: 18,
@@ -1589,7 +1918,7 @@ export default function ImageStudio() {
                               size="small"
                               icon={<DownloadOutlined />}
                               onClick={() => handleDownloadImage(image)}
-                              loading={Boolean(downloadingTypes[image.imageType])}
+                              loading={Boolean(downloadingTypes[downloadKey])}
                               style={{ borderRadius: 12 }}
                             >
                               下载
@@ -1597,8 +1926,8 @@ export default function ImageStudio() {
                             <Button
                               size="small"
                               icon={<StarOutlined />}
-                              onClick={() => handleScoreImage(image.imageType)}
-                              loading={result.scoring}
+                              onClick={() => handleScoreImage(image.imageType, activeVariant?.variantId)}
+                              loading={Boolean(activeVariant?.scoring)}
                               style={{ borderRadius: 12 }}
                             >
                               评分
@@ -1606,16 +1935,85 @@ export default function ImageStudio() {
                           </Space>
                         </div>
 
-                        {result.score ? (
+                        {activeVariant?.score ? (
                           <Row gutter={[8, 8]}>
-                            <Col span={8}><Statistic title="综合" value={result.score.overall} precision={1} /></Col>
-                            <Col span={8}><Statistic title="合规" value={result.score.compliance} precision={1} /></Col>
-                            <Col span={8}><Statistic title="吸引力" value={result.score.appeal} precision={1} /></Col>
+                            <Col span={8}><Statistic title="综合" value={activeVariant.score.overall} precision={1} /></Col>
+                            <Col span={8}><Statistic title="合规" value={activeVariant.score.compliance} precision={1} /></Col>
+                            <Col span={8}><Statistic title="吸引力" value={activeVariant.score.appeal} precision={1} /></Col>
                           </Row>
                         ) : null}
 
-                        {result.score?.suggestions?.length ? (
-                          <Text type="secondary">优化建议：{result.score.suggestions.join("；")}</Text>
+                        {activeVariant?.score?.suggestions?.length ? (
+                          <Text type="secondary">优化建议：{activeVariant.score.suggestions.join("；")}</Text>
+                        ) : null}
+
+                        <div>
+                          <Text type="secondary" style={{ display: "block", marginBottom: 6 }}>
+                            重绘建议
+                          </Text>
+                          <TextArea
+                            autoSize={{ minRows: 3, maxRows: 5 }}
+                            value={redrawSuggestions[image.imageType] || ""}
+                            onChange={(event) => setRedrawSuggestions((prev) => ({ ...prev, [image.imageType]: event.target.value }))}
+                            placeholder="例如：背景改成厨房台面，不要人物，文案更简洁，整体更高级。"
+                            style={{ borderRadius: 12 }}
+                          />
+                        </div>
+
+                        <Button
+                          block
+                          icon={<ReloadOutlined />}
+                          onClick={() => handleSingleRedraw(image.imageType)}
+                          loading={Boolean(redrawingTypes[image.imageType])}
+                          disabled={generating && !redrawingTypes[image.imageType]}
+                          style={{ borderRadius: 12 }}
+                        >
+                          {redrawingTypes[image.imageType] ? "正在重绘…" : "按建议重绘"}
+                        </Button>
+
+                        {variants.length > 0 ? (
+                          <div>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                              <Text type="secondary">候选版本</Text>
+                              <Text type="secondary">{variants.length} 个</Text>
+                            </div>
+                            <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4 }}>
+                              {variants.map((variant, index) => {
+                                const selected = activeVariant?.variantId === variant.variantId;
+                                return (
+                                  <button
+                                    key={variant.variantId || `${variant.imageType}-${index}`}
+                                    type="button"
+                                    onClick={() => {
+                                      setActiveVariantIds((prev) => ({ ...prev, [image.imageType]: variant.variantId || "" }));
+                                      setRedrawSuggestions((prev) => ({ ...prev, [image.imageType]: variant.suggestion || "" }));
+                                    }}
+                                    style={{
+                                      border: selected ? `2px solid ${TEMU_ORANGE}` : "1px solid #e5eaf1",
+                                      borderRadius: 12,
+                                      padding: 4,
+                                      background: "#fff",
+                                      cursor: "pointer",
+                                      minWidth: 78,
+                                    }}
+                                  >
+                                    <img
+                                      src={variant.imageUrl}
+                                      alt={`${image.imageType}-${index + 1}`}
+                                      style={{ width: 68, height: 68, objectFit: "cover", borderRadius: 8, display: "block" }}
+                                    />
+                                    <div style={{ marginTop: 6, fontSize: 11, color: selected ? TEMU_ORANGE : "#7a8ca8" }}>
+                                      {index === 0 ? "原图" : `候选 ${index}`}
+                                    </div>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ) : null}
+
+                        {activeVariant?.suggestion ? (
+                          <Text type="secondary">本候选调整：{activeVariant.suggestion}</Text>
                         ) : null}
                       </Space>
                     </Card>
@@ -1691,7 +2089,7 @@ export default function ImageStudio() {
                   paddingTop: 4,
                 }}
               >
-                <Text type="secondary">不满意当前结果？可以重新开始或返回方案页继续微调。</Text>
+                <Text type="secondary">不满意某一张图时，可以直接填写建议重绘，系统会保留原图并新增候选版本。</Text>
                 <Space wrap>
                   <Button onClick={resetStudio} style={{ borderRadius: 14 }}>
                     重新开始

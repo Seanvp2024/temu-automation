@@ -79,6 +79,11 @@ export interface ImageStudioPlan {
 export interface ImageStudioGeneratedImage {
   imageType: string;
   imageUrl: string;
+  variantId?: string;
+  prompt?: string;
+  suggestion?: string;
+  createdAt?: number;
+  active?: boolean;
 }
 
 export interface ImageStudioHistorySummary {

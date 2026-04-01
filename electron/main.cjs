@@ -20,6 +20,7 @@ let mainWindow = null;
 let worker = null;
 let workerPort = 19280;
 let workerReady = false;
+let workerAiImageServer = "";
 const AUTO_PRICING_TASKS_KEY = "temu_auto_pricing_tasks";
 const AUTO_PRICING_TASK_LIMIT = 20;
 const CREATE_HISTORY_KEY = "temu_create_history";
@@ -351,22 +352,25 @@ async function shutdownOldWorker() {
   } catch {}
 }
 
-async function startWorker() {
-  if (worker && workerReady) return;
+async function startWorker(options = {}) {
+  const desiredAiImageServer = (
+    (typeof options?.aiImageServer === "string" && options.aiImageServer.trim())
+      ? options.aiImageServer.trim()
+      : (process.env.AI_IMAGE_SERVER || getImageStudioBaseUrl(imageStudioPort))
+  ).replace(/\/+$/, "");
+
+  if (worker && workerReady && workerAiImageServer === desiredAiImageServer) return;
 
   // 清理旧进程
   if (worker) {
     try { worker.kill(); } catch {}
     worker = null;
     workerReady = false;
+    workerAiImageServer = "";
   }
 
   // 先尝试关闭旧的 worker
   await shutdownOldWorker();
-
-  const aiImagePort = await findAvailableImageStudioPort();
-  updateImageStudioStatus({ port: aiImagePort });
-  const aiImageServer = getImageStudioBaseUrl(aiImagePort);
 
   // 打包模式优先用 ELECTRON_RUN_AS_NODE（能读 asar），否则用外部 Node
   const workerPath = app.isPackaged
@@ -383,7 +387,7 @@ async function startWorker() {
       ELECTRON_RUN_AS_NODE: "1",
       WORKER_PORT: String(workerPort),
       APP_USER_DATA: app.getPath("userData"),
-      AI_IMAGE_SERVER: aiImageServer,
+      AI_IMAGE_SERVER: desiredAiImageServer,
     };
   } else {
     nodeExe = findNodeExe();
@@ -392,11 +396,12 @@ async function startWorker() {
         Object.entries(process.env).filter(([k]) => !k.startsWith("ELECTRON"))
       ),
       WORKER_PORT: String(workerPort),
-      AI_IMAGE_SERVER: aiImageServer,
+      APP_USER_DATA: app.getPath("userData"),
+      AI_IMAGE_SERVER: desiredAiImageServer,
     };
   }
 
-  console.log(`[Main] Starting worker: ${nodeExe} ${workerPath} (port ${workerPort}) packaged=${app.isPackaged} aiImageServer=${aiImageServer}`);
+  console.log(`[Main] Starting worker: ${nodeExe} ${workerPath} (port ${workerPort}) packaged=${app.isPackaged} aiImageServer=${desiredAiImageServer}`);
 
   worker = spawn(nodeExe, [workerPath], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -422,6 +427,7 @@ async function startWorker() {
     stopAutoPricingTaskSync();
     worker = null;
     workerReady = false;
+    workerAiImageServer = "";
   });
 
   worker.on("error", (err) => {
@@ -430,18 +436,21 @@ async function startWorker() {
     stopAutoPricingTaskSync();
     worker = null;
     workerReady = false;
+    workerAiImageServer = "";
   });
 
   // 等待 worker HTTP 服务就绪
   try {
     await waitForWorker(workerPort);
     workerReady = true;
+    workerAiImageServer = desiredAiImageServer;
     console.log(`[Main] Worker ready on port ${workerPort}`);
   } catch (e) {
     console.error("[Main] Worker 启动失败:", e.message);
     if (worker) { try { worker.kill(); } catch {} }
     worker = null;
     workerReady = false;
+    workerAiImageServer = "";
     throw e;
   }
 }
@@ -858,6 +867,7 @@ function stopWorker() {
     try { worker.kill(); } catch {}
     worker = null;
     workerReady = false;
+    workerAiImageServer = "";
   }
 }
 
@@ -866,6 +876,7 @@ function stopWorker() {
 const AUTO_IMAGE_HOST = "127.0.0.1";
 const AUTO_IMAGE_DEFAULT_PORT = 3210;
 const AUTO_IMAGE_HEALTH_PATH = "/api/config";
+const IMAGE_STUDIO_SAFE_ANALYZE_MODEL = "gemini-3.1-flash-image-preview";
 
 let imageStudioProcess = null;
 let imageStudioPort = AUTO_IMAGE_DEFAULT_PORT;
@@ -1202,6 +1213,58 @@ async function readImageStudioResponse(response) {
   }
 }
 
+function isHtmlErrorPayload(payload) {
+  return typeof payload === "string" && /<!DOCTYPE html>|<html/i.test(payload);
+}
+
+function getImageStudioErrorMessage(routePath, response, payload) {
+  if (payload && typeof payload === "object" && typeof payload.error === "string" && payload.error.trim()) {
+    return payload.error.trim();
+  }
+
+  if (isHtmlErrorPayload(payload)) {
+    if (routePath === "/api/analyze" || routePath === "/api/regenerate-analysis") {
+      return "AI 商品分析失败，请检查分析模型是否支持图片输入";
+    }
+    return `AI 出图服务内部错误 (${response.status})`;
+  }
+
+  if (typeof payload === "string" && payload.trim()) {
+    return payload.trim();
+  }
+
+  if (routePath === "/api/analyze" || routePath === "/api/regenerate-analysis") {
+    return `AI 商品分析失败 (${response.status})`;
+  }
+
+  return `AI 出图服务请求失败 (${response.status})`;
+}
+
+function shouldFallbackAnalyzeModel(model) {
+  return typeof model === "string" && /flash-lite/i.test(model);
+}
+
+async function ensureCompatibleAnalyzeModel() {
+  try {
+    const currentConfig = await imageStudioJson("/api/config");
+    const currentModel = currentConfig?.analyzeModel;
+    if (!shouldFallbackAnalyzeModel(currentModel)) {
+      return false;
+    }
+
+    await imageStudioJson("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ analyzeModel: IMAGE_STUDIO_SAFE_ANALYZE_MODEL }),
+    });
+    appendImageStudioLog(`[compat] analyze model upgraded from ${currentModel} to ${IMAGE_STUDIO_SAFE_ANALYZE_MODEL}`);
+    return true;
+  } catch (error) {
+    appendImageStudioLog(`[compat] failed to upgrade analyze model: ${error?.message || error}`);
+    return false;
+  }
+}
+
 async function imageStudioFetch(routePath, init = {}) {
   const status = await ensureImageStudioService();
   const projectInfo = getImageStudioProjectInfo();
@@ -1219,9 +1282,8 @@ async function imageStudioJson(routePath, init = {}) {
   const response = await imageStudioFetch(routePath, init);
   const payload = await readImageStudioResponse(response);
   if (!response.ok) {
-    const message = payload && typeof payload === "object" && typeof payload.error === "string"
-      ? payload.error
-      : (typeof payload === "string" && payload ? payload : `AI 出图服务请求失败 (${response.status})`);
+    const message = getImageStudioErrorMessage(routePath, response, payload);
+    appendImageStudioLog(`[http] ${routePath} -> ${response.status}: ${message}`);
     throw new Error(message);
   }
   return payload;
@@ -1467,7 +1529,13 @@ async function createWindow() {
 app.whenReady().then(async () => {
   await createWindow();
   try {
-    await startWorker();
+    await ensureImageStudioService();
+    console.log("[Main] Image studio auto-started successfully");
+  } catch (e) {
+    console.error("[Main] Image studio auto-start failed (will retry on demand):", e.message);
+  }
+  try {
+    await startWorker({ aiImageServer: imageStudioStatus.url });
     console.log("[Main] Worker auto-started successfully");
   } catch (e) {
     console.error("[Main] Worker auto-start failed (will retry on demand):", e.message);
@@ -1545,6 +1613,10 @@ ipcMain.handle("automation:scrape-all", async () => {
 });
 
 ipcMain.handle("automation:create-product", async (_e, params) => {
+  if (params?.generateAI !== false && params?.sourceImage) {
+    const imageStudio = await ensureImageStudioService();
+    await startWorker({ aiImageServer: imageStudio.url });
+  }
   return sendCmd("create_product", params);
 });
 
@@ -1564,7 +1636,8 @@ ipcMain.handle("automation:auto-pricing", async (_e, params) => {
     };
   }
 
-  await startWorker();
+  const imageStudio = await ensureImageStudioService();
+  await startWorker({ aiImageServer: imageStudio.url });
 
   const now = new Date().toLocaleString("zh-CN");
   const taskId = typeof params?.taskId === "string" && params.taskId.trim()
@@ -1770,7 +1843,11 @@ ipcMain.handle("image-studio:ensure-running", async () => {
 
 ipcMain.handle("image-studio:restart", async () => {
   stopImageStudioService();
-  return ensureImageStudioService();
+  const status = await ensureImageStudioService();
+  if (workerReady) {
+    await startWorker({ aiImageServer: status.url });
+  }
+  return status;
 });
 
 ipcMain.handle("image-studio:open-external", async () => {
@@ -1800,7 +1877,7 @@ ipcMain.handle("image-studio:update-config", async (_event, payload) => {
 });
 
 ipcMain.handle("image-studio:analyze", async (_event, payload) => {
-  return imageStudioJson("/api/analyze", {
+  const requestAnalyze = () => imageStudioJson("/api/analyze", {
     method: "POST",
     body: createImageStudioFormData({
       files: payload?.files,
@@ -1809,10 +1886,20 @@ ipcMain.handle("image-studio:analyze", async (_event, payload) => {
       },
     }),
   });
+
+  try {
+    return await requestAnalyze();
+  } catch (error) {
+    const upgraded = await ensureCompatibleAnalyzeModel();
+    if (upgraded) {
+      return requestAnalyze();
+    }
+    throw error;
+  }
 });
 
 ipcMain.handle("image-studio:regenerate-analysis", async (_event, payload) => {
-  return imageStudioJson("/api/regenerate-analysis", {
+  const requestRegenerateAnalysis = () => imageStudioJson("/api/regenerate-analysis", {
     method: "POST",
     body: createImageStudioFormData({
       files: payload?.files,
@@ -1822,6 +1909,16 @@ ipcMain.handle("image-studio:regenerate-analysis", async (_event, payload) => {
       },
     }),
   });
+
+  try {
+    return await requestRegenerateAnalysis();
+  } catch (error) {
+    const upgraded = await ensureCompatibleAnalyzeModel();
+    if (upgraded) {
+      return requestRegenerateAnalysis();
+    }
+    throw error;
+  }
 });
 
 ipcMain.handle("image-studio:generate-plans", async (_event, payload) => {

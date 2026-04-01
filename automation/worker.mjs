@@ -5052,6 +5052,11 @@ async function formatAiImageError(prefix, response) {
   return `${prefix}: ${response.status}`;
 }
 
+function formatAiImageFetchError(prefix, error, routePath) {
+  const reason = error?.message || String(error || "");
+  return `${prefix}: 请求 ${AI_IMAGE_GEN_URL}${routePath} 失败 (${reason})`;
+}
+
 /**
  * 调用 AI 生图服务：分析 + 生成 10 张图
  * @param {string} sourceImagePath - 商品原图本地路径
@@ -5087,11 +5092,16 @@ async function generateImagesWithAI(sourceImagePath, productTitle, extraImagePat
   }
   analyzeForm.append("productMode", "single");
 
-  const analyzeResp = await fetch(`${AI_IMAGE_GEN_URL}/api/analyze`, {
-    method: "POST",
-    body: analyzeForm,
-    headers: AI_AUTH_HEADERS,
-  });
+  let analyzeResp;
+  try {
+    analyzeResp = await fetch(`${AI_IMAGE_GEN_URL}/api/analyze`, {
+      method: "POST",
+      body: analyzeForm,
+      headers: AI_AUTH_HEADERS,
+    });
+  } catch (error) {
+    return { success: false, error: formatAiImageFetchError("Analyze failed", error, "/api/analyze") };
+  }
   if (!analyzeResp.ok) {
     return { success: false, error: await formatAiImageError("Analyze failed", analyzeResp) };
   }
@@ -5100,17 +5110,22 @@ async function generateImagesWithAI(sourceImagePath, productTitle, extraImagePat
 
   // Step 2: 生成 plans（调用 /api/plans 获取带 prompt 的方案）
   console.error("[ai-gen] Step 2: Generating plans with prompts...");
-  const plansResp = await fetch(`${AI_IMAGE_GEN_URL}/api/plans`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...AI_AUTH_HEADERS },
-    body: JSON.stringify({
-      analysis,
-      imageTypes: AI_DETAIL_IMAGE_TYPE_ORDER,
-      salesRegion: "us",
-      imageSize: "1000x1000",
-      productMode: "single",
-    }),
-  });
+  let plansResp;
+  try {
+    plansResp = await fetch(`${AI_IMAGE_GEN_URL}/api/plans`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...AI_AUTH_HEADERS },
+      body: JSON.stringify({
+        analysis,
+        imageTypes: AI_DETAIL_IMAGE_TYPE_ORDER,
+        salesRegion: "us",
+        imageSize: "1000x1000",
+        productMode: "single",
+      }),
+    });
+  } catch (error) {
+    return { success: false, error: formatAiImageFetchError("Plans API failed", error, "/api/plans") };
+  }
   if (!plansResp.ok) {
     return { success: false, error: await formatAiImageError("Plans API failed", plansResp) };
   }
@@ -5120,6 +5135,7 @@ async function generateImagesWithAI(sourceImagePath, productTitle, extraImagePat
   // Step 3: 并发生成图片（分成多组并行请求）
   const CONCURRENCY = 10; // 10并发，失败自动重试
   const images = {};
+  let lastGenerateError = "";
 
   // 将 plans 分组
   const planGroups = [];
@@ -5175,9 +5191,11 @@ async function generateImagesWithAI(sourceImagePath, productTitle, extraImagePat
           if (Object.keys(r).length > 0) return r;
           console.error(`[ai-gen] Empty result for ${plan.imageType}, attempt ${attempt + 1}/${retries + 1}`);
         } else {
+          lastGenerateError = await formatAiImageError(`Generate failed (${plan.imageType})`, resp);
           console.error(`[ai-gen] HTTP ${resp.status} for ${plan.imageType}, attempt ${attempt + 1}/${retries + 1}`);
         }
       } catch (e) {
+        lastGenerateError = formatAiImageFetchError(`Generate failed (${plan.imageType})`, e, "/api/generate");
         console.error(`[ai-gen] Error for ${plan.imageType}: ${e.message}, attempt ${attempt + 1}/${retries + 1}`);
       }
       if (attempt < retries) await new Promise(r => setTimeout(r, 3000)); // 重试前等3秒
@@ -5202,7 +5220,8 @@ async function generateImagesWithAI(sourceImagePath, productTitle, extraImagePat
   }
 
   console.error(`[ai-gen] Total generated: ${Object.keys(images).length}/${plans.length}`);
-  return { success: Object.keys(images).length >= REQUIRED_AI_DETAIL_IMAGE_COUNT, images, analysis };
+  const success = Object.keys(images).length >= REQUIRED_AI_DETAIL_IMAGE_COUNT;
+  return { success, images, analysis, error: success ? "" : lastGenerateError };
 }
 
 /**
