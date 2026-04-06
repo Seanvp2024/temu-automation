@@ -7722,6 +7722,24 @@ async function autoPricingFromCSV(params) {
     console.error(`[auto-pricing] Category: front="${frontCategoryCn}" generic="${genericCategoryCn}" back="${backCategoryCn}"`);
     console.error(`[auto-pricing] Price: $${priceUSD} → ¥${priceCNY.toFixed(2)}`);
 
+    // 用户策略：后台分类为空直接跳过，避免浪费 AI 调用与无意义的类目猜测重试
+    if (!backCategoryCn) {
+      console.error(`[auto-pricing] SKIP (后台分类为空): ${productName.slice(0, 50)}`);
+      results.push({
+        index: i,
+        name: productName.slice(0, 40),
+        success: false,
+        skipped: true,
+        message: "已跳过：后台分类为空（请在表格【后台分类】列填写完整路径后重试）",
+        step: "skipped",
+      });
+      syncCurrentProgressResults(results, {
+        current: `${itemNum}/${total} ${productName.slice(0, 30)}`,
+        step: "已跳过(后台分类空)",
+      });
+      continue;
+    }
+
     try {
       // Step 1: 下载商品原图（带重试）
       updateCurrentProgress({ step: "下载原图" });
@@ -7862,10 +7880,14 @@ async function autoPricingFromCSV(params) {
       // Step 6: 保存草稿
       // 有表格类目时严格按表格类目走，避免被 AI/历史类目带偏
       const aiCategory = aiResult.analysis?.category?.split("(")?.[0]?.trim() || ""; // 取中文部分，如 "家庭清洁用品"
+      // 任一表格类目存在即进入 strict 模式，避免 AI 分析返回的猜测类目（如"钥匙扣/挂件"）
+      // 覆盖掉表格里有效的前台分类。这样后台为空但前台有效时也能锁定。
       const categoryLockMode = (
         directLeafCatId
         || Object.keys(directCatIds).some((key) => key !== "_path")
         || backCategoryCn
+        || genericCategoryCn
+        || frontCategoryCn
       )
         ? "strict"
         : "guided";
@@ -9054,7 +9076,9 @@ async function createProductViaAPI(params) {
       // 方法1: 分类树遍历（主方法）— 用后台分类路径精确匹配
       if (!leafCatId) {
         for (const term of searchTerms) {
-          if (catIds) break;
+          // 只有当 catIds 拿到了真实层级 ID（depth>0）才停止；只有 _path 占位串不算有效，
+          // 否则会让整个搜索循环在第一次迭代直接 break，所有后台分类都搜不到。
+          if (catIds && getCategoryDepth(catIds) > 0) break;
           console.error(`[api-create] Fallback searchCategoryAPI: "${term.slice(0, 50)}"`);
           const catResult = await searchCategoryAPI(page, term, { title: params.title });
           if (catResult?.list?.[0]) {
@@ -9848,7 +9872,14 @@ async function batchCreateViaAPI(params) {
     }
 
     try {
-      const categoryLockMode = (directLeafCatId > 0 || Object.keys(directCatIds).some((key) => key !== "_path") || Boolean(backCategoryCn))
+      // 任一表格类目存在即 strict，避免被启发式 fallback 带偏（同 autoPricingFromCSV）
+      const categoryLockMode = (
+        directLeafCatId > 0
+        || Object.keys(directCatIds).some((key) => key !== "_path")
+        || Boolean(backCategoryCn)
+        || Boolean(genericCategoryCn)
+        || Boolean(frontCategoryCn)
+      )
         ? "strict"
         : "guided";
       const createParams = {
