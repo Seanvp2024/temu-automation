@@ -67,6 +67,10 @@ function findInRawStore(rawData: any, apiPathFragment: string): any {
 
 function safeRender(val: any): string {
   if (val === null || val === undefined) return "-";
+  if (typeof val === "string") {
+    const text = val.trim();
+    return text || "-";
+  }
   if (typeof val === "object") return JSON.stringify(val).slice(0, 100);
   return String(val);
 }
@@ -74,6 +78,27 @@ function safeRender(val: any): string {
 function toNumberValue(value: any) {
   const num = Number(value);
   return Number.isFinite(num) ? num : 0;
+}
+
+function formatRatePercent(value: any) {
+  if (value === null || value === undefined || value === "") return "-";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return safeRender(value);
+  const normalized = Math.abs(num) <= 1 ? num * 100 : num;
+  return `${normalized.toFixed(2)}%`;
+}
+
+function formatPictureAuditStatus(value: any) {
+  const raw = safeRender(value);
+  if (raw === "-") return { label: "-", color: undefined as string | undefined };
+  const labelMap: Record<string, { label: string; color?: string }> = {
+    "0": { label: "未提交", color: "default" },
+    "1": { label: "待审核", color: "warning" },
+    "2": { label: "审核通过", color: "success" },
+    "3": { label: "审核驳回", color: "error" },
+    "4": { label: "审核中", color: "processing" },
+  };
+  return labelMap[raw] || { label: raw };
 }
 
 function buildProductIdCandidates(id: string | undefined, product?: Partial<ProductInfo> | null) {
@@ -93,11 +118,109 @@ function matchesRecordByCandidateIds(record: any, fields: string[], candidates: 
   return fields.some((field) => candidates.has(String(record?.[field] || "").trim()));
 }
 
+function mergeTextValue(current: unknown, next: unknown) {
+  const values = [current, next]
+    .flatMap((value) => String(value ?? "").split(/\s*[,/|]\s*/))
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return Array.from(new Set(values)).join(" / ");
+}
+
+function mergeAvailableSaleDays(current: unknown, next: unknown) {
+  const currentNum = Number(current);
+  const nextNum = Number(next);
+  if (Number.isFinite(currentNum) && Number.isFinite(nextNum)) return Math.max(currentNum, nextNum);
+  if (Number.isFinite(nextNum)) return nextNum;
+  const nextText = String(next ?? "").trim();
+  if (nextText) return nextText;
+  return current ?? "";
+}
+
+function mergeSalesRows(rows: any[]) {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  return rows.reduce((acc: any, row: any, index: number) => {
+    const first = index === 0;
+    return {
+      ...acc,
+      title: acc.title || row.title || "",
+      category: acc.category || row.category || "",
+      skcId: acc.skcId || row.skcId || "",
+      spuId: acc.spuId || row.spuId || "",
+      goodsId: acc.goodsId || row.goodsId || "",
+      imageUrl: acc.imageUrl || row.imageUrl || "",
+      siteLabel: acc.siteLabel || row.siteLabel || "",
+      skuCode: mergeTextValue(acc.skuCode, row.skuCode),
+      skuId: mergeTextValue(acc.skuId, row.skuId),
+      skuName: mergeTextValue(acc.skuName, row.skuName),
+      hotTag: mergeTextValue(acc.hotTag, row.hotTag),
+      stockStatus: acc.stockStatus || row.stockStatus || "",
+      supplyStatus: acc.supplyStatus || row.supplyStatus || "",
+      todaySales: first ? toNumberValue(row.todaySales) : acc.todaySales + toNumberValue(row.todaySales),
+      last7DaysSales: first ? toNumberValue(row.last7DaysSales) : acc.last7DaysSales + toNumberValue(row.last7DaysSales),
+      last30DaysSales: first ? toNumberValue(row.last30DaysSales) : acc.last30DaysSales + toNumberValue(row.last30DaysSales),
+      totalSales: first ? toNumberValue(row.totalSales) : acc.totalSales + toNumberValue(row.totalSales),
+      warehouseStock: first ? toNumberValue(row.warehouseStock) : acc.warehouseStock + toNumberValue(row.warehouseStock),
+      adviceQuantity: first ? toNumberValue(row.adviceQuantity ?? row.suggestStock) : acc.adviceQuantity + toNumberValue(row.adviceQuantity ?? row.suggestStock),
+      lackQuantity: first ? toNumberValue(row.lackQuantity) : acc.lackQuantity + toNumberValue(row.lackQuantity),
+      occupyStock: first ? toNumberValue(row.occupyStock) : acc.occupyStock + toNumberValue(row.occupyStock),
+      unavailableStock: first ? toNumberValue(row.unavailableStock) : acc.unavailableStock + toNumberValue(row.unavailableStock),
+      warehouseGroup: mergeTextValue(acc.warehouseGroup, row.warehouseGroup),
+      price: mergeTextValue(acc.price, row.price),
+      availableSaleDays: mergeAvailableSaleDays(acc.availableSaleDays, row.availableSaleDays),
+      asfScore: row.asfScore ?? acc.asfScore ?? "",
+      buyerName: row.buyerName ?? acc.buyerName ?? "",
+      buyerUid: row.buyerUid ?? acc.buyerUid ?? "",
+      commentNum: Math.max(toNumberValue(acc.commentNum), toNumberValue(row.commentNum)),
+      inBlackList: row.inBlackList === "是" ? "是" : (acc.inBlackList || row.inBlackList || ""),
+      pictureAuditStatus: row.pictureAuditStatus ?? acc.pictureAuditStatus ?? "",
+      qualityAfterSalesRate: row.qualityAfterSalesRate ?? acc.qualityAfterSalesRate ?? "",
+      predictTodaySaleVolume: first ? toNumberValue(row.predictTodaySaleVolume) : acc.predictTodaySaleVolume + toNumberValue(row.predictTodaySaleVolume),
+      sevenDaysSaleReference: first ? toNumberValue(row.sevenDaysSaleReference) : acc.sevenDaysSaleReference + toNumberValue(row.sevenDaysSaleReference),
+    };
+  }, {
+    title: "",
+    category: "",
+    skcId: "",
+    spuId: "",
+    goodsId: "",
+    imageUrl: "",
+    siteLabel: "",
+    skuCode: "",
+    skuId: "",
+    skuName: "",
+    hotTag: "",
+    stockStatus: "",
+    supplyStatus: "",
+    todaySales: 0,
+    last7DaysSales: 0,
+    last30DaysSales: 0,
+    totalSales: 0,
+    warehouseStock: 0,
+    adviceQuantity: 0,
+    lackQuantity: 0,
+    occupyStock: 0,
+    unavailableStock: 0,
+    warehouseGroup: "",
+    price: "",
+    availableSaleDays: "",
+    asfScore: "",
+    buyerName: "",
+    buyerUid: "",
+    commentNum: 0,
+    inBlackList: "",
+    pictureAuditStatus: "",
+    qualityAfterSalesRate: "",
+    predictTodaySaleVolume: 0,
+    sevenDaysSaleReference: 0,
+  });
+}
+
 export default function ProductDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [product, setProduct] = useState<ProductInfo | null>(null);
   const [salesInfo, setSalesInfo] = useState<any>(null);
+  const [salesRows, setSalesRows] = useState<any[]>([]);
   const [orders, setOrders] = useState<any[]>([]);
   const [afterSalesRecords, setAfterSalesRecords] = useState<any[]>([]);
   const [flowPriceInfo, setFlowPriceInfo] = useState<any>(null);
@@ -138,6 +261,7 @@ export default function ProductDetail() {
     setLoading(true);
     setProduct(null);
     setSalesInfo(null);
+    setSalesRows([]);
     setOrders([]);
     setAfterSalesRecords([]);
     setFlowPriceInfo(null);
@@ -174,22 +298,26 @@ export default function ProductDetail() {
       if (rawSales) {
         nextSources.sales = true;
         const sales = parseSalesData(rawSales);
-        const salesItem = sales?.items?.find((item: any) => matchesRecordByCandidateIds(item, ["skcId", "spuId"], productIdCandidates));
-        if (salesItem) {
-          setSalesInfo(salesItem);
+        const matchedSalesRows = Array.isArray(sales?.items)
+          ? sales.items.filter((item: any) => matchesRecordByCandidateIds(item, ["skcId", "spuId", "goodsId"], productIdCandidates))
+          : [];
+        if (matchedSalesRows.length > 0) {
+          const mergedSalesInfo = mergeSalesRows(matchedSalesRows);
+          setSalesRows(matchedSalesRows);
+          setSalesInfo(mergedSalesInfo);
           if (!resolvedProduct) {
             fallbackProduct = {
-              title: salesItem.title || "未命名商品",
-              category: salesItem.category || "",
-              categories: salesItem.category || "",
-              spuId: String(salesItem.spuId || ""),
-              skcId: String(salesItem.skcId || ""),
-              goodsId: "",
-              sku: salesItem.skuCode || "",
-              imageUrl: salesItem.imageUrl || "",
+              title: mergedSalesInfo?.title || "未命名商品",
+              category: mergedSalesInfo?.category || "",
+              categories: mergedSalesInfo?.category || "",
+              spuId: String(mergedSalesInfo?.spuId || ""),
+              skcId: String(mergedSalesInfo?.skcId || ""),
+              goodsId: String(mergedSalesInfo?.goodsId || ""),
+              sku: mergedSalesInfo?.skuCode || "",
+              imageUrl: mergedSalesInfo?.imageUrl || "",
               status: "",
-              totalSales: salesItem.totalSales || 0,
-              last7DaysSales: salesItem.last7DaysSales || 0,
+              totalSales: mergedSalesInfo?.totalSales || 0,
+              last7DaysSales: mergedSalesInfo?.last7DaysSales || 0,
             };
           }
         }
@@ -425,6 +553,7 @@ export default function ProductDetail() {
     || flowPriceInfo
     || retailPriceInfo.length > 0,
   );
+  const pictureAuditStatus = formatPictureAuditStatus(salesInfo?.pictureAuditStatus);
 
   const tabItems = [
     {
@@ -457,12 +586,32 @@ export default function ProductDetail() {
                 <Descriptions.Item label="建议备货量">{safeRender(salesInfo.adviceQuantity)}</Descriptions.Item>
                 <Descriptions.Item label="缺货量">{safeRender(salesInfo.lackQuantity)}</Descriptions.Item>
                 <Descriptions.Item label="可售天数">{safeRender(salesInfo.availableSaleDays)}</Descriptions.Item>
+                <Descriptions.Item label="站点">{safeRender(salesInfo.siteLabel)}</Descriptions.Item>
+                <Descriptions.Item label="热卖标签">{safeRender(salesInfo.hotTag)}</Descriptions.Item>
                 <Descriptions.Item label="供货状态">
                   {salesInfo.supplyStatus ? <Tag color={salesInfo.supplyStatus === "正常供货" ? "green" : "orange"}>{salesInfo.supplyStatus}</Tag> : "-"}
                 </Descriptions.Item>
                 <Descriptions.Item label="库存状态">{safeRender(salesInfo.stockStatus)}</Descriptions.Item>
-                <Descriptions.Item label="供货价">{salesInfo.price ? `¥${salesInfo.price}` : "-"}</Descriptions.Item>
+                <Descriptions.Item label="申报价">{safeRender(salesInfo.price)}</Descriptions.Item>
                 <Descriptions.Item label="SKU货号">{salesInfo.skuCode || p.sku || "-"}</Descriptions.Item>
+                <Descriptions.Item label="SKU ID">{safeRender(salesInfo.skuId)}</Descriptions.Item>
+                <Descriptions.Item label="SKU名称">{safeRender(salesInfo.skuName)}</Descriptions.Item>
+                <Descriptions.Item label="预占库存">{safeRender(salesInfo.occupyStock)}</Descriptions.Item>
+                <Descriptions.Item label="不可用库存">{safeRender(salesInfo.unavailableStock)}</Descriptions.Item>
+                <Descriptions.Item label="仓组">{safeRender(salesInfo.warehouseGroup)}</Descriptions.Item>
+                <Descriptions.Item label="ASF评分">{safeRender(salesInfo.asfScore)}</Descriptions.Item>
+                <Descriptions.Item label="买手名称">{safeRender(salesInfo.buyerName)}</Descriptions.Item>
+                <Descriptions.Item label="买手ID">{safeRender(salesInfo.buyerUid)}</Descriptions.Item>
+                <Descriptions.Item label="评论数">{safeRender(salesInfo.commentNum)}</Descriptions.Item>
+                <Descriptions.Item label="是否黑名单">
+                  {salesInfo.inBlackList === "是" ? <Tag color="error">是</Tag> : salesInfo.inBlackList === "否" ? <Tag color="success">否</Tag> : "-"}
+                </Descriptions.Item>
+                <Descriptions.Item label="图片审核状态">
+                  {pictureAuditStatus.color ? <Tag color={pictureAuditStatus.color}>{pictureAuditStatus.label}</Tag> : pictureAuditStatus.label}
+                </Descriptions.Item>
+                <Descriptions.Item label="品质售后率">{formatRatePercent(salesInfo.qualityAfterSalesRate)}</Descriptions.Item>
+                <Descriptions.Item label="预测今日销量">{safeRender(salesInfo.predictTodaySaleVolume)}</Descriptions.Item>
+                <Descriptions.Item label="7日销量参考值">{safeRender(salesInfo.sevenDaysSaleReference)}</Descriptions.Item>
               </Descriptions>
             ) : (
               <Paragraph type="secondary" style={{ marginBottom: 0 }}>
@@ -470,6 +619,25 @@ export default function ProductDetail() {
               </Paragraph>
             )}
           </Card>
+
+          {salesRows.length > 0 ? (
+            <Card size="small" title="SKU销售明细">
+              <Table
+                dataSource={salesRows.map((row: any, index: number) => ({ ...row, key: `${row.skuId || row.skuCode || index}` }))}
+                columns={[
+                  { title: "SKU ID", dataIndex: "skuId", key: "skuId", render: (value: any) => safeRender(value) },
+                  { title: "SKU名称", dataIndex: "skuName", key: "skuName", render: (value: any) => safeRender(value) },
+                  { title: "SKU货号", dataIndex: "skuCode", key: "skuCode", render: (value: any) => safeRender(value) },
+                  { title: "申报价", dataIndex: "price", key: "price", render: (value: any) => safeRender(value) },
+                  { title: "仓库库存", dataIndex: "warehouseStock", key: "warehouseStock", render: (value: any) => safeRender(value) },
+                  { title: "预占库存", dataIndex: "occupyStock", key: "occupyStock", render: (value: any) => safeRender(value) },
+                  { title: "不可用库存", dataIndex: "unavailableStock", key: "unavailableStock", render: (value: any) => safeRender(value) },
+                ]}
+                size="small"
+                pagination={salesRows.length > 10 ? { pageSize: 10 } : false}
+              />
+            </Card>
+          ) : null}
         </div>
       ),
     },

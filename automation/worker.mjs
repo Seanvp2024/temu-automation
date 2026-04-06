@@ -57,9 +57,828 @@ const ATTRIBUTE_AI_BASE_URL = normalizeChatBaseUrl(process.env.VECTORENGINE_ATTR
 const ATTRIBUTE_AI_MODEL = process.env.VECTORENGINE_ATTRIBUTE_MODEL || AI_MODEL;
 const GENERATED_WORKER_AUTH_TOKEN = crypto.randomBytes(32).toString("hex");
 const WORKER_AUTH_TOKEN = process.env.WORKER_AUTH_TOKEN || GENERATED_WORKER_AUTH_TOKEN;
+const CATEGORY_HISTORY_FILE = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "temu_category_history.json");
+const AUTO_PRICING_TASKS_FILE = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "temu_auto_pricing_tasks.json");
+const CATEGORY_HISTORY_LIMIT = 300;
+const CATEGORY_HISTORY_SEED_LIMIT = 200;
+const CATEGORY_HISTORY_PRODUCT_SEED_LIMIT = 3000;
+const CATEGORY_LOOKUP_PHRASE_ALIASES = [
+  [/商用[、，,\/｜|]*工业与科技/g, "工业和科学"],
+  [/商用与工业科技/g, "工业和科学"],
+  [/商用工业与科技/g, "工业和科学"],
+  [/家居清洁用品/g, "家庭清洁用品"],
+  [/居家清洁用品/g, "家庭清洁用品"],
+  [/家居洗衣清洁用品/g, "家庭清洁用品"],
+  [/家居洗涤防染色片/g, "家庭清洁用品"],
+  [/食品供应设备/g, "食品服务设备和用品"],
+  [/食物供应设备和用品/g, "食品服务设备和用品"],
+  [/电子元件/g, "工业电气"],
+];
+const CATEGORY_LOOKUP_SEGMENT_ALIASES = new Map([
+  ["商用工业与科技", "工业和科学"],
+  ["工业与科技", "工业和科学"],
+  ["工业科技", "工业和科学"],
+  ["家居清洁用品", "家庭清洁用品"],
+  ["居家清洁用品", "家庭清洁用品"],
+  ["家居洗衣清洁用品", "家庭清洁用品"],
+  ["家居洗涤防染色片", "家庭清洁用品"],
+  ["食品供应设备", "食品服务设备和用品"],
+  ["食物供应设备和用品", "食品服务设备和用品"],
+  ["电子元件", "工业电气"],
+]);
+const CATEGORY_KNOWN_BRANCH_FALLBACKS = {
+  foodService: { cat1Id: 4673, cat1Name: "工业和科学", cat2Id: 9066, cat2Name: "食品服务设备和用品" },
+  industrialElectric: { cat1Id: 4673, cat1Name: "工业和科学", cat2Id: 5652, cat2Name: "工业电气" },
+  safety: { cat1Id: 4673, cat1Name: "工业和科学", cat2Id: 6665, cat2Name: "安防劳保" },
+  safetyEmergency: { cat1Id: 4673, cat1Name: "工业和科学", cat2Id: 6665, cat2Name: "安防劳保", cat3Id: 6666, cat3Name: "应急器具" },
+  medical: { cat1Id: 4673, cat1Name: "工业和科学", cat2Id: 7725, cat2Name: "专业医疗用品" },
+  medicalTherapy: { cat1Id: 4673, cat1Name: "工业和科学", cat2Id: 7725, cat2Name: "专业医疗用品", cat3Id: 7743, cat3Name: "职业治疗和物理治疗辅助" },
+  householdLaundrySheet: {
+    cat1Id: 9711,
+    cat1Name: "家居、厨房用品",
+    cat2Id: 12870,
+    cat2Name: "家庭清洁用品",
+    cat3Id: 12871,
+    cat3Name: "家庭清洁",
+    cat4Id: 12906,
+    cat4Name: "清洁布",
+  },
+  householdCleaningToolsOther: {
+    cat1Id: 9711,
+    cat1Name: "家居、厨房用品",
+    cat2Id: 12870,
+    cat2Name: "家庭清洁用品",
+    cat3Id: 12871,
+    cat3Name: "家庭清洁",
+    cat4Id: 12873,
+    cat4Name: "清洁工具",
+    cat5Id: 12874,
+    cat5Name: "其他（清洁工具）",
+  },
+};
 let requestCredentialPhone = "";
 let requestCredentialPassword = "";
+let stickyCredentialAccountId = "";
+let stickyCredentialPhone = "";
+let stickyCredentialPassword = "";
 const recentChildSpecValues = [];
+let categoryHistoryCache = null;
+let categoryHistorySeeded = false;
+
+function getCategoryHistoryFilePath() {
+  fs.mkdirSync(path.dirname(CATEGORY_HISTORY_FILE), { recursive: true });
+  return CATEGORY_HISTORY_FILE;
+}
+
+function applyCategoryLookupPhraseAliases(value = "") {
+  let normalized = String(value || "").normalize("NFKC").toLowerCase();
+  for (const [pattern, replacement] of CATEGORY_LOOKUP_PHRASE_ALIASES) {
+    normalized = normalized.replace(pattern, replacement);
+  }
+  return normalized;
+}
+
+function normalizeCategoryLookupSegment(value = "") {
+  let normalized = applyCategoryLookupPhraseAliases(value)
+    .replace(/\s+/g, "")
+    .replace(/[、，,；;]+/g, "");
+  normalized = CATEGORY_LOOKUP_SEGMENT_ALIASES.get(normalized) || normalized;
+  return normalized.trim();
+}
+
+function normalizeCategoryLookupText(value = "") {
+  const normalized = applyCategoryLookupPhraseAliases(value)
+    .replace(/[>＞｜|]+/g, "/")
+    .replace(/\s*\/\s*/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/|\/$/g, "");
+  if (!normalized) return "";
+  return normalized
+    .split("/")
+    .map((segment) => normalizeCategoryLookupSegment(segment))
+    .filter(Boolean)
+    .join("/");
+}
+
+function pickKnownCategoryBranchFallback(searchTerm = "", title = "") {
+  const normalized = normalizeCategoryLookupText(searchTerm);
+  const titleText = String(title || "");
+  const isLaundryColorSheet = /(洗衣|吸色|护色|串色|防串色|防染色|染料转移)/.test(titleText);
+  const isSheetLikeCleaning = /(片|纸|布|纤维|无纺布)/.test(titleText);
+  if (isLaundryColorSheet && isSheetLikeCleaning) {
+    return { ...CATEGORY_KNOWN_BRANCH_FALLBACKS.householdLaundrySheet };
+  }
+  if (isLaundryColorSheet && /(刷|海绵|擦|拖把|扫把|清洁工具)/.test(titleText)) {
+    return { ...CATEGORY_KNOWN_BRANCH_FALLBACKS.householdCleaningToolsOther };
+  }
+  if (!normalized) return null;
+
+  if ((normalized.includes("工业电气") || normalized.includes("电子元件")) && /(灭火|消防|应急|火灾|逃生|防火)/.test(titleText)) {
+    return { ...CATEGORY_KNOWN_BRANCH_FALLBACKS.safetyEmergency };
+  }
+  if (normalized.includes("专业医疗用品") && /(姿势|矫正|支撑|牵引|颈椎|护腰|护背|靠背|护具|护理垫|记忆棉|康复|训练)/.test(titleText)) {
+    return { ...CATEGORY_KNOWN_BRANCH_FALLBACKS.medicalTherapy };
+  }
+  if ((normalized.includes("家庭清洁用品") || normalized.includes("家庭清洁") || normalized.includes("家居清洁")) && isLaundryColorSheet) {
+    return isSheetLikeCleaning
+      ? { ...CATEGORY_KNOWN_BRANCH_FALLBACKS.householdLaundrySheet }
+      : { ...CATEGORY_KNOWN_BRANCH_FALLBACKS.householdCleaningToolsOther };
+  }
+  if (normalized.includes("食品服务设备和用品")) return { ...CATEGORY_KNOWN_BRANCH_FALLBACKS.foodService };
+  if (normalized.includes("工业电气")) return { ...CATEGORY_KNOWN_BRANCH_FALLBACKS.industrialElectric };
+  if (normalized.includes("专业医疗用品")) return { ...CATEGORY_KNOWN_BRANCH_FALLBACKS.medical };
+  if (normalized.includes("安防劳保")) return { ...CATEGORY_KNOWN_BRANCH_FALLBACKS.safety };
+  return null;
+}
+
+function getCategoryIntentHints(title = "") {
+  const titleText = String(title || "");
+  const isLaundryColorSheet = /(洗衣|吸色|护色|串色|防串色|防染色|染料转移)/.test(titleText);
+  const isSheetLikeCleaning = /(片|纸|布|纤维|无纺布)/.test(titleText);
+  return {
+    isLaundryColorSheet,
+    isSheetLikeCleaning,
+  };
+}
+
+function shouldPreferKnownCategoryBranch(searchTerms = [], title = "") {
+  const terms = Array.isArray(searchTerms) ? searchTerms : [searchTerms];
+  for (const term of terms) {
+    const normalized = normalizeCategoryLookupText(term);
+    if (!normalized) continue;
+    const seed = pickKnownCategoryBranchFallback(term, title);
+    if (!seed) continue;
+    const requestedDepth = normalized.split("/").filter(Boolean).length;
+    const seedDepth = getCategoryDepth(seed);
+    if (requestedDepth <= 2 || seedDepth >= 3) return true;
+  }
+  return false;
+}
+
+function isCategoryCandidateCompatible(candidate = {}, requestedTexts = []) {
+  const requestedPaths = (Array.isArray(requestedTexts) ? requestedTexts : [requestedTexts])
+    .map((value) => normalizeCategoryLookupText(value))
+    .filter((value) => value.includes("/"));
+  if (requestedPaths.length === 0) return true;
+
+  const candidatePath = normalizeCategoryLookupText(
+    candidate?.path
+    || candidate?.categorySearch
+    || candidate?.catIds?._path
+    || getCategoryPathText(candidate?.catIds || candidate)
+  );
+  if (!candidatePath) return false;
+
+  return requestedPaths.some((requestedPath) => {
+    const pathParts = requestedPath.split("/").filter(Boolean);
+    const overlap = countCategoryPathOverlap(candidatePath, requestedPath);
+    const requiredOverlap = Math.min(2, pathParts.length);
+    if (overlap >= requiredOverlap) return true;
+    const leafSegment = pathParts[pathParts.length - 1] || "";
+    return candidatePath.split("/").some((part) => part === leafSegment || part.includes(leafSegment) || leafSegment.includes(part));
+  });
+}
+
+function countCategoryPathOverlap(left = "", right = "") {
+  const leftParts = normalizeCategoryLookupText(left).split("/").filter(Boolean);
+  const rightParts = normalizeCategoryLookupText(right).split("/").filter(Boolean);
+  if (leftParts.length === 0 || rightParts.length === 0) return 0;
+  let overlap = 0;
+  for (const leftPart of leftParts) {
+    if (rightParts.some((rightPart) => rightPart === leftPart || rightPart.includes(leftPart) || leftPart.includes(rightPart))) {
+      overlap += 1;
+    }
+  }
+  return overlap;
+}
+
+function extractCategoryIdsSnapshot(source = {}) {
+  if (!source || typeof source !== "object") return null;
+  const snapshot = {};
+  for (let i = 1; i <= 10; i += 1) {
+    const id = Number(source[`cat${i}Id`] || source[`cat${i}`]?.catId || 0) || 0;
+    const name = String(source[`cat${i}Name`] || source[`cat${i}`]?.catName || "").trim();
+    if (id > 0) snapshot[`cat${i}Id`] = id;
+    if (name) snapshot[`cat${i}Name`] = name;
+  }
+  const pathText = String(source._path || source.path || source.catPath || "").trim();
+  if (pathText) snapshot._path = pathText;
+  return Object.keys(snapshot).length > 0 ? snapshot : null;
+}
+
+function extractLeafCatIdFromCategoryIds(catIds = {}, fallback = 0) {
+  for (let i = 10; i >= 1; i -= 1) {
+    const value = Number(catIds?.[`cat${i}Id`] || 0) || 0;
+    if (value > 0) return value;
+  }
+  return Number(fallback) || 0;
+}
+
+function parseCategoryIdsCell(value) {
+  if (!value) return null;
+  if (typeof value === "object") return extractCategoryIdsSnapshot(value);
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return extractCategoryIdsSnapshot(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeHistoryIdentifier(value = "") {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  return raw.replace(/\.0+$/, "");
+}
+
+function collectCategoryHistoryIdentifiers(source = {}) {
+  const seen = new Set();
+  const result = [];
+  const remember = (kind, value) => {
+    const normalized = normalizeHistoryIdentifier(value);
+    if (!normalized) return;
+    const key = `${kind}:${normalized}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    result.push({ kind, value: normalized });
+  };
+
+  remember("sourceProductId", source.sourceProductId);
+  remember("goodsId", source.goodsId || source.itemId);
+  remember("productId", source.productId || source.spuId);
+  remember("productSkcId", source.productSkcId || source.skcId);
+  return result;
+}
+
+function hasExactCategoryHistoryIdentifierMatch(entry, request = {}) {
+  const requestIds = collectCategoryHistoryIdentifiers(request);
+  if (requestIds.length === 0) return false;
+  const entryIds = collectCategoryHistoryIdentifiers(entry);
+  if (entryIds.length === 0) return false;
+  return requestIds.some((left) => entryIds.some((right) => left.value === right.value));
+}
+
+function normalizeCategoryHistoryEntry(source = {}, meta = {}) {
+  const catIds = (
+    extractCategoryIdsSnapshot(meta.catIds)
+    || extractCategoryIdsSnapshot(source.catIds)
+    || extractCategoryIdsSnapshot(source.payload)
+    || extractCategoryIdsSnapshot(source)
+    || {}
+  );
+  const leafCatId = extractLeafCatIdFromCategoryIds(catIds,
+    meta.leafCatId
+    || source.leafCatId
+    || source.leafCategoryId
+    || source.catId
+    || source.categoryId
+    || source.payload?.leafCatId
+    || source.payload?.leafCategoryId
+    || source.payload?.catId
+    || source.payload?.categoryId
+  );
+  if (!leafCatId) return null;
+
+  const pathText = String(
+    meta.path
+    || source.path
+    || source._path
+    || source.catPath
+    || source.payload?._path
+    || ""
+  ).trim();
+  if (pathText && !catIds._path) catIds._path = pathText;
+
+  const title = String(
+    meta.title
+    || source.title
+    || source.productName
+    || source.payload?.productName
+    || source.params?.title
+    || ""
+  ).trim();
+  const categorySearch = String(
+    meta.categorySearch
+    || source.categorySearch
+    || source.params?.categorySearch
+    || pathText
+    || ""
+  ).trim();
+  const sourceProductId = normalizeHistoryIdentifier(
+    meta.sourceProductId
+    || source.sourceProductId
+    || source.payload?.sourceProductId
+    || source.params?.sourceProductId
+    || source.goodsId
+    || source.payload?.goodsId
+    || source.params?.goodsId
+    || source.productId
+    || source.payload?.productId
+    || source.params?.productId
+  );
+  const goodsId = normalizeHistoryIdentifier(
+    meta.goodsId
+    || source.goodsId
+    || source.itemId
+    || source.payload?.goodsId
+    || source.payload?.itemId
+    || source.params?.goodsId
+  );
+  const productId = normalizeHistoryIdentifier(
+    meta.productId
+    || source.productId
+    || source.spuId
+    || source.payload?.productId
+    || source.payload?.spuId
+    || source.params?.productId
+  );
+  const productSkcId = normalizeHistoryIdentifier(
+    meta.productSkcId
+    || source.productSkcId
+    || source.skcId
+    || source.payload?.productSkcId
+    || source.payload?.skcId
+    || source.params?.productSkcId
+    || source.params?.skcId
+  );
+
+  return {
+    leafCatId,
+    catIds,
+    path: pathText || String(catIds._path || "").trim(),
+    title,
+    categorySearch,
+    sourceProductId,
+    goodsId,
+    productId,
+    productSkcId,
+    updatedAt: String(meta.updatedAt || source.updatedAt || source.createdAt || new Date().toISOString()),
+    source: String(meta.source || source.source || "").trim(),
+  };
+}
+
+function getCategoryHistoryIdentity(entry) {
+  const exactIdentifiers = collectCategoryHistoryIdentifiers(entry);
+  if (exactIdentifiers.length > 0) {
+    const preferredIdentifier = exactIdentifiers[0];
+    return `id|${preferredIdentifier.kind}|${preferredIdentifier.value}`;
+  }
+  const categoryKey = normalizeCategoryLookupText(entry.categorySearch || entry.path || entry.catIds?._path || "");
+  const titleKey = normalizeCategoryLookupText(entry.title || "").replace(/\//g, "").slice(0, 48);
+  return `${entry.leafCatId}|${categoryKey}|${titleKey}`;
+}
+
+function mergeCategoryHistoryEntries(current, incoming) {
+  const mergedCatIds = {
+    ...(current?.catIds || {}),
+    ...(incoming?.catIds || {}),
+  };
+  if (!mergedCatIds._path) {
+    mergedCatIds._path = incoming?.path || current?.path || current?.catIds?._path || "";
+  }
+  return {
+    leafCatId: Number(incoming?.leafCatId || current?.leafCatId) || 0,
+    catIds: mergedCatIds,
+    path: String(incoming?.path || current?.path || mergedCatIds._path || "").trim(),
+    title: String(incoming?.title || current?.title || "").trim(),
+    categorySearch: String(incoming?.categorySearch || current?.categorySearch || "").trim(),
+    sourceProductId: normalizeHistoryIdentifier(incoming?.sourceProductId || current?.sourceProductId),
+    goodsId: normalizeHistoryIdentifier(incoming?.goodsId || current?.goodsId),
+    productId: normalizeHistoryIdentifier(incoming?.productId || current?.productId),
+    productSkcId: normalizeHistoryIdentifier(incoming?.productSkcId || current?.productSkcId),
+    updatedAt: String(incoming?.updatedAt || current?.updatedAt || new Date().toISOString()),
+    source: String(incoming?.source || current?.source || "").trim(),
+  };
+}
+
+function readPersistedCategoryHistoryEntries() {
+  try {
+    const filePath = getCategoryHistoryFilePath();
+    if (!fs.existsSync(filePath)) return [];
+    const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const list = Array.isArray(raw) ? raw : raw?.entries;
+    if (!Array.isArray(list)) return [];
+    return list
+      .map((entry) => normalizeCategoryHistoryEntry(entry))
+      .filter(Boolean)
+      .slice(0, CATEGORY_HISTORY_LIMIT);
+  } catch (e) {
+    logSilent("category.history.read", e, "warn");
+    return [];
+  }
+}
+
+function persistCategoryHistoryEntries() {
+  try {
+    const filePath = getCategoryHistoryFilePath();
+    fs.writeFileSync(filePath, JSON.stringify(categoryHistoryCache || [], null, 2));
+  } catch (e) {
+    logSilent("category.history.write", e, "warn");
+  }
+}
+
+function upsertCategoryHistoryEntry(entry, options = {}) {
+  const normalizedEntry = normalizeCategoryHistoryEntry(entry);
+  if (!normalizedEntry) return null;
+  if (!categoryHistoryCache) categoryHistoryCache = readPersistedCategoryHistoryEntries();
+
+  const identity = getCategoryHistoryIdentity(normalizedEntry);
+  const nextHistory = [];
+  let mergedEntry = normalizedEntry;
+  let merged = false;
+  for (const currentEntry of categoryHistoryCache) {
+    if (!merged && getCategoryHistoryIdentity(currentEntry) === identity) {
+      mergedEntry = mergeCategoryHistoryEntries(currentEntry, normalizedEntry);
+      nextHistory.push(mergedEntry);
+      merged = true;
+    } else {
+      nextHistory.push(currentEntry);
+    }
+  }
+  if (!merged) nextHistory.unshift(mergedEntry);
+
+  categoryHistoryCache = nextHistory
+    .filter(Boolean)
+    .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")))
+    .slice(0, CATEGORY_HISTORY_LIMIT);
+
+  if (options.persist !== false) persistCategoryHistoryEntries();
+  return mergedEntry;
+}
+
+function seedCategoryHistoryEntriesFromFailedPayloads() {
+  try {
+    const debugDir = getDebugDir();
+    const files = fs.readdirSync(debugDir)
+      .filter((fileName) => /^failed_payload_\d+\.json$/i.test(fileName))
+      .sort()
+      .slice(-CATEGORY_HISTORY_SEED_LIMIT);
+    for (const fileName of files) {
+      try {
+        const filePath = path.join(debugDir, fileName);
+        const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
+        const entry = normalizeCategoryHistoryEntry(raw, { source: "failed_payload" });
+        if (entry) upsertCategoryHistoryEntry(entry, { persist: false });
+      } catch (e) {
+        logSilent(`category.history.seed:${fileName}`, e, "warn");
+      }
+    }
+  } catch (e) {
+    logSilent("category.history.seed", e, "warn");
+  }
+}
+
+function collectLocalCategorySeedFiles() {
+  const appDataDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation");
+  const candidateFiles = [];
+  const rememberFile = (filePath) => {
+    if (!filePath || !fs.existsSync(filePath)) return;
+    if (!candidateFiles.includes(filePath)) candidateFiles.push(filePath);
+  };
+
+  try {
+    for (const fileName of fs.readdirSync(appDataDir)) {
+      if (
+        /^temu_raw_.*\.json(?:\.bak)?$/i.test(fileName)
+        || /^temu_product_detail_cache\.json(?:\.bak)?$/i.test(fileName)
+        || /^temu_store%3A.*temu_product_detail_cache\.json$/i.test(fileName)
+      ) {
+        rememberFile(path.join(appDataDir, fileName));
+      }
+    }
+  } catch (e) {
+    logSilent("category.history.seed.local_files", e, "warn");
+  }
+
+  try {
+    const debugDir = getDebugDir();
+    for (const fileName of fs.readdirSync(debugDir)) {
+      if (/^scrape_all_.*\.json$/i.test(fileName)) rememberFile(path.join(debugDir, fileName));
+    }
+  } catch (e) {
+    logSilent("category.history.seed.debug_files", e, "warn");
+  }
+
+  return candidateFiles
+    .map((filePath) => {
+      try {
+        return { filePath, mtimeMs: fs.statSync(filePath).mtimeMs || 0 };
+      } catch {
+        return { filePath, mtimeMs: 0 };
+      }
+    })
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)
+    .map((item) => item.filePath);
+}
+
+function buildCategoryHistorySeedEntryFromNode(node = {}) {
+  if (!node || typeof node !== "object") return null;
+
+  const categoriesSource = (
+    (node.categories && typeof node.categories === "object" && !Array.isArray(node.categories)) ? node.categories
+      : (node.categoriesSimpleVO && typeof node.categoriesSimpleVO === "object" ? node.categoriesSimpleVO : null)
+  );
+  const catIds = (
+    extractCategoryIdsSnapshot(categoriesSource)
+    || extractCategoryIdsSnapshot(node.catIds)
+    || extractCategoryIdsSnapshot(node)
+    || null
+  );
+  const leafCatId = Number(
+    node.leafCat?.catId
+    || node.leftCat?.catId
+    || node.leafCatId
+    || node.leafCategoryId
+    || node.catId
+    || node.categoryId
+    || extractLeafCatIdFromCategoryIds(catIds)
+  ) || 0;
+  if (!leafCatId || !catIds || getCategoryDepth(catIds) === 0) return null;
+
+  const title = String(
+    node.productName
+    || node.title
+    || node.name
+    || node.goodsName
+    || ""
+  ).trim();
+  const pathText = String(
+    catIds._path
+    || node.path
+    || node.catPath
+    || getCategoryPathText(catIds)
+    || (typeof node.categories === "string" ? node.categories : "")
+  ).trim();
+  const categorySearch = String(
+    node.categorySearch
+    || pathText
+    || node.leafCat?.catName
+    || node.leftCat?.catName
+    || node.category
+    || ""
+  ).trim();
+  const goodsId = normalizeHistoryIdentifier(node.goodsId || node.itemId);
+  const productId = normalizeHistoryIdentifier(node.productId || node.spuId);
+  const productSkcId = normalizeHistoryIdentifier(node.productSkcId || node.skcId);
+  const sourceProductId = normalizeHistoryIdentifier(node.sourceProductId || goodsId || productId);
+
+  return normalizeCategoryHistoryEntry({
+    leafCatId,
+    catIds: {
+      ...catIds,
+      ...(pathText && !catIds._path ? { _path: pathText } : {}),
+    },
+    path: pathText,
+    title,
+    categorySearch,
+    sourceProductId,
+    goodsId,
+    productId,
+    productSkcId,
+    updatedAt: new Date().toISOString(),
+    source: "local_product_cache",
+  });
+}
+
+function seedCategoryHistoryEntriesFromLocalProductCaches() {
+  const files = collectLocalCategorySeedFiles();
+  if (files.length === 0) return;
+
+  let seededCount = 0;
+  const visitNode = (value, seen) => {
+    if (!value || seededCount >= CATEGORY_HISTORY_PRODUCT_SEED_LIMIT) return;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (seededCount >= CATEGORY_HISTORY_PRODUCT_SEED_LIMIT) break;
+        visitNode(item, seen);
+      }
+      return;
+    }
+    if (typeof value !== "object") return;
+    if (seen.has(value)) return;
+    seen.add(value);
+
+    const entry = buildCategoryHistorySeedEntryFromNode(value);
+    if (entry) {
+      upsertCategoryHistoryEntry(entry, { persist: false });
+      seededCount += 1;
+      if (seededCount >= CATEGORY_HISTORY_PRODUCT_SEED_LIMIT) return;
+    }
+
+    for (const child of Object.values(value)) {
+      if (seededCount >= CATEGORY_HISTORY_PRODUCT_SEED_LIMIT) break;
+      visitNode(child, seen);
+    }
+  };
+
+  for (const filePath of files) {
+    if (seededCount >= CATEGORY_HISTORY_PRODUCT_SEED_LIMIT) break;
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      visitNode(raw, new WeakSet());
+    } catch (e) {
+      logSilent(`category.history.seed.local_cache:${path.basename(filePath)}`, e, "warn");
+    }
+  }
+}
+
+function ensureCategoryHistoryEntries() {
+  if (!categoryHistoryCache) categoryHistoryCache = readPersistedCategoryHistoryEntries();
+  if (!categoryHistorySeeded) {
+    categoryHistorySeeded = true;
+    seedCategoryHistoryEntriesFromFailedPayloads();
+    seedCategoryHistoryEntriesFromLocalProductCaches();
+    persistCategoryHistoryEntries();
+  }
+  return categoryHistoryCache;
+}
+
+function scoreCategoryHistoryEntry(entry, request = {}) {
+  let score = 0;
+  const entryPathNormalized = normalizeCategoryLookupText(entry.path || entry.categorySearch || entry.catIds?._path || "");
+  const titleIntent = getCategoryIntentHints(request.title || "");
+  const exactIdentifierMatch = hasExactCategoryHistoryIdentifierMatch(entry, request);
+  if (exactIdentifierMatch) score += 5000;
+  const requestedLeafCatId = Number(
+    request.leafCatId
+    || request.leafCategoryId
+    || request.catId
+    || request.categoryId
+    || extractLeafCatIdFromCategoryIds(request.catIds)
+  ) || 0;
+  if (requestedLeafCatId && requestedLeafCatId === entry.leafCatId) score += 1000;
+
+  const requestedCategoryTexts = Array.from(new Set([
+    request.categorySearch,
+    request.path,
+    request.catIds?._path,
+  ].map((value) => String(value || "").trim()).filter(Boolean)));
+  const entryCategoryTexts = Array.from(new Set([
+    entry.categorySearch,
+    entry.path,
+    entry.catIds?._path,
+  ].map((value) => String(value || "").trim()).filter(Boolean)));
+
+  for (const requestedText of requestedCategoryTexts) {
+    const requestedNormalized = normalizeCategoryLookupText(requestedText);
+    if (!requestedNormalized) continue;
+    for (const entryText of entryCategoryTexts) {
+      const entryNormalized = normalizeCategoryLookupText(entryText);
+      if (!entryNormalized) continue;
+      if (requestedNormalized === entryNormalized) {
+        score = Math.max(score, 260 + requestedNormalized.split("/").filter(Boolean).length * 10);
+        continue;
+      }
+      const overlap = countCategoryPathOverlap(requestedNormalized, entryNormalized);
+      if (overlap > 0) {
+        score = Math.max(score, overlap * 45 + ((requestedNormalized.includes(entryNormalized) || entryNormalized.includes(requestedNormalized)) ? 70 : 0));
+      }
+    }
+  }
+
+  const requestedTitle = normalizeCategoryLookupText(request.title || "").replace(/\//g, "");
+  const entryTitle = normalizeCategoryLookupText(entry.title || "").replace(/\//g, "");
+  if (requestedTitle && entryTitle) {
+    if (requestedTitle === entryTitle) score += 180;
+    else {
+      const requestPrefix = requestedTitle.slice(0, Math.min(18, requestedTitle.length));
+      const entryPrefix = entryTitle.slice(0, Math.min(18, entryTitle.length));
+      if (requestPrefix && entryPrefix && (requestedTitle.includes(entryPrefix) || entryTitle.includes(requestPrefix))) score += 90;
+    }
+  }
+
+  if (titleIntent.isLaundryColorSheet) {
+    if (
+      entryPathNormalized.includes("家居、厨房用品/家庭清洁用品/家庭清洁/清洁布")
+      || entryPathNormalized.includes("家居、厨房用品/家庭清洁用品/家庭清洁/清洁工具/其他（清洁工具）")
+    ) {
+      score += titleIntent.isSheetLikeCleaning ? 320 : 220;
+    }
+    if (
+      entryPathNormalized.includes("工业和科学")
+      || entryPathNormalized.includes("商业清洁")
+      || entryPathNormalized.includes("各色美食")
+      || entryPathNormalized.includes("烘焙预拌粉")
+      || entryPathNormalized.includes("物料搬运")
+      || entryPathNormalized.includes("固定捆扎带")
+    ) {
+      score -= 260;
+    }
+  }
+
+  if (entry.path) score += 5;
+  if (extractLeafCatIdFromCategoryIds(entry.catIds) === entry.leafCatId) score += 5;
+  return score;
+}
+
+function findCategoryHistoryMatch(request = {}) {
+  const entries = ensureCategoryHistoryEntries();
+  let bestEntry = null;
+  let bestScore = -1;
+  for (const entry of entries) {
+    const score = scoreCategoryHistoryEntry(entry, request);
+    if (score > bestScore) {
+      bestScore = score;
+      bestEntry = entry;
+    }
+  }
+  const requestedLeafCatId = Number(
+    request.leafCatId
+    || request.leafCategoryId
+    || request.catId
+    || request.categoryId
+    || extractLeafCatIdFromCategoryIds(request.catIds)
+  ) || 0;
+  if (bestEntry && (bestScore >= 120 || (requestedLeafCatId > 0 && requestedLeafCatId === bestEntry.leafCatId))) {
+    return {
+      ...bestEntry,
+      _score: bestScore,
+      _exactIdentifierMatch: hasExactCategoryHistoryIdentifierMatch(bestEntry, request),
+    };
+  }
+  return null;
+}
+
+function rememberResolvedCategory(request = {}) {
+  const entry = normalizeCategoryHistoryEntry(request, {
+    source: request.source || "resolved",
+    updatedAt: new Date().toISOString(),
+  });
+  if (!entry) return null;
+  return upsertCategoryHistoryEntry(entry);
+}
+
+function readPersistedAutoPricingTasks() {
+  try {
+    if (!fs.existsSync(AUTO_PRICING_TASKS_FILE)) return [];
+    const raw = JSON.parse(fs.readFileSync(AUTO_PRICING_TASKS_FILE, "utf8"));
+    return Array.isArray(raw?.tasks) ? raw.tasks : [];
+  } catch (error) {
+    logSilent("auto_pricing.tasks.read", error, "warn");
+    return [];
+  }
+}
+
+function collectHistoricalDraftIds(request = {}) {
+  const normalizedCsvPath = String(request.csvPath || "").trim().toLowerCase();
+  const normalizedTitle = normalizeCategoryLookupText(request.title || request.name || "");
+  const targetIndex = Number(request.index);
+  const draftIds = [];
+  const seen = new Set();
+
+  const remember = (value) => {
+    const draftId = Number(value) || 0;
+    if (draftId <= 0 || seen.has(draftId)) return;
+    seen.add(draftId);
+    draftIds.push(draftId);
+  };
+
+  for (const task of readPersistedAutoPricingTasks()) {
+    const sameCsv = !normalizedCsvPath || String(task?.csvPath || "").trim().toLowerCase() === normalizedCsvPath;
+    if (!sameCsv) continue;
+    for (const result of Array.isArray(task?.results) ? task.results : []) {
+      if (!result?.success) continue;
+      const resultIndex = Number(result?.index);
+      const normalizedResultTitle = normalizeCategoryLookupText(result?.name || result?.title || "");
+      const sameIndex = Number.isFinite(targetIndex) && resultIndex === targetIndex;
+      const sameTitle = normalizedTitle && normalizedResultTitle && (
+        normalizedResultTitle === normalizedTitle
+        || normalizedResultTitle.includes(normalizedTitle)
+        || normalizedTitle.includes(normalizedResultTitle)
+      );
+      if (!sameIndex && !sameTitle) continue;
+      remember(result?.draftId);
+      remember(result?.productDraftId);
+      remember(result?.result?.draftId);
+      remember(result?.result?.productDraftId);
+      remember(result?.productId);
+      remember(result?.result?.productId);
+    }
+  }
+
+  return draftIds;
+}
+
+function extractCategoryIdsFromDraftCategories(categories = {}) {
+  const catIds = {};
+  let leafCatId = 0;
+  const pathParts = [];
+  for (let level = 1; level <= 10; level += 1) {
+    const node = categories?.[`cat${level}`] || {};
+    const catId = Number(node?.catId) || 0;
+    const catName = String(node?.catName || "").trim();
+    catIds[`cat${level}Id`] = catId;
+    if (catName) {
+      catIds[`cat${level}Name`] = catName;
+      pathParts.push(catName);
+    }
+    if (catId > 0) leafCatId = catId;
+  }
+  if (pathParts.length > 0) catIds._path = pathParts.join(" > ");
+  return leafCatId > 0 ? { catIds, leafCatId, path: catIds._path || "" } : null;
+}
 
 // browser/context 代理：旧代码通过全局 browser/context 访问，实际指向 browserState
 // 使用 defineProperty 创建动态代理，读写都同步到 browserState
@@ -398,6 +1217,12 @@ function clearBrowserPassword() {
   browserState.lastPassword = "";
 }
 
+function clearStickyWorkerCredentials() {
+  stickyCredentialAccountId = "";
+  stickyCredentialPhone = "";
+  stickyCredentialPassword = "";
+}
+
 function sanitizeLoginPhone(value = "") {
   const raw = String(value || "").trim();
   if (!raw) return "";
@@ -407,10 +1232,25 @@ function sanitizeLoginPhone(value = "") {
   return digits || raw;
 }
 
+function isPlaceholderLoginPhone(value = "") {
+  return sanitizeLoginPhone(value) === "13800138000";
+}
+
 function getRequestCredentials() {
+  const requestedPhone = sanitizeLoginPhone(requestCredentialPhone || "");
+  const stickyPhone = sanitizeLoginPhone(stickyCredentialPhone || "");
+  const cachedPhone = sanitizeLoginPhone(browserState.lastPhone || "");
+  const phone = requestedPhone && !isPlaceholderLoginPhone(requestedPhone)
+    ? requestedPhone
+    : (stickyPhone && !isPlaceholderLoginPhone(stickyPhone)
+      ? stickyPhone
+      : (cachedPhone && !isPlaceholderLoginPhone(cachedPhone) ? cachedPhone : ""));
+  const password = normalizeRequestCredential(requestCredentialPassword)
+    || normalizeRequestCredential(stickyCredentialPassword)
+    || normalizeRequestCredential(browserState.lastPassword);
   return {
-    phone: sanitizeLoginPhone(requestCredentialPhone || browserState.lastPhone || ""),
-    password: requestCredentialPassword,
+    phone,
+    password,
   };
 }
 
@@ -419,6 +1259,70 @@ function getWorkerTypingDelay() {
   const min = Math.max(20, Math.round(40 * scale));
   const max = Math.max(min, Math.round(120 * scale));
   return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+async function findVisibleInputOnPage(page, selectors = []) {
+  for (const selector of selectors) {
+    const locator = page.locator(selector);
+    const count = await locator.count().catch(() => 0);
+    for (let index = 0; index < count; index += 1) {
+      const candidate = locator.nth(index);
+      const visible = await candidate.isVisible().catch(() => false);
+      const editable = await candidate.isEditable().catch(() => false);
+      if (visible && editable) return candidate;
+    }
+  }
+  return null;
+}
+
+async function fillInputWithVerification(input, value, options = {}) {
+  const {
+    label = "输入框",
+    logPrefix = "[input]",
+    normalize = (next) => String(next ?? "").trim(),
+  } = options;
+  const expected = normalize(value);
+  const readValue = async () => normalize(
+    await input.inputValue().catch(async () => input.evaluate((node) => node?.value || ""))
+  );
+  const clearInput = async () => {
+    await input.click({ clickCount: 3 }).catch(() => {});
+    await input.press("Control+A").catch(() => {});
+    await input.press("Backspace").catch(() => {});
+    await input.fill("").catch(() => {});
+    await input.evaluate((node) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(node, "");
+      node.dispatchEvent(new Event("input", { bubbles: true }));
+      node.dispatchEvent(new Event("change", { bubbles: true }));
+    }).catch(() => {});
+  };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await clearInput();
+    await randomDelay(120, 240);
+
+    if (attempt < 2) {
+      for (const char of String(value ?? "")) {
+        await input.type(char, { delay: getWorkerTypingDelay() });
+      }
+    } else {
+      await input.evaluate((node, nextValue) => {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        setter?.call(node, nextValue);
+        node.dispatchEvent(new Event("input", { bubbles: true }));
+        node.dispatchEvent(new Event("change", { bubbles: true }));
+        node.dispatchEvent(new Event("blur", { bubbles: true }));
+      }, String(value ?? ""));
+    }
+
+    await randomDelay(150, 320);
+    const actual = await readValue();
+    if (actual === expected) return true;
+    console.error(`${logPrefix} ${label} mismatch on attempt ${attempt + 1}: expected=${expected} actual=${actual || "<empty>"}`);
+  }
+
+  throw new Error(`${label}输入后校验失败`);
 }
 
 function buildSellerCentralUrl(targetPath = "/goods/list") {
@@ -534,57 +1438,101 @@ async function tryAutoLoginInPopup(popup, logPrefix = "[popup-login]") {
       }
     } catch (e) { logSilent("ui.action", e); }
 
-    const phoneInput = await popup.waitForSelector(
-      '#usernameId, input[name="usernameId"], input[type="tel"], input[inputmode="numeric"], input[placeholder*="手机"], input[placeholder*="号码"]',
-      { timeout: 8000 }
-    );
+    const phoneInput = await findVisibleInputOnPage(popup, [
+      '#usernameId',
+      'input[name="usernameId"]',
+      'input[placeholder*="手机"]',
+      'input[placeholder*="号码"]',
+      'input[type="tel"]',
+      'input[inputmode="numeric"]',
+    ]);
+    if (!phoneInput) throw new Error("未找到手机号输入框");
     await phoneInput.click();
-    await phoneInput.fill("");
-    for (const c of phone) await phoneInput.type(c, { delay: getWorkerTypingDelay() });
+    await fillInputWithVerification(phoneInput, phone, {
+      label: "手机号",
+      logPrefix,
+      normalize: sanitizeLoginPhone,
+    });
     await randomDelay(400, 800);
 
-    const passwordInput = await popup.waitForSelector('#passwordId, input[type="password"]', { timeout: 8000 });
+    const passwordInput = await findVisibleInputOnPage(popup, ['#passwordId', 'input[type="password"]']);
+    if (!passwordInput) throw new Error("未找到密码输入框");
     await passwordInput.click();
-    await passwordInput.fill("");
-    for (const c of password) await passwordInput.type(c, { delay: getWorkerTypingDelay() });
+    await fillInputWithVerification(passwordInput, password, {
+      label: "密码",
+      logPrefix,
+    });
     await randomDelay(400, 800);
 
-    const consentReady = await ensurePopupConsentChecked(popup, logPrefix);
-    if (!consentReady) {
-      throw new Error("未能自动勾选隐私协议");
-    }
-    await randomDelay(200, 500);
+    let lastLoginHint = "";
+    for (let submitAttempt = 0; submitAttempt < 4; submitAttempt += 1) {
+      const consentReady = await ensurePopupConsentChecked(popup, `${logPrefix}-consent`);
+      if (!consentReady) {
+        throw new Error("未能自动勾选隐私协议");
+      }
+      await randomDelay(200, 500);
 
-    const loginBtn = await popup.waitForSelector('button:has-text("登录"), button:has-text("授权登录"), button:has-text("同意并登录")', { timeout: 8000 });
-    await loginBtn.click();
-    console.error(`${logPrefix} Auto-login submitted`);
-    await randomDelay(1500, 2500);
-
-    try {
-      const loginHint = await popup.evaluate(() => {
-        const nodes = [...document.querySelectorAll('[class*="error"], [class*="toast"], [class*="tip"], [class*="message"], [role="alert"]')];
-        const text = nodes
-          .map((node) => (node.textContent || "").trim())
-          .filter(Boolean)
-          .join(" | ");
-        return text.slice(0, 160);
+      const loginBtn = await popup.waitForSelector('button:has-text("登录"), button:has-text("授权登录"), button:has-text("同意并登录")', { timeout: 8000 });
+      await loginBtn.click().catch(async () => {
+        await popup.evaluate(() => {
+          const candidates = [...document.querySelectorAll("button, [role='button'], a, div[class*='btn'], div[class*='Btn']")];
+          const target = candidates.find((node) => /^(登录|授权登录|同意并登录)$/.test((node.textContent || "").trim()));
+          target?.click?.();
+        });
       });
-      if (loginHint) {
-        console.error(`${logPrefix} Login hint after submit: ${loginHint}`);
+      console.error(`${logPrefix} Auto-login submitted (attempt ${submitAttempt + 1}/4)`);
+      await randomDelay(1500, 2500);
+
+      try {
+        const agreeBtn = popup.locator('button:has-text("同意并登录"), button:has-text("同意")').first();
+        if (await agreeBtn.isVisible({ timeout: 1500 })) {
+          await agreeBtn.click();
+          await randomDelay(800, 1500);
+        }
+      } catch (e) { logSilent("ui.action", e); }
+
+      let loginHint = "";
+      try {
+        loginHint = await popup.evaluate(() => {
+          const nodes = [...document.querySelectorAll('[class*="error"], [class*="toast"], [class*="tip"], [class*="message"], [role="alert"]')];
+          const text = nodes
+            .map((node) => (node.textContent || "").trim())
+            .filter(Boolean)
+            .join(" | ");
+          return text.slice(0, 160);
+        });
+        if (loginHint) {
+          console.error(`${logPrefix} Login hint after submit: ${loginHint}`);
+        }
+      } catch (e) {
+        logSilent("ui.action", e);
       }
-    } catch (e) {
-      logSilent("ui.action", e);
+      lastLoginHint = loginHint || lastLoginHint;
+
+      const stageAfterSubmit = await detectSellerPopupStage(popup);
+      if (stageAfterSubmit !== "login") {
+        return true;
+      }
+
+      if (/隐私政策|阅读并同意|先阅读|同意/.test(loginHint)) {
+        await ensurePopupConsentChecked(popup, `${logPrefix}-retry-consent`);
+      }
+      if (/手机|号码/.test(loginHint)) {
+        await fillInputWithVerification(phoneInput, phone, {
+          label: "手机号",
+          logPrefix,
+          normalize: sanitizeLoginPhone,
+        });
+      }
+      if (/密码/.test(loginHint)) {
+        await fillInputWithVerification(passwordInput, password, {
+          label: "密码",
+          logPrefix,
+        });
+      }
     }
 
-    try {
-      const agreeBtn = popup.locator('button:has-text("同意并登录"), button:has-text("同意")').first();
-      if (await agreeBtn.isVisible({ timeout: 1500 })) {
-        await agreeBtn.click();
-        await randomDelay(800, 1500);
-      }
-    } catch (e) { logSilent("ui.action", e); }
-
-    return true;
+    throw new Error(lastLoginHint || "自动登录已提交，但页面仍停留在登录页");
   } catch (error) {
     await captureWorkerErrorScreenshot("auto_login_popup_error", popup);
     console.error(`${logPrefix} Auto-login failed: ${error.message}`);
@@ -1012,10 +1960,17 @@ async function withWorkerRequestCredentials(credentials, fn) {
   const prevPhone = requestCredentialPhone;
   const prevPassword = requestCredentialPassword;
   const requestedAccountId = normalizeRequestCredential(credentials?.accountId);
+  const nextPhone = sanitizeLoginPhone(normalizeRequestCredential(credentials?.phone));
+  const nextPassword = normalizeRequestCredential(credentials?.password);
   const shouldSwitchAccount = requestedAccountId && requestedAccountId !== browserState.lastAccountId;
+  const shouldResetStickyAccount = requestedAccountId && stickyCredentialAccountId && stickyCredentialAccountId !== requestedAccountId;
+
+  if (shouldSwitchAccount || shouldResetStickyAccount) {
+    console.error(`[worker-credentials] Switching browser account: ${browserState.lastAccountId || "none"} -> ${requestedAccountId}`);
+    clearStickyWorkerCredentials();
+  }
 
   if (shouldSwitchAccount) {
-    console.error(`[worker-credentials] Switching browser account: ${browserState.lastAccountId || "none"} -> ${requestedAccountId}`);
     try {
       await closeBrowser();
     } catch (error) {
@@ -1027,12 +1982,22 @@ async function withWorkerRequestCredentials(credentials, fn) {
     browserState.lastAccountId = requestedAccountId;
   }
 
-  if (credentials && typeof credentials === "object") {
-    const phone = normalizeRequestCredential(credentials.phone);
-    if (phone) {
-      requestCredentialPhone = phone;
-      requestCredentialPassword = normalizeRequestCredential(credentials.password);
-      browserState.lastPhone = phone;
+  if (nextPhone && !isPlaceholderLoginPhone(nextPhone)) {
+    requestCredentialPhone = nextPhone;
+    requestCredentialPassword = nextPassword;
+    stickyCredentialPhone = nextPhone;
+    if (nextPassword) {
+      stickyCredentialPassword = nextPassword;
+    }
+    if (requestedAccountId) {
+      stickyCredentialAccountId = requestedAccountId;
+    }
+    browserState.lastPhone = nextPhone;
+  } else if (nextPhone && isPlaceholderLoginPhone(nextPhone)) {
+    requestCredentialPhone = "";
+    requestCredentialPassword = nextPassword;
+    if (isPlaceholderLoginPhone(browserState.lastPhone)) {
+      browserState.lastPhone = "";
     }
   }
   clearBrowserPassword();
@@ -1041,7 +2006,9 @@ async function withWorkerRequestCredentials(credentials, fn) {
   } finally {
     requestCredentialPhone = prevPhone;
     requestCredentialPassword = prevPassword;
-    if (prevPhone) browserState.lastPhone = prevPhone;
+    if (!requestCredentialPhone && isPlaceholderLoginPhone(browserState.lastPhone)) {
+      browserState.lastPhone = "";
+    }
     clearBrowserPassword();
   }
 }
@@ -1974,6 +2941,254 @@ async function scrapePageCaptureAll(targetPath, options = {}) {
     await saveCookies();
     return { apis: capturedApis };
   } finally {
+    await page.close();
+  }
+}
+
+
+async function scrapeLifecycle(options = {}) {
+  const lite = options.lite ?? _navLiteMode;
+  const waitTime = options.waitTime ?? (lite ? 6000 : 8500);
+  const page = await context.newPage();
+  const capturedApis = [];
+  const responseTracker = createPendingTaskTracker();
+  const staticExts = [".js", ".css", ".png", ".svg", ".woff", ".woff2", ".ttf", ".ico", ".jpg", ".jpeg", ".gif", ".map", ".webp"];
+  const ignorePatterns = [
+    "phantom/xg",
+    "pfb/l1",
+    "pfb/a4",
+    "web-performace",
+    "_stm",
+    "msgBox",
+    "hot-update",
+    "sockjs",
+    "hm.baidu",
+    "google",
+    "favicon",
+    "drogon-api",
+    "report/uin",
+    "/api/phantom/dm/wl/cg",
+    "/api/seller/auth/",
+    "/api/bg-ladyfish/mms/menu/page/feedback/entrance",
+  ];
+
+  const closeCommonPrompts = async (rounds = 8) => {
+    for (let i = 0; i < rounds; i += 1) {
+      try {
+        const btn = page.locator(
+          'button:has-text("知道了"), button:has-text("我知道了"), button:has-text("确定"), button:has-text("关闭"), button:has-text("暂不"), button:has-text("取消"), button:has-text("稍后"), button:has-text("去处理")'
+        ).first();
+        if (await btn.isVisible({ timeout: 500 })) {
+          await btn.click().catch(() => {});
+          await randomDelay(250, 450);
+          continue;
+        }
+      } catch {}
+      break;
+    }
+  };
+
+  try {
+    page.on("response", (resp) => {
+      responseTracker.track((async () => {
+        try {
+          const url = resp.url();
+          if (staticExts.some((ext) => url.includes(ext))) return;
+          if (ignorePatterns.some((pattern) => url.includes(pattern))) return;
+          if (resp.status() !== 200) return;
+          const ct = resp.headers()["content-type"] || "";
+          if (!ct.includes("json") && !ct.includes("application")) return;
+          const body = await resp.json().catch(() => null);
+          if (!body || (body.result === undefined && body.success === undefined)) return;
+          const u = new URL(url);
+          capturedApis.push({ path: u.pathname, data: body });
+          console.error(`[lifecycle] Captured: ${u.pathname}`);
+        } catch (error) {
+          logSilent("ui.action", error);
+        }
+      })());
+    });
+
+    console.error("[lifecycle] Navigating to /newon/product-select...");
+    await navigateToSellerCentral(page, "/newon/product-select", { lite });
+    await randomDelay(waitTime, waitTime + (lite ? 1000 : 1800));
+    await closeCommonPrompts();
+
+    let queryClicked = false;
+    try {
+      const exactQueryButton = page.getByRole("button", { name: "查询", exact: true }).first();
+      if (await exactQueryButton.isVisible({ timeout: 2500 })) {
+        await exactQueryButton.scrollIntoViewIfNeeded().catch(() => {});
+        await exactQueryButton.click();
+        queryClicked = true;
+      }
+    } catch {}
+
+    if (!queryClicked) {
+      const querySelectors = [
+        'button:has-text("查询")',
+        'span:has-text("查询")',
+        '.ant-btn-primary:has-text("查询")',
+      ];
+      for (const selector of querySelectors) {
+        try {
+          const button = page.locator(selector).first();
+          if (await button.isVisible({ timeout: 1200 })) {
+            await button.scrollIntoViewIfNeeded().catch(() => {});
+            await button.click();
+            queryClicked = true;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    if (!queryClicked) {
+      queryClicked = await page.evaluate(() => {
+        const normalizeText = (value) => String(value || "").replace(/\s+/g, "");
+        const candidates = Array.from(document.querySelectorAll("button, span, a, div"))
+          .filter((element) => {
+            const text = normalizeText(element.textContent || "");
+            if (text !== "查询") return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          });
+        const target = candidates[candidates.length - 1];
+        if (!target) return false;
+        target.click();
+        return true;
+      }).catch(() => false);
+    }
+
+    if (queryClicked) {
+      console.error("[lifecycle] Query triggered");
+      await randomDelay(lite ? 3800 : 5500, lite ? 5200 : 7800);
+    } else {
+      console.error("[lifecycle] Query button not found, capturing current page state");
+      await randomDelay(lite ? 1800 : 2600, lite ? 2600 : 3600);
+    }
+
+    await closeCommonPrompts(4);
+    await responseTracker.drain(lite ? 2500 : 4500);
+
+    const domData = await page.evaluate(() => {
+      const normalizeText = (value) => String(value || "").replace(/\s+/g, " ").trim();
+      const toNumber = (value) => {
+        const match = String(value || "").match(/-?\d+(?:\.\d+)?/);
+        return match ? Number(match[0]) : null;
+      };
+      const isVisible = (element) => {
+        if (!element) return false;
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      const uniqueByText = (items) => {
+        const seen = new Set();
+        return items.filter((item) => {
+          const key = JSON.stringify(item);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+      };
+      const summaryCards = uniqueByText(
+        Array.from(document.querySelectorAll("div, li, button, a"))
+          .map((element) => {
+            if (!isVisible(element)) return null;
+            const text = normalizeText(element.innerText || "");
+            if (!text || text.length > 48 || !/\d/.test(text)) return null;
+            const rect = element.getBoundingClientRect();
+            if (rect.width < 90 || rect.height < 28) return null;
+            const lines = text.split(/ (?=\d)|\n/).map(normalizeText).filter(Boolean);
+            return {
+              text,
+              value: toNumber(text),
+              top: Math.round(rect.top),
+              left: Math.round(rect.left),
+              width: Math.round(rect.width),
+            };
+          })
+          .filter(Boolean)
+          .sort((a, b) => (a.top - b.top) || (a.left - b.left))
+          .slice(0, 24)
+      );
+
+      const filterLabels = uniqueByText(
+        Array.from(document.querySelectorAll("label, .ant-form-item-label, .ant-select-selector, .ant-picker"))
+          .map((element) => normalizeText(element.innerText || element.textContent || ""))
+          .filter((text) => text && text.length <= 24)
+          .slice(0, 80)
+      );
+
+      const buttons = uniqueByText(
+        Array.from(document.querySelectorAll("button, [role='button'], .ant-btn"))
+          .map((element) => normalizeText(element.innerText || element.textContent || ""))
+          .filter((text) => text && text.length <= 24)
+          .slice(0, 80)
+      );
+
+      const statusTabs = uniqueByText(
+        Array.from(document.querySelectorAll("[role='tab'], .ant-tabs-tab, .ant-radio-button-wrapper, .ant-segmented-item"))
+          .map((element) => {
+            if (!isVisible(element)) return null;
+            const text = normalizeText(element.innerText || "");
+            if (!text || text.length > 40) return null;
+            return {
+              text,
+              value: toNumber(text),
+            };
+          })
+          .filter(Boolean)
+      );
+
+      const table = (() => {
+        const root = document.querySelector("table");
+        if (!root) return null;
+        const headers = Array.from(root.querySelectorAll("thead th, thead td"))
+          .map((cell) => normalizeText(cell.innerText || cell.textContent || ""))
+          .filter(Boolean);
+        const rows = Array.from(root.querySelectorAll("tbody tr"))
+          .slice(0, 30)
+          .map((row) => {
+            const cells = Array.from(row.querySelectorAll("td"))
+              .map((cell) => normalizeText(cell.innerText || cell.textContent || "").slice(0, 300))
+              .filter((text, index, arr) => text || index < arr.length);
+            return cells;
+          })
+          .filter((cells) => cells.length > 0);
+        return {
+          headers,
+          rows,
+          rowCount: root.querySelectorAll("tbody tr").length,
+        };
+      })();
+
+      const pageTitle = normalizeText(
+        document.querySelector("h1, h2, .title, .page-title")?.textContent || document.title || ""
+      );
+
+      return {
+        pageTitle,
+        summaryCards,
+        statusTabs,
+        filterLabels,
+        buttons,
+        table,
+      };
+    });
+
+    console.error(`[lifecycle] Done! APIs: ${capturedApis.length}, table rows: ${domData?.table?.rowCount || 0}`);
+    await saveCookies();
+    return {
+      apis: capturedApis,
+      domData,
+      meta: {
+        queryTriggered: queryClicked,
+        currentUrl: page.url(),
+      },
+    };
+  } finally {
+    await responseTracker.drain(1200).catch(() => {});
     await page.close();
   }
 }
@@ -3683,6 +4898,10 @@ async function handleRequest(body) {
       await ensureBrowser();
       return { sales: await scrapeSales() };
     }
+    case "scrape_lifecycle": {
+      await ensureBrowser();
+      return { lifecycle: await scrapeLifecycle() };
+    }
     case "sidebar_nav": {
       await ensureBrowser();
       return await scrapeViaSidebarClick();
@@ -3868,7 +5087,7 @@ async function handleRequest(body) {
         { key: "soldout", fn: () => _registryScrape("soldout") },
         { key: "performance", fn: () => _registryScrape("performance") },
         // ---- 扩展采集 ----
-        { key: "lifecycle", fn: () => _registryScrape("lifecycle") },
+        { key: "lifecycle", fn: () => scrapeLifecycle() },
         { key: "priceCompete", fn: () => _registryScrape("priceCompete") },
         { key: "urgentOrders", fn: () => _registryScrape("urgentOrders") },
         { key: "delivery", fn: () => _registryScrape("delivery") },
@@ -4533,9 +5752,14 @@ async function handleRequest(body) {
           tasks: nextTasks,
         });
       }
+      clearStickyWorkerCredentials();
       await closeBrowser();
       return { status: "closed" };
-    case "shutdown": await closeBrowser(); setTimeout(() => process.exit(0), 100); return { status: "shutting_down" };
+    case "shutdown":
+      clearStickyWorkerCredentials();
+      await closeBrowser();
+      setTimeout(() => process.exit(0), 100);
+      return { status: "shutting_down" };
     case "pause_pricing":
       if (!isCurrentProgressTask(params?.taskId)) {
         return { status: currentProgress.status || "idle", taskId: currentProgress.taskId };
@@ -4743,6 +5967,89 @@ function extractCategoryRefinementSegments(text = "") {
     .filter((segment) => segment.length >= 2);
 }
 
+async function resolveKnownCategoryBranchFallback(page, searchTerms = [], title = "") {
+  const cleanStr = (s) => String(s || "").replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "").replace(/[、，]/g, "");
+  const orderedTerms = Array.from(new Set(
+    (Array.isArray(searchTerms) ? searchTerms : [searchTerms])
+      .map((term) => String(term || "").trim())
+      .filter(Boolean)
+  ));
+
+  for (const term of orderedTerms) {
+    const seed = pickKnownCategoryBranchFallback(term, title);
+    if (!seed) continue;
+
+    const catIds = {};
+    let leafCatId = 0;
+    let startLevel = 0;
+    for (let level = 1; level <= 10; level += 1) {
+      const catId = Number(seed[`cat${level}Id`]) || 0;
+      const catName = String(seed[`cat${level}Name`] || "").trim();
+      if (!catId) break;
+      catIds[`cat${level}Id`] = catId;
+      if (catName) catIds[`cat${level}Name`] = catName;
+      leafCatId = catId;
+      startLevel = level;
+    }
+    if (!leafCatId) continue;
+
+    const segments = Array.from(new Set([
+      ...extractCategoryRefinementSegments(term),
+      ...extractCategoryRefinementSegments(title),
+    ]));
+    let parentId = leafCatId;
+
+    for (let level = startLevel + 1; level <= 10; level += 1) {
+      const result = await temuXHR(page, "/anniston-agent-seller/category/children/list", { parentCatId: parentId }, { maxRetries: 1 });
+      const children = result.success ? (result.data?.categoryNodeVOS || []) : [];
+      if (children.length === 0) break;
+
+      let bestChild = null;
+      let bestScore = -1;
+      let otherChild = null;
+      for (const child of children) {
+        const childName = cleanStr(child.catName);
+        if (/^其[他它]/.test(childName)) otherChild = child;
+        let score = 0;
+        for (const seg of segments) {
+          if (childName.includes(seg)) score += seg.length * 3;
+          else if (seg.includes(childName)) score += childName.length * 2;
+          else {
+            for (let len = Math.min(4, seg.length); len >= 2; len -= 1) {
+              for (let idx = 0; idx <= seg.length - len; idx += 1) {
+                if (childName.includes(seg.slice(idx, idx + len))) {
+                  score += len;
+                  break;
+                }
+              }
+            }
+          }
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestChild = child;
+        }
+      }
+
+      const selectedChild = bestScore > 0 ? bestChild : (otherChild || null);
+      if (!selectedChild) break;
+      catIds[`cat${level}Id`] = selectedChild.catId;
+      catIds[`cat${level}Name`] = selectedChild.catName;
+      parentId = selectedChild.catId;
+      leafCatId = selectedChild.catId;
+      if (selectedChild.isLeaf) break;
+    }
+
+    for (let level = 1; level <= 10; level += 1) {
+      if (!catIds[`cat${level}Id`]) catIds[`cat${level}Id`] = 0;
+    }
+    catIds._path = getCategoryPathText(catIds);
+    return { catIds, leafCatId, path: catIds._path, source: `known_branch:${term}` };
+  }
+
+  return null;
+}
+
 function syncLeafCategoryPayloadFields(payload, leafCatId) {
   const normalizedLeafCatId = Number(leafCatId) || 0;
   if (!payload || normalizedLeafCatId <= 0) return;
@@ -4750,6 +6057,172 @@ function syncLeafCategoryPayloadFields(payload, leafCatId) {
   payload.leafCategoryId = normalizedLeafCatId;
   payload.catId = normalizedLeafCatId;
   payload.categoryId = normalizedLeafCatId;
+}
+
+const DEFAULT_DRAFT_TITLE_LANGUAGES = ["zh"];
+const DEFAULT_DRAFT_MATERIAL_LANGUAGES = ["zh", "en"];
+
+function normalizeDraftLanguageList(values, fallback = DEFAULT_DRAFT_TITLE_LANGUAGES) {
+  const normalized = Array.from(new Set(
+    (Array.isArray(values) ? values : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  ));
+  return normalized.length > 0 ? normalized : [...fallback];
+}
+
+function buildDraftProductI18nReqs(productName, languages = DEFAULT_DRAFT_TITLE_LANGUAGES) {
+  const normalizedName = String(productName || "").trim() || "商品";
+  return normalizeDraftLanguageList(languages).map((language) => ({
+    language,
+    productName: normalizedName,
+  }));
+}
+
+function buildDraftImageI18nReqs(imageUrls = [], languages = DEFAULT_DRAFT_MATERIAL_LANGUAGES) {
+  const normalizedImageUrls = Array.from(new Set(
+    (Array.isArray(imageUrls) ? imageUrls : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  )).slice(0, 10);
+  if (normalizedImageUrls.length === 0) return [];
+  return normalizeDraftLanguageList(languages, DEFAULT_DRAFT_MATERIAL_LANGUAGES).flatMap((language) =>
+    normalizedImageUrls.map((imageUrl) => ({
+      language,
+      imageUrl,
+    }))
+  );
+}
+
+function syncDraftPayloadDisplayFields(payload, params = {}, imageUrls = []) {
+  if (!payload || typeof payload !== "object") return payload;
+
+  const normalizedTitle = String(params.title || payload.productName || "").trim() || "商品";
+  const normalizedImages = Array.from(new Set(
+    (Array.isArray(imageUrls) ? imageUrls : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  )).slice(0, 10);
+  const primaryImage = normalizedImages[0] || "";
+  const titleLanguages = normalizeDraftLanguageList(
+    params.titleLanguages,
+    DEFAULT_DRAFT_TITLE_LANGUAGES
+  );
+  const materialLanguages = normalizeDraftLanguageList(
+    params.materialMultiLanguages || payload.materialMultiLanguages,
+    DEFAULT_DRAFT_MATERIAL_LANGUAGES
+  );
+  const carouselImageI18nReqs = buildDraftImageI18nReqs(normalizedImages, materialLanguages);
+  const thumbImageI18nReqs = buildDraftImageI18nReqs(primaryImage ? [primaryImage] : [], materialLanguages);
+
+  payload.productName = normalizedTitle;
+  payload.materialMultiLanguages = [...materialLanguages];
+  payload.productI18nReqs = buildDraftProductI18nReqs(normalizedTitle, titleLanguages);
+
+  if (normalizedImages.length > 0) {
+    payload.carouselImageUrls = normalizedImages;
+    payload.materialImgUrl = primaryImage;
+    payload.carouselImageI18nReqs = carouselImageI18nReqs;
+  }
+
+  if (Array.isArray(payload.productSkcReqs)) {
+    for (const skc of payload.productSkcReqs) {
+      if (!skc || typeof skc !== "object") continue;
+      if (normalizedImages.length > 0) {
+        skc.previewImgUrls = normalizedImages;
+        if (Array.isArray(skc.productSkcCarouselImageI18nReqs) && skc.productSkcCarouselImageI18nReqs.length > 0) {
+          skc.productSkcCarouselImageI18nReqs = carouselImageI18nReqs;
+        }
+      }
+      if (!Array.isArray(skc.productSkuReqs)) continue;
+      for (const sku of skc.productSkuReqs) {
+        if (!sku || typeof sku !== "object") continue;
+        if (primaryImage) sku.thumbUrl = primaryImage;
+        if (Array.isArray(sku.productSkuThumbUrlI18nReqs)) {
+          sku.productSkuThumbUrlI18nReqs = thumbImageI18nReqs;
+        }
+      }
+    }
+  }
+
+  return payload;
+}
+
+function summarizeDraftVerificationResult(rawResult = {}) {
+  const result = rawResult && typeof rawResult === "object" ? rawResult : {};
+  const productName = String(result.productName || "").trim();
+  const productI18nList = Array.isArray(result.productI18nList) ? result.productI18nList : [];
+  const titleFromI18n = productI18nList
+    .map((item) => String(item?.productName || item?.name || item?.title || "").trim())
+    .find(Boolean) || "";
+  const carouselImageUrls = Array.isArray(result.carouselImageUrls) ? result.carouselImageUrls : [];
+  const productSkcList = Array.isArray(result.productSkcList) ? result.productSkcList : [];
+  const hasSkcImages = productSkcList.some((skc) => {
+    const previewImages = Array.isArray(skc?.previewImgUrls) ? skc.previewImgUrls : [];
+    if (previewImages.some(Boolean)) return true;
+    const skuList = Array.isArray(skc?.productSkuList) ? skc.productSkuList : [];
+    return skuList.some((sku) => String(sku?.thumbUrl || "").trim());
+  });
+  const hasSpecs = productSkcList.length > 0 || (Array.isArray(result.productSpecPropertyVOS) && result.productSpecPropertyVOS.length > 0);
+  const hasTitle = Boolean(productName || titleFromI18n);
+  const hasImages = carouselImageUrls.some(Boolean) || Boolean(String(result.materialImgUrl || "").trim()) || hasSkcImages;
+  return {
+    hasTitle,
+    hasImages,
+    hasSpecs,
+    title: productName || titleFromI18n,
+    imageCount: carouselImageUrls.filter(Boolean).length,
+    skcCount: productSkcList.length,
+  };
+}
+
+async function verifyDraftPersistedContent(page, draftId, options = {}) {
+  const numericDraftId = Number(draftId) || 0;
+  if (!numericDraftId || !page) {
+    return { ok: false, reason: "draft_id_invalid", summary: { hasTitle: false, hasImages: false, hasSpecs: false } };
+  }
+  const captured = { raw: null };
+  const listener = async (response) => {
+    try {
+      if (!response.url().includes("/visage-agent-seller/product/draft/query")) return;
+      const text = await response.text();
+      captured.raw = JSON.parse(text);
+    } catch {}
+  };
+  page.on("response", listener);
+  try {
+    await openSellerCentralTarget(page, `/goods/edit?productDraftId=${numericDraftId}&from=productDraftList`, {
+      lite: false,
+      logPrefix: options.logPrefix || "[draft-verify]",
+    });
+    await dismissCommonDialogs(page).catch(() => {});
+    await page.waitForTimeout(options.waitMs || 8000).catch(() => {});
+
+    const domState = await page.evaluate(() => {
+      const titleInput = document.querySelector('input[placeholder*="商品名称"], textarea[placeholder*="商品名称"]');
+      return {
+        titleInputValue: titleInput && "value" in titleInput ? String(titleInput.value || "").trim() : "",
+        bodyText: (document.body?.innerText || "").slice(0, 4000),
+      };
+    });
+
+    const draftResult = captured.raw?.result && typeof captured.raw.result === "object" ? captured.raw.result : {};
+    const summary = summarizeDraftVerificationResult(draftResult);
+    if (!summary.hasTitle && domState.titleInputValue) {
+      summary.hasTitle = true;
+      summary.title = domState.titleInputValue;
+    }
+    const ok = summary.hasTitle && summary.hasImages;
+    return {
+      ok,
+      reason: ok ? "verified" : "draft_shell_only",
+      summary,
+      domState,
+      rawResult: draftResult,
+    };
+  } finally {
+    page.off("response", listener);
+  }
 }
 
 async function searchCategoryAPI(page, searchTerm, options = {}) {
@@ -4771,6 +6244,7 @@ async function searchCategoryAPI(page, searchTerm, options = {}) {
     const rootResult = await temuXHR(page, "/anniston-agent-seller/category/children/list", { parentCatId: 0 }, { maxRetries: 2 });
     if (!rootResult.success) return null;
     const rootCats = rootResult.data?.categoryNodeVOS || [];
+    const rootChildrenMap = new Map();
 
     // 提取标题中的核心关键词（用分隔符切分后直接匹配）
     const titleClean = cleanStr(searchTerm);
@@ -4778,6 +6252,62 @@ async function searchCategoryAPI(page, searchTerm, options = {}) {
       ? refinementSegments
       : titleClean.split(/[|｜,，;；>》\s]+/).filter(s => s.length >= 2);
     console.error(`[category] Segments: ${segments.slice(0, 8).join(", ")}`);
+
+    function scoreCategoryName(candidateName, sourceSegments = []) {
+      const childName = cleanStr(candidateName);
+      let score = 0;
+      for (const seg of sourceSegments) {
+        if (childName.includes(seg)) score += seg.length * 2;
+        else if (seg.includes(childName)) score += childName.length * 2;
+        else {
+          for (let len = Math.min(4, seg.length); len >= 2; len--) {
+            for (let i = 0; i <= seg.length - len; i++) {
+              if (childName.includes(seg.slice(i, i + len))) {
+                score += len;
+                break;
+              }
+            }
+          }
+        }
+      }
+      return score;
+    }
+
+    function buildCatIdsFromPathNodes(pathNodes = []) {
+      const catIds = {};
+      pathNodes.forEach((node, index) => {
+        const level = index + 1;
+        catIds[`cat${level}Id`] = Number(node?.catId) || 0;
+        if (node?.catName) catIds[`cat${level}Name`] = node.catName;
+      });
+      for (let i = 1; i <= 10; i++) {
+        if (!catIds[`cat${i}Id`]) catIds[`cat${i}Id`] = 0;
+      }
+      catIds._path = pathNodes.map((node) => node?.catName).filter(Boolean).join(" > ");
+      return catIds;
+    }
+
+    async function scanTitleDescendants(parentId, pathNodes, depth = 0, maxDepth = 3) {
+      if (depth >= maxDepth) return null;
+      const childResult = await temuXHR(page, "/anniston-agent-seller/category/children/list", { parentCatId: parentId }, { maxRetries: 1 });
+      if (!childResult.success) return null;
+      const children = childResult.data?.categoryNodeVOS || [];
+      if (children.length === 0) return null;
+
+      let best = null;
+      for (const child of children) {
+        const nextPath = [...pathNodes, child];
+        const score = scoreCategoryName(child.catName, segments);
+        if (score > 0 && (!best || score > best.score)) {
+          best = { pathNodes: nextPath, score };
+        }
+        const nested = await scanTitleDescendants(child.catId, nextPath, depth + 1, maxDepth);
+        if (nested && (!best || nested.score > best.score)) {
+          best = nested;
+        }
+      }
+      return best;
+    }
 
     let bestCat = null;
     let bestScore = 0;
@@ -4787,26 +6317,10 @@ async function searchCategoryAPI(page, searchTerm, options = {}) {
       const childResult = await temuXHR(page, "/anniston-agent-seller/category/children/list", { parentCatId: root.catId }, { maxRetries: 1 });
       if (!childResult.success) continue;
       const children = childResult.data?.categoryNodeVOS || [];
+      rootChildrenMap.set(root.catId, children);
 
       for (const child of children) {
-        const childName = cleanStr(child.catName);
-        let score = 0;
-        for (const seg of segments) {
-          // 双向匹配：分类名包含片段，或片段包含分类名
-          if (childName.includes(seg)) score += seg.length * 2;
-          else if (seg.includes(childName)) score += childName.length * 2;
-          else {
-            // 子串匹配：片段中的任意2+字子串出现在分类名中
-            for (let len = Math.min(4, seg.length); len >= 2; len--) {
-              for (let i = 0; i <= seg.length - len; i++) {
-                if (childName.includes(seg.slice(i, i + len))) {
-                  score += len;
-                  break;
-                }
-              }
-            }
-          }
-        }
+        const score = scoreCategoryName(child.catName, segments);
         if (score > bestScore) {
           bestScore = score;
           bestCat = child;
@@ -4876,6 +6390,56 @@ async function searchCategoryAPI(page, searchTerm, options = {}) {
       // 如果没找到一级分类，走 fallback
       searchParts = [bestPath.split(" > ")[0], bestPath.split(" > ")[1]];
     } else {
+      let deepBest = null;
+      for (const root of rootCats) {
+        const children = rootChildrenMap.get(root.catId) || [];
+        for (const child of children) {
+          const childScore = scoreCategoryName(child.catName, segments);
+          if (childScore > 0 && (!deepBest || childScore > deepBest.score)) {
+            deepBest = { pathNodes: [root, child], score: childScore };
+          }
+          const nested = await scanTitleDescendants(child.catId, [root, child], 0, 3);
+          if (nested && (!deepBest || nested.score > deepBest.score)) {
+            deepBest = nested;
+          }
+        }
+      }
+
+      if (deepBest && deepBest.score > 0) {
+        console.error(`[category] Deep title match: ${deepBest.pathNodes.map((node) => node.catName).join(" > ")} (score=${deepBest.score})`);
+        const catIds = buildCatIdsFromPathNodes(deepBest.pathNodes);
+        let parentId = Number(deepBest.pathNodes[deepBest.pathNodes.length - 1]?.catId) || 0;
+
+        for (let level = deepBest.pathNodes.length + 1; level <= 10; level++) {
+          const childResult = await temuXHR(page, "/anniston-agent-seller/category/children/list", { parentCatId: parentId }, { maxRetries: 1 });
+          if (!childResult.success || !childResult.data?.categoryNodeVOS?.length) break;
+          const children = childResult.data.categoryNodeVOS;
+
+          let bestChild = null;
+          let bestChildScore = -1;
+          let otherChild = null;
+          for (const child of children) {
+            const cn = cleanStr(child.catName);
+            if (/^其[他它]/.test(cn)) otherChild = child;
+            const score = scoreCategoryName(child.catName, segments);
+            if (score > bestChildScore) { bestChildScore = score; bestChild = child; }
+          }
+
+          const selectedChild = bestChildScore > 0 ? bestChild : (otherChild || children[0]);
+          catIds[`cat${level}Id`] = selectedChild.catId;
+          catIds[`cat${level}Name`] = selectedChild.catName;
+          parentId = selectedChild.catId;
+          console.error(`[category] Level ${level}: auto-select → ${selectedChild.catId}:${selectedChild.catName}`);
+        }
+
+        for (let i = 1; i <= 10; i++) {
+          if (!catIds[`cat${i}Id`]) catIds[`cat${i}Id`] = 0;
+        }
+        catIds._path = Object.keys(catIds).filter(k => k.endsWith("Name") && catIds[k]).map(k => catIds[k]).join(" > ");
+        console.error(`[category] Final: ${catIds._path}`);
+        return { list: [catIds] };
+      }
+
       searchParts = [searchTerm];
       console.error(`[category] No title match, falling back to path search`);
     }
@@ -5961,11 +7525,27 @@ async function autoPricingFromCSV(params) {
   const nameEnIdx = colIndex(["商品标题（英文）", "title_en"]);
   const imageIdx = colIndex(["商品主图", "商品原图", "image"]);
   const carouselIdx = colIndex(["商品轮播图"]);
-  const catCnIdx = colIndex(["后台分类", "前台分类（中文）", "分类（中文）", "分类"]);
+  const frontCatCnIdx = colIndex(["前台分类（中文）"]);
+  const backCatCnIdx = colIndex(["后台分类"]);
+  const genericCatCnIdx = colIndex(["分类（中文）", "分类"]);
   const priceIdx = colIndex(["美元价格($)", "美元价格", "price"]);
+  const exactColIndex = (patterns) => headers.findIndex((columnName) => patterns.some((pattern) => pattern.test(String(columnName || "").trim())));
+  const directLeafCatIdx = exactColIndex([/^leafCatId$/i, /^leafCategoryId$/i, /^catId$/i, /^categoryId$/i, /^叶子类目ID$/i]);
+  const catIdsJsonIdx = exactColIndex([/^catIds$/i, /^categoryIds$/i]);
+  const goodsIdIdx = exactColIndex([/^商品ID$/i, /^goodsId$/i, /^goods_id$/i]);
+  const productIdIdx = exactColIndex([/^productId$/i, /^spuId$/i, /^SPU ID$/i]);
+  const productSkcIdIdx = exactColIndex([/^productSkcId$/i, /^skcId$/i, /^SKC ID$/i]);
+  const catIdIndexes = {};
+  const catNameIndexes = {};
+  for (let level = 1; level <= 10; level += 1) {
+    const catIdIdx = exactColIndex([new RegExp(`^cat${level}Id$`, "i")]);
+    const catNameIdx = exactColIndex([new RegExp(`^cat${level}Name$`, "i")]);
+    if (catIdIdx >= 0) catIdIndexes[`cat${level}Id`] = catIdIdx;
+    if (catNameIdx >= 0) catNameIndexes[`cat${level}Name`] = catNameIdx;
+  }
   const total = Math.max(0, Math.min(count, dataRows.length - startRow));
 
-  console.error(`[auto-pricing] Columns: name=${nameIdx}, image=${imageIdx}, cat=${catCnIdx}, price=${priceIdx}`);
+  console.error(`[auto-pricing] Columns: name=${nameIdx}, image=${imageIdx}, frontCat=${frontCatCnIdx}, backCat=${backCatCnIdx}, genericCat=${genericCatCnIdx}, leafCat=${directLeafCatIdx}, price=${priceIdx}`);
   if (imageIdx < 0) {
     const message = `未识别到商品原图列，当前表头：${headers.slice(0, 12).join(" | ")}`;
     const failedAt = getProgressTimestamp();
@@ -5987,7 +7567,7 @@ async function autoPricingFromCSV(params) {
   }
 
   console.error(`[auto-pricing] Will process ${total} products (dataRows=${dataRows.length})`);
-  console.error(`[auto-pricing] Columns: name=${nameIdx}, nameEn=${nameEnIdx}, image=${imageIdx}, carousel=${carouselIdx}, cat=${catCnIdx}, price=${priceIdx}`);
+  console.error(`[auto-pricing] Columns: name=${nameIdx}, nameEn=${nameEnIdx}, image=${imageIdx}, carousel=${carouselIdx}, frontCat=${frontCatCnIdx}, backCat=${backCatCnIdx}, genericCat=${genericCatCnIdx}, price=${priceIdx}`);
 
   // 创建临时目录
   const tmpDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "auto-pricing-tmp");
@@ -6028,9 +7608,29 @@ async function autoPricingFromCSV(params) {
     const productName = getCol(nameIdx) || getCol(nameEnIdx) || "";
     const imageUrl = getCol(imageIdx) || "";
     const carouselUrls = getCol(carouselIdx).split(",").map(s => s.trim()).filter(s => s.startsWith("http"));
-    const categoryCn = catCnIdx >= 0 ? normalizeCategoryText(cols[catCnIdx]) : "";
+    const frontCategoryCn = frontCatCnIdx >= 0 ? normalizeCategoryText(cols[frontCatCnIdx]) : "";
+    const backCategoryCn = backCatCnIdx >= 0 ? normalizeCategoryText(cols[backCatCnIdx]) : "";
+    const genericCategoryCn = genericCatCnIdx >= 0 ? normalizeCategoryText(cols[genericCatCnIdx]) : "";
+    const preferredCategoryCn = backCategoryCn || genericCategoryCn || frontCategoryCn;
+    const titleCategorySuffix = backCategoryCn || genericCategoryCn || frontCategoryCn;
     const priceUSD = priceIdx >= 0 ? normalizePriceNumber(cols[priceIdx], 0) : 0;
     const priceCNY = priceUSD > 0 ? priceUSD * 7 : 9.99;
+    const sourceProductId = goodsIdIdx >= 0 ? normalizeHistoryIdentifier(getCol(goodsIdIdx)) : "";
+    const sourceSpuId = productIdIdx >= 0 ? normalizeHistoryIdentifier(getCol(productIdIdx)) : "";
+    const sourceSkcId = productSkcIdIdx >= 0 ? normalizeHistoryIdentifier(getCol(productSkcIdIdx)) : "";
+    const directLeafCatId = directLeafCatIdx >= 0 ? (Number(getCol(directLeafCatIdx)) || 0) : 0;
+    const directCatIds = parseCategoryIdsCell(catIdsJsonIdx >= 0 ? getCol(catIdsJsonIdx) : "") || {};
+    for (const [key, idx] of Object.entries(catIdIndexes)) {
+      const nextId = Number(getCol(idx)) || 0;
+      if (nextId > 0) directCatIds[key] = nextId;
+    }
+    for (const [key, idx] of Object.entries(catNameIndexes)) {
+      const nextName = getCol(idx);
+      if (nextName) directCatIds[key] = nextName;
+    }
+    if (!directCatIds._path && (backCategoryCn || preferredCategoryCn)) {
+      directCatIds._path = backCategoryCn || preferredCategoryCn;
+    }
 
     const itemNum = i - startRow + 1;
 
@@ -6062,7 +7662,7 @@ async function autoPricingFromCSV(params) {
     });
     console.error(`\n[auto-pricing] ======== ${itemNum}/${total} ========`);
     console.error(`[auto-pricing] Title: ${productName.slice(0, 50)}`);
-    console.error(`[auto-pricing] Category: ${categoryCn}`);
+    console.error(`[auto-pricing] Category: front="${frontCategoryCn}" generic="${genericCategoryCn}" back="${backCategoryCn}"`);
     console.error(`[auto-pricing] Price: $${priceUSD} → ¥${priceCNY.toFixed(2)}`);
 
     try {
@@ -6194,23 +7794,46 @@ async function autoPricingFromCSV(params) {
       }
 
       // 标题末尾追加后台分类最后一级
-      if (categoryCn) {
-        const lastCat = categoryCn.split(/[/>]/).map(s => s.trim()).filter(Boolean).pop();
+      if (titleCategorySuffix) {
+        const lastCat = titleCategorySuffix.split(/[/>]/).map(s => s.trim()).filter(Boolean).pop();
         if (lastCat && !finalTitle.includes(lastCat)) {
           finalTitle = `${finalTitle}，${lastCat}`;
           console.error(`[auto-pricing] Title + category: ${finalTitle.slice(0, 80)}`);
         }
       }
 
-      // Step 6: 提交核价
-      // 分类搜索词优先级：CSV分类路径（含/，最精确） > AI分析分类 > 标题
+      // Step 6: 保存草稿
+      // 有表格类目时严格按表格类目走，避免被 AI/历史类目带偏
       const aiCategory = aiResult.analysis?.category?.split("(")?.[0]?.trim() || ""; // 取中文部分，如 "家庭清洁用品"
-      // 优先用CSV中的分类路径（如 "商用、工业与科技/职业安全用品"），再用AI分析的分类
-      const categorySearch = categoryCn || aiCategory || productName;
-      console.error(`[auto-pricing] Category search: CSV="${categoryCn}" AI="${aiCategory}" → using "${categorySearch}"`);
+      const categoryLockMode = (
+        directLeafCatId
+        || Object.keys(directCatIds).some((key) => key !== "_path")
+        || backCategoryCn
+      )
+        ? "strict"
+        : "guided";
+      const categorySearchVariants = categoryLockMode === "strict"
+        ? [backCategoryCn, genericCategoryCn, frontCategoryCn].map((value) => normalizeCategoryText(value)).filter(Boolean)
+        : buildGuidedCategorySearchVariants(
+            productName,
+            aiCategory,
+            backCategoryCn,
+          );
+      const categorySearch = categoryLockMode === "guided"
+        ? (aiCategory || productName)
+        : (preferredCategoryCn || aiCategory || productName);
+      const historicalDraftIds = collectHistoricalDraftIds({
+        csvPath,
+        index: i,
+        title: productName,
+        name: productName,
+      });
+      console.error(
+        `[auto-pricing] Category search: back="${backCategoryCn}" generic="${genericCategoryCn}" front="${frontCategoryCn}" AI="${aiCategory}" draftHits=${historicalDraftIds.length} → using "${categorySearch}"`
+      );
 
-      updateCurrentProgress({ step: "提交核价..." });
-      console.error(`[auto-pricing] Submitting pricing with ${orderedImageUrls.length} images...`);
+      updateCurrentProgress({ step: "保存草稿..." });
+      console.error(`[auto-pricing] Saving draft with ${orderedImageUrls.length} images...`);
       let createResult;
       for (let submitAttempt = 0; submitAttempt < 3; submitAttempt++) {
         try {
@@ -6219,6 +7842,15 @@ async function autoPricingFromCSV(params) {
             imageUrls: orderedImageUrls,
             price: priceCNY,
             categorySearch,
+            categorySearchVariants,
+            draftIdCandidates: historicalDraftIds,
+            sourceProductId,
+            goodsId: sourceProductId || undefined,
+            productId: sourceSpuId || undefined,
+            productSkcId: sourceSkcId || undefined,
+            leafCatId: directLeafCatId || undefined,
+            catIds: Object.keys(directCatIds).length > 0 ? directCatIds : undefined,
+            categoryLockMode,
             keepOpen: false,
             config: params.config,
           });
@@ -6245,10 +7877,10 @@ async function autoPricingFromCSV(params) {
       });
       syncCurrentProgressResults(results, {
         current: `${itemNum}/${total} ${productName.slice(0, 30)}`,
-        step: createResult.success ? "提交成功" : "提交失败",
-        message: createResult.success ? "当前商品提交成功" : (createResult.message || "当前商品提交失败"),
+        step: createResult.success ? "草稿保存成功" : "草稿保存失败",
+        message: createResult.success ? "当前商品已保存到Temu草稿箱" : (createResult.message || "当前商品保存草稿失败"),
       });
-      console.error(`[auto-pricing] ${createResult.success ? "SUCCESS productId=" + createResult.productId : "FAIL: " + createResult.message}`);
+      console.error(`[auto-pricing] ${createResult.success ? "SUCCESS draftId=" + (createResult.draftId || createResult.productId || "unknown") : "FAIL: " + createResult.message}`);
 
       // 清理临时文件
       for (const f of Object.values(localImages)) {
@@ -6331,13 +7963,15 @@ async function autoPricingFromCSV(params) {
 // 核价配置 — 可通过 params.config 覆盖
 // ============================================================
 const PRICING_CONFIG = {
-  retailPriceMultiplier: 1,        // 建议零售价 = 申报价 × N（默认1:1）
+  retailPriceMultiplier: 3,        // 建议零售价 = 申报价 × N（默认3:1）
   defaultWeight: 50000,            // 默认重量 (mg)，50g
   defaultDimensions: { len: 80, width: 70, height: 60 },  // 默认尺寸 (mm)
   defaultRegion: { countryShortName: "CN", region2Id: 43000000000031 }, // 浙江
   currency: "CNY",
   createEndpoint: "/visage-agent-seller/product/add",
   draftEndpoint: "/visage-agent-seller/product/draft/add",
+  draftSaveEndpoint: "/visage-agent-seller/product/draft/save",
+  draftListEndpoint: "/visage-agent-seller/product/draft/pageQuery",
   categoryTemplateEndpoint: "/anniston-agent-seller/category/template/query",
   specQueryEndpoint: "/anniston-agent-seller/sku/spec/byName/queryOrAdd",
   specParentEndpoint: "/anniston-agent-seller/sku/spec/parent/list",
@@ -6360,12 +7994,226 @@ function getCategoryPathText(catIds = {}) {
   ).trim();
 }
 
+function buildCategorySearchVariants(...values) {
+  const variants = [];
+  const seen = new Set();
+  const pushVariant = (value) => {
+    const candidate = String(value || "")
+      .replace(/[＞>｜|]+/g, "/")
+      .replace(/\s*\/\s*/g, "/")
+      .trim()
+      .replace(/^\/|\/$/g, "");
+    if (!candidate || seen.has(candidate)) return;
+    seen.add(candidate);
+    variants.push(candidate);
+  };
+  for (const value of values) {
+    const raw = String(value || "")
+      .replace(/[＞>｜|]+/g, "/")
+      .replace(/\s*\/\s*/g, "/")
+      .trim();
+    if (!raw) continue;
+    const normalizedPath = normalizeCategoryLookupText(raw);
+    const normalizedParts = normalizedPath.split("/").filter(Boolean);
+    const rawParts = raw.split("/").map((part) => part.trim()).filter(Boolean);
+
+    if (normalizedParts.length > 0) {
+      pushVariant(normalizedPath);
+      for (let start = 1; start < normalizedParts.length; start += 1) {
+        pushVariant(normalizedParts.slice(start).join("/"));
+      }
+      for (let index = normalizedParts.length - 1; index >= 0; index -= 1) {
+        pushVariant(normalizedParts[index]);
+      }
+    }
+
+    pushVariant(raw);
+    for (let start = 1; start < rawParts.length; start += 1) {
+      pushVariant(rawParts.slice(start).join("/"));
+    }
+    for (let index = rawParts.length - 1; index >= 0; index -= 1) {
+      pushVariant(rawParts[index]);
+    }
+  }
+  return variants;
+}
+
+function buildTitleCategoryFallbackTerms(title = "") {
+  const variants = [];
+  const seen = new Set();
+  const pushVariant = (value) => {
+    const candidate = String(value || "")
+      .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!candidate || candidate.length < 2 || seen.has(candidate)) return;
+    seen.add(candidate);
+    variants.push(candidate);
+  };
+
+  const normalizedTitle = String(title || "")
+    .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "")
+    .replace(/[【】\[\]{}]/g, " ")
+    .replace(/[()（）]/g, " ")
+    .replace(/[|｜,，;；、/]+/g, "\n")
+    .replace(/\s*[-—]+\s*/g, "\n")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalizedTitle) return variants;
+
+  const chunks = normalizedTitle
+    .split(/\n+/)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean);
+
+  for (const rawChunk of chunks) {
+    const chunk = rawChunk
+      .replace(/^[0-9０-９]+(?:\s*[xX×*]\s*[0-9０-９]+)?\s*(个装|套装|件装|只装|袋装|盒装|件套|pcs?|pc|个|套|件|只|条|袋|盒|包)\b/iu, "")
+      .replace(/^[一二三四五六七八九十百两]+\s*(个装|套装|件装|只装|袋装|盒装|件套|个|套|件|只|条|袋|盒|包)\b/u, "")
+      .replace(/^(新品|爆款|热卖|新款|现货)\s*/u, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!chunk) continue;
+
+    pushVariant(chunk);
+
+    const primaryChunk = chunk
+      .split(/适用于|用于|专为|可用于|兼容|搭配|适合/u)[0]
+      .trim();
+    if (primaryChunk && primaryChunk !== chunk) pushVariant(primaryChunk);
+
+    const compactChunk = chunk.replace(/\s+/g, "");
+    if (compactChunk.length > 18) pushVariant(compactChunk.slice(0, 18));
+    else pushVariant(compactChunk);
+
+    const productNounMatches = compactChunk.match(/[\u4e00-\u9fa5]{2,10}(?:收纳架|置物架|挂钩|支架|清洁刷|洗衣片|吸色片|护色片|清洁片|抹布|毛巾|纸巾|湿巾|垃圾袋|保鲜袋|保鲜膜|抽纸|牙刷|杯子|瓶子|盒子|挂架|篮子|拖把|扫把|刷子|夹子|袋子|盒|袋|片|布|巾|刷|架|钩|绳|网|盘|垫|贴|膜|罩|器|夹|杆|杯|瓶|桶|箱|套|链|锁)/gu) || [];
+    for (const match of productNounMatches) {
+      pushVariant(match);
+    }
+
+    if (compactChunk.length >= 4) {
+      for (const suffixLength of [8, 6, 5, 4, 3, 2]) {
+        if (compactChunk.length > suffixLength) pushVariant(compactChunk.slice(-suffixLength));
+      }
+    }
+  }
+
+  pushVariant(normalizedTitle.split(/\n+/)[0]);
+  pushVariant(normalizedTitle.replace(/\n+/g, " ").slice(0, 24));
+
+  return variants.slice(0, 8);
+}
+
+function buildGuidedCategorySearchVariants(title = "", aiCategory = "", ...categoryHints) {
+  const variants = [];
+  const seen = new Set();
+  const pushVariant = (value) => {
+    const candidate = String(value || "")
+      .replace(/[＞>｜|]+/g, "/")
+      .replace(/\s*\/\s*/g, "/")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/^\/|\/$/g, "");
+    if (!candidate || seen.has(candidate)) return;
+    seen.add(candidate);
+    variants.push(candidate);
+  };
+
+  for (const value of buildCategorySearchVariants(
+    ...buildTitleCategoryFallbackTerms(title),
+    aiCategory,
+    title,
+  )) {
+    pushVariant(value);
+  }
+
+  for (const rawHint of categoryHints) {
+    const hint = String(rawHint || "")
+      .replace(/[＞>｜|]+/g, "/")
+      .replace(/\s*\/\s*/g, "/")
+      .trim();
+    if (!hint) continue;
+    if (hint.includes("/")) continue;
+
+    const normalizedHint = normalizeCategoryLookupText(hint);
+    const rawParts = hint.split("/").map((part) => part.trim()).filter(Boolean);
+    const normalizedParts = normalizedHint.split("/").filter(Boolean);
+
+    const leafRaw = rawParts[rawParts.length - 1] || "";
+    const leafNormalized = normalizedParts[normalizedParts.length - 1] || "";
+    pushVariant(leafRaw);
+    pushVariant(leafNormalized);
+
+    for (const segment of extractCategoryRefinementSegments(leafRaw || leafNormalized)) {
+      pushVariant(segment);
+    }
+  }
+
+  return variants;
+}
+
 function getCategoryDepth(catIds = {}) {
   let depth = 0;
   for (let i = 1; i <= 10; i++) {
     if ((Number(catIds?.[`cat${i}Id`]) || 0) > 0) depth = i;
   }
   return depth;
+}
+
+async function findDraftCategoryMatch(page, draftIdCandidates = [], title = "") {
+  const normalizedDraftIds = Array.from(new Set(
+    (Array.isArray(draftIdCandidates) ? draftIdCandidates : [])
+      .map((value) => Number(value) || 0)
+      .filter((value) => value > 0)
+  ));
+  if (normalizedDraftIds.length === 0) return null;
+
+  const requestVariants = [
+    { page: 1, pageSize: 100 },
+  ];
+
+  for (const basePayload of requestVariants) {
+    for (let pageNumber = 1; pageNumber <= 3; pageNumber += 1) {
+      const payload = { ...basePayload };
+      if ("page" in payload) payload.page = pageNumber;
+      const result = await temuXHR(page, PRICING_CONFIG.draftListEndpoint, payload, { maxRetries: 1 });
+      if (!result.success) break;
+
+      const pageItems = Array.isArray(result.data?.pageItems)
+        ? result.data.pageItems
+        : (Array.isArray(result.data?.result?.pageItems)
+          ? result.data.result.pageItems
+          : (Array.isArray(result.data?.list)
+            ? result.data.list
+            : (Array.isArray(result.data?.result?.list) ? result.data.result.list : [])));
+      if (pageItems.length === 0) break;
+
+      let matchedDraft = null;
+      for (const draftId of normalizedDraftIds) {
+        matchedDraft = pageItems.find((item) => (Number(item?.productDraftId) || 0) === draftId);
+        if (matchedDraft) break;
+      }
+      if (matchedDraft?.categories) {
+        const extracted = extractCategoryIdsFromDraftCategories(matchedDraft.categories);
+        if (extracted?.leafCatId) {
+          console.error(`[api-create] Restored category from draft ${matchedDraft.productDraftId}: ${extracted.path || extracted.leafCatId}`);
+          rememberResolvedCategory({
+            title: title || matchedDraft.productName,
+            categorySearch: matchedDraft.productName || title,
+            catIds: extracted.catIds,
+            leafCatId: extracted.leafCatId,
+            path: extracted.path,
+            source: "draft_page_query",
+          });
+          return extracted;
+        }
+      }
+
+      if (pageItems.length < 100) break;
+    }
+  }
+
+  return null;
 }
 
 function selectPropertyValueByPatterns(propValues = [], patterns = []) {
@@ -6943,6 +8791,10 @@ function ruleBasedRepair(errorMsg) {
 async function createProductViaAPI(params) {
   console.error("[api-create] Starting API-based product creation...");
   const config = { ...PRICING_CONFIG, ...params.config };
+  const strictCategoryMode = params.categoryLockMode === "strict";
+  const guidedCategoryMode = params.categoryLockMode === "guided";
+  // 只有 strict 才完全锁定表格类目；guided 允许使用标题/历史/已知分支继续收敛到更合适的后台类目。
+  const protectedCategoryMode = strictCategoryMode;
 
   // Step 1: 打开 Temu 页面获取认证上下文
   const page = await createSellerCentralPage("/goods/list", {
@@ -7001,21 +8853,84 @@ async function createProductViaAPI(params) {
     await page.waitForTimeout(2000);
     console.error(`[api-create] Page refreshed before category search`);
 
-    let catIds = params.catIds;
-    let leafCatId = params.leafCatId;
-    if (!catIds) {
+    let catIds = extractCategoryIdsSnapshot(params.catIds);
+    let leafCatId = Number(params.leafCatId || params.leafCategoryId || params.catId || params.categoryId) || extractLeafCatIdFromCategoryIds(catIds);
+
+    if ((!catIds || getCategoryDepth(catIds) === 0) && !leafCatId) {
+      const exactHistoryMatch = findCategoryHistoryMatch({
+        sourceProductId: params.sourceProductId,
+        goodsId: params.goodsId,
+        productId: params.productId,
+        productSkcId: params.productSkcId,
+        title: params.title,
+        categorySearch: params.categorySearch,
+      });
+      if (exactHistoryMatch?._exactIdentifierMatch) {
+        catIds = { ...(exactHistoryMatch.catIds || {}) };
+        if (exactHistoryMatch.path && !catIds._path) catIds._path = exactHistoryMatch.path;
+        leafCatId = Number(exactHistoryMatch.leafCatId) || 0;
+        console.error(`[api-create] Restored exact backend category from local cache: ${exactHistoryMatch.path || leafCatId}`);
+      }
+    }
+
+    if (!protectedCategoryMode && leafCatId && (!catIds || getCategoryDepth(catIds) === 0)) {
+      const directLeafMatch = findCategoryHistoryMatch({
+        leafCatId,
+        sourceProductId: params.sourceProductId,
+        goodsId: params.goodsId,
+        productId: params.productId,
+        productSkcId: params.productSkcId,
+        title: params.title,
+        categorySearch: params.categorySearch,
+      });
+      if (directLeafMatch) {
+        catIds = {
+          ...(directLeafMatch.catIds || {}),
+          ...(catIds || {}),
+        };
+        if (!catIds._path && directLeafMatch.path) catIds._path = directLeafMatch.path;
+        leafCatId = Number(directLeafMatch.leafCatId) || leafCatId;
+        console.error(`[api-create] Restored direct leaf category from history: ${directLeafMatch.path || directLeafMatch.categorySearch || leafCatId} (leaf=${leafCatId}, score=${directLeafMatch._score})`);
+      } else {
+        catIds = catIds || {};
+        console.error(`[api-create] Using direct leaf category: ${leafCatId}`);
+      }
+    }
+
+    let categorySearchTerms = [];
+    if (!catIds || getCategoryDepth(catIds) === 0) {
       // 后台分类路径搜索 + 逐级 fallback
-      const searchTerms = [];
-      if (params.categorySearch) {
-        searchTerms.push(params.categorySearch);
-        // fallback: 逐级从最后一级往上搜
-        const parts = params.categorySearch.split("/").map(s => s.trim()).filter(Boolean);
-        for (let i = parts.length - 1; i >= 0; i--) {
-          if (!searchTerms.includes(parts[i])) searchTerms.push(parts[i]);
+      const titleFallbackTerms = strictCategoryMode ? [] : buildTitleCategoryFallbackTerms(params.title);
+      const searchTerms = strictCategoryMode
+        ? buildCategorySearchVariants(
+            ...(Array.isArray(params.categorySearchVariants) ? params.categorySearchVariants : []),
+            params.categorySearch,
+          )
+        : buildCategorySearchVariants(
+            ...(Array.isArray(params.categorySearchVariants) ? params.categorySearchVariants : []),
+            params.categorySearch,
+            ...titleFallbackTerms,
+          );
+      if (!strictCategoryMode && params.title && !searchTerms.includes(params.title)) searchTerms.push(params.title);
+      if (searchTerms.length === 0) searchTerms.push("通用商品");
+      categorySearchTerms = searchTerms.slice();
+      const compatibilityHints = guidedCategoryMode
+        ? searchTerms.filter((term) => !normalizeCategoryLookupText(term).includes("/"))
+        : searchTerms;
+      if (guidedCategoryMode && compatibilityHints.length === 0 && params.title) compatibilityHints.push(params.title);
+
+      // strict 模式也允许走“确定性已知分支”回退：
+      // 这仍然是按表格后台分类 + 标题语义在本地已知类目树里收敛，
+      // 不会引入 AI/历史草稿的漂移，但能避免后台分类只有宽词时搜索失败。
+      if (shouldPreferKnownCategoryBranch(searchTerms, params.title || "")) {
+        const preferredKnownBranchMatch = await resolveKnownCategoryBranchFallback(page, searchTerms, params.title || "");
+        if (preferredKnownBranchMatch?.leafCatId && isCategoryCandidateCompatible(preferredKnownBranchMatch, searchTerms)) {
+          catIds = { ...(preferredKnownBranchMatch.catIds || {}) };
+          if (preferredKnownBranchMatch.path && !catIds._path) catIds._path = preferredKnownBranchMatch.path;
+          leafCatId = Number(preferredKnownBranchMatch.leafCatId) || 0;
+          console.error(`[api-create] Preferred known branch category: ${preferredKnownBranchMatch.path || leafCatId}`);
         }
       }
-      if (params.title && !searchTerms.includes(params.title)) searchTerms.push(params.title);
-      if (searchTerms.length === 0) searchTerms.push("通用商品");
 
       // 辅助函数：从 queryCatHints 响应中提取 catIds
       function extractCatIdsFromHints(hintsResult, categoryPath) {
@@ -7080,19 +8995,24 @@ async function createProductViaAPI(params) {
       }
 
       // 方法1: 分类树遍历（主方法）— 用后台分类路径精确匹配
-      {
+      if (!leafCatId) {
         for (const term of searchTerms) {
           if (catIds) break;
           console.error(`[api-create] Fallback searchCategoryAPI: "${term.slice(0, 50)}"`);
           const catResult = await searchCategoryAPI(page, term, { title: params.title });
           if (catResult?.list?.[0]) {
             const cat = catResult.list[0];
-            catIds = {};
+            const candidateCatIds = {};
             for (let i = 1; i <= 10; i++) {
-              catIds[`cat${i}Id`] = cat[`cat${i}Id`] || 0;
-              if (cat[`cat${i}Name`]) catIds[`cat${i}Name`] = cat[`cat${i}Name`];
+              candidateCatIds[`cat${i}Id`] = cat[`cat${i}Id`] || 0;
+              if (cat[`cat${i}Name`]) candidateCatIds[`cat${i}Name`] = cat[`cat${i}Name`];
             }
-            if (cat._path) catIds._path = cat._path;
+            if (cat._path) candidateCatIds._path = cat._path;
+            if (!isCategoryCandidateCompatible({ catIds: candidateCatIds, path: candidateCatIds._path }, compatibilityHints)) {
+              console.error(`[api-create] Reject mismatched category candidate: ${candidateCatIds._path || JSON.stringify(candidateCatIds)}`);
+              continue;
+            }
+            catIds = candidateCatIds;
             for (let i = 10; i >= 1; i--) {
               if (catIds[`cat${i}Id`] > 0) { leafCatId = catIds[`cat${i}Id`]; break; }
             }
@@ -7102,12 +9022,52 @@ async function createProductViaAPI(params) {
       }
     }
 
-    if (!catIds || !leafCatId) {
-      // Final check: all catIds zero means search failed
-      const allZero = catIds && Object.values(catIds).every(v => v === 0);
-      if (!catIds || allZero || !leafCatId) {
-        return { success: false, message: `分类搜索失败: "${params.categorySearch || params.title}"`, step: "category" };
+    const requestedCategoryHints = categorySearchTerms.length > 0
+      ? categorySearchTerms
+      : [params.categorySearch, ...(Array.isArray(params.categorySearchVariants) ? params.categorySearchVariants : [])].filter(Boolean);
+
+    if (!leafCatId) {
+      const knownBranchMatch = await resolveKnownCategoryBranchFallback(page, categorySearchTerms, params.title || "");
+      if (knownBranchMatch?.leafCatId) {
+        catIds = { ...(knownBranchMatch.catIds || {}) };
+        if (knownBranchMatch.path && !catIds._path) catIds._path = knownBranchMatch.path;
+        leafCatId = Number(knownBranchMatch.leafCatId) || 0;
+        console.error(`[api-create] Resolved category from known branch fallback: ${knownBranchMatch.path || leafCatId}`);
       }
+    }
+
+    if (!protectedCategoryMode && !leafCatId) {
+      const historyMatch = findCategoryHistoryMatch({
+        title: params.title,
+        categorySearch: params.categorySearch,
+        catIds,
+      });
+      if (historyMatch && isCategoryCandidateCompatible(historyMatch, categorySearchTerms.length > 0 ? categorySearchTerms : [params.categorySearch])) {
+        catIds = {
+          ...(historyMatch.catIds || {}),
+          ...(catIds || {}),
+        };
+        if (!catIds._path && historyMatch.path) catIds._path = historyMatch.path;
+        leafCatId = Number(historyMatch.leafCatId) || 0;
+        console.error(`[api-create] Restored category from local history: ${historyMatch.path || historyMatch.categorySearch || leafCatId} (leaf=${leafCatId}, score=${historyMatch._score})`);
+      } else if (historyMatch) {
+        console.error(`[api-create] Ignored mismatched history category: ${historyMatch.path || historyMatch.categorySearch || historyMatch.leafCatId}`);
+      }
+    }
+
+    if (!protectedCategoryMode && !leafCatId) {
+      const draftMatch = await findDraftCategoryMatch(page, params.draftIdCandidates, params.title || "");
+      if (draftMatch?.leafCatId && isCategoryCandidateCompatible(draftMatch, categorySearchTerms.length > 0 ? categorySearchTerms : [params.categorySearch])) {
+        catIds = { ...(draftMatch.catIds || {}) };
+        if (draftMatch.path && !catIds._path) catIds._path = draftMatch.path;
+        leafCatId = Number(draftMatch.leafCatId) || 0;
+      } else if (draftMatch?.leafCatId) {
+        console.error(`[api-create] Ignored mismatched draft category: ${draftMatch.path || draftMatch.leafCatId}`);
+      }
+    }
+
+    if (!leafCatId) {
+      return { success: false, message: `分类搜索失败: "${params.categorySearch || params.title}"`, step: "category" };
     }
 
     // 确保 leafCatId 不为 undefined
@@ -7118,8 +9078,10 @@ async function createProductViaAPI(params) {
       console.error(`[api-create] Re-extracted leafCatId=${leafCatId} from catIds`);
     }
 
+    catIds = catIds || {};
+
     // Step 3.5: AI 验证分类是否匹配商品标题
-    if (catIds && params.title && AI_API_KEY) {
+    if (!strictCategoryMode && catIds && params.title && AI_API_KEY) {
       const catPath = catIds._path || Object.keys(catIds)
         .filter(k => k.endsWith("Name") && catIds[k])
         .map(k => catIds[k]).join(" > ");
@@ -7146,17 +9108,23 @@ async function createProductViaAPI(params) {
               const titleCatResult = await searchCategoryAPI(page, params.title, { title: params.title });
               if (titleCatResult?.list?.[0]) {
                 const cat = titleCatResult.list[0];
-                catIds = {};
+                const nextCatIds = {};
                 for (let i = 1; i <= 10; i++) {
-                  catIds[`cat${i}Id`] = cat[`cat${i}Id`] || 0;
-                  if (cat[`cat${i}Name`]) catIds[`cat${i}Name`] = cat[`cat${i}Name`];
+                  nextCatIds[`cat${i}Id`] = cat[`cat${i}Id`] || 0;
+                  if (cat[`cat${i}Name`]) nextCatIds[`cat${i}Name`] = cat[`cat${i}Name`];
                 }
-                if (cat._path) catIds._path = cat._path;
-                for (let i = 10; i >= 1; i--) {
-                  if (catIds[`cat${i}Id`] > 0) { leafCatId = catIds[`cat${i}Id`]; break; }
+                if (cat._path) nextCatIds._path = cat._path;
+                if (!isCategoryCandidateCompatible({ catIds: nextCatIds, path: nextCatIds._path }, requestedCategoryHints)) {
+                  console.error(`[api-create] Ignore mismatched title re-search category: ${nextCatIds._path || JSON.stringify(nextCatIds)}`);
+                } else {
+                  catIds = nextCatIds;
+                  leafCatId = 0;
+                  for (let i = 10; i >= 1; i--) {
+                    if (catIds[`cat${i}Id`] > 0) { leafCatId = catIds[`cat${i}Id`]; break; }
+                  }
+                  const newPath = Object.keys(catIds).filter(k => k.endsWith("Name") && catIds[k]).map(k => catIds[k]).join(" > ");
+                  console.error(`[api-create] Re-searched category: ${newPath}, leaf=${leafCatId}`);
                 }
-                const newPath = Object.keys(catIds).filter(k => k.endsWith("Name") && catIds[k]).map(k => catIds[k]).join(" > ");
-                console.error(`[api-create] Re-searched category: ${newPath}, leaf=${leafCatId}`);
               }
             }
           }
@@ -7164,13 +9132,29 @@ async function createProductViaAPI(params) {
       }
     }
 
-    const betterCategory = await findBetterLeafCategoryByTemplate(page, catIds, leafCatId, params.title || "");
-    if (betterCategory?.catId) {
-      catIds = { ...(betterCategory.catIds || catIds) };
-      leafCatId = Number(betterCategory.catId) || leafCatId;
-      catIds._path = betterCategory.path;
-      console.error(`[api-create] Category corrected by template scan: ${betterCategory.path} (leaf=${leafCatId})`);
+    if (!strictCategoryMode) {
+      const betterCategory = await findBetterLeafCategoryByTemplate(page, catIds, leafCatId, params.title || "");
+      if (betterCategory?.catId && isCategoryCandidateCompatible(betterCategory, requestedCategoryHints)) {
+        catIds = { ...(betterCategory.catIds || catIds) };
+        leafCatId = Number(betterCategory.catId) || leafCatId;
+        catIds._path = betterCategory.path;
+        console.error(`[api-create] Category corrected by template scan: ${betterCategory.path} (leaf=${leafCatId})`);
+      } else if (betterCategory?.catId) {
+        console.error(`[api-create] Ignore mismatched template-scan category: ${betterCategory.path || betterCategory.catId}`);
+      }
     }
+    rememberResolvedCategory({
+      title: params.title,
+      categorySearch: params.categorySearch,
+      catIds,
+      leafCatId,
+      path: getCategoryPathText(catIds),
+      sourceProductId: params.sourceProductId,
+      goodsId: params.goodsId,
+      productId: params.productId,
+      productSkcId: params.productSkcId,
+      source: "resolved",
+    });
 
     // Step 4: 获取分类属性和规格
     let properties = params.properties;
@@ -7314,12 +9298,14 @@ async function createProductViaAPI(params) {
       productOriginCertFileReqs: [],
     };
     syncLeafCategoryPayloadFields(payload, leafCatId);
+    syncDraftPayloadDisplayFields(payload, params, imageUrls);
 
-    // Step 6: 提交核价
-    console.error(`[api-create] Submitting to ${config.createEndpoint}...`);
+    // Step 6: 保存到 Temu 草稿箱
+    const submitEndpoint = config.draftEndpoint;
+    console.error(`[api-create] Saving draft to ${submitEndpoint}...`);
     console.error(`[api-create] Price: ¥${(priceInCents / 100).toFixed(2)}, Retail: ¥${(retailPrice / 100).toFixed(2)}, Images: ${imageUrls.length}, Props: ${properties.length}`);
 
-    let result = await temuXHR(page, config.createEndpoint, payload, { maxRetries: 1 });
+    let result = await temuXHR(page, submitEndpoint, payload, { maxRetries: 1 });
 
     // ============ AI 自修复系统：最多5轮，根据错误类型智能修复 ============
     for (let attempt = 1; attempt <= 5 && !result.success; attempt++) {
@@ -7395,37 +9381,75 @@ async function createProductViaAPI(params) {
             break;
           }
           case "retry_category": {
+            if (strictCategoryMode) {
+              console.error("[selfRepair] retry_category skipped: strict category mode");
+              break;
+            }
             console.error(`[selfRepair] retry_category: re-searching with different terms...`);
             await page.goto(page.url(), { waitUntil: "domcontentloaded" });
             await randomDelay(2000, 3500);
 
-            // 尝试多种搜索词：原标题 → 类目路径中的关键词 → 标题前20字
-            const searchTerms = [];
-            if (params.title) searchTerms.push(params.title);
-            if (params.categorySearch) {
-              const parts = params.categorySearch.split("/").map(s => s.trim()).filter(Boolean);
-              // 从最后一级开始尝试
-              for (let i = parts.length - 1; i >= 0; i--) searchTerms.push(parts[i]);
-            }
-            if (params.title && params.title.length > 20) searchTerms.push(params.title.substring(0, 20));
+            // 尝试多种搜索词：原标题 → 归一化类目路径 → 标题前20字
+            const titleFallbackTerms = buildTitleCategoryFallbackTerms(params.title);
+            const searchTerms = guidedCategoryMode
+              ? buildGuidedCategorySearchVariants(
+                  params.title,
+                  "",
+                  ...(Array.isArray(params.categorySearchVariants) ? params.categorySearchVariants : []),
+                  params.categorySearch,
+                )
+              : buildCategorySearchVariants(
+                  params.categorySearch,
+                  ...titleFallbackTerms,
+                  params.title && params.title.length > 20 ? params.title.substring(0, 20) : "",
+                );
+            if (params.title && !searchTerms.includes(params.title)) searchTerms.unshift(params.title);
 
             let found = false;
+            if (shouldPreferKnownCategoryBranch(searchTerms, params.title || "")) {
+              const knownBranchMatch = await resolveKnownCategoryBranchFallback(page, searchTerms, params.title || "");
+              if (knownBranchMatch?.leafCatId && isCategoryCandidateCompatible(knownBranchMatch, searchTerms)) {
+                catIds = { ...(knownBranchMatch.catIds || catIds) };
+                if (knownBranchMatch.path) catIds._path = knownBranchMatch.path;
+                leafCatId = Number(knownBranchMatch.leafCatId) || leafCatId;
+                for (let i = 1; i <= 10; i += 1) {
+                  payload[`cat${i}Id`] = Number(catIds[`cat${i}Id`]) || 0;
+                }
+                syncLeafCategoryPayloadFields(payload, leafCatId);
+                const newProps = await getCategoryProperties(page, leafCatId, params.title || "");
+                if (newProps && newProps.length > 0) payload.productPropertyReqs = newProps;
+                console.error(`[selfRepair] Preferred known branch category: ${knownBranchMatch.path || leafCatId}`);
+                needResubmit = true;
+                found = true;
+              }
+            }
             for (const term of searchTerms) {
               if (found) break;
               console.error(`[selfRepair] Trying category search: "${term.substring(0, 30)}..."`);
               const catResult = await searchCategoryAPI(page, term, { title: params.title });
               if (catResult?.list?.[0]) {
                 const cat = catResult.list[0];
+                const candidateCatIds = {};
+                for (let i = 1; i <= 10; i++) {
+                  const cid = cat[`cat${i}Id`] || 0;
+                  candidateCatIds[`cat${i}Id`] = cid;
+                  if (cat[`cat${i}Name`]) candidateCatIds[`cat${i}Name`] = cat[`cat${i}Name`];
+                }
+                if (cat._path) candidateCatIds._path = cat._path;
+                if (!isCategoryCandidateCompatible({ catIds: candidateCatIds, path: candidateCatIds._path }, searchTerms)) {
+                  console.error(`[selfRepair] Reject mismatched category candidate: ${candidateCatIds._path || JSON.stringify(candidateCatIds)}`);
+                  continue;
+                }
                 let newLeaf = null;
                 let depth = 0;
                 for (let i = 1; i <= 10; i++) {
-                  const cid = cat[`cat${i}Id`] || 0;
+                  const cid = candidateCatIds[`cat${i}Id`] || 0;
                   catIds[`cat${i}Id`] = cid;
-                  if (cat[`cat${i}Name`]) catIds[`cat${i}Name`] = cat[`cat${i}Name`];
+                  if (candidateCatIds[`cat${i}Name`]) catIds[`cat${i}Name`] = candidateCatIds[`cat${i}Name`];
                   payload[`cat${i}Id`] = cid;
                   if (cid > 0) { newLeaf = cid; depth = i; }
                 }
-                if (cat._path) catIds._path = cat._path;
+                if (candidateCatIds._path) catIds._path = candidateCatIds._path;
                 // 只接受比当前更深或不同的类目
                 if (newLeaf && (newLeaf !== leafCatId || depth > 3)) {
                   leafCatId = newLeaf;
@@ -7438,6 +9462,23 @@ async function createProductViaAPI(params) {
                 } else {
                   console.error(`[selfRepair] Same/shallow category (depth=${depth}), trying next term...`);
                 }
+              }
+            }
+            if (!found) {
+              const knownBranchMatch = await resolveKnownCategoryBranchFallback(page, searchTerms, params.title || "");
+              if (knownBranchMatch?.leafCatId) {
+                catIds = { ...(knownBranchMatch.catIds || catIds) };
+                if (knownBranchMatch.path) catIds._path = knownBranchMatch.path;
+                leafCatId = Number(knownBranchMatch.leafCatId) || leafCatId;
+                for (let i = 1; i <= 10; i += 1) {
+                  payload[`cat${i}Id`] = Number(catIds[`cat${i}Id`]) || 0;
+                }
+                syncLeafCategoryPayloadFields(payload, leafCatId);
+                const newProps = await getCategoryProperties(page, leafCatId, params.title || "");
+                if (newProps && newProps.length > 0) payload.productPropertyReqs = newProps;
+                console.error(`[selfRepair] Known branch fallback category: ${knownBranchMatch.path || leafCatId}`);
+                needResubmit = true;
+                found = true;
               }
             }
             break;
@@ -7486,20 +9527,91 @@ async function createProductViaAPI(params) {
         break;
       }
 
-      console.error(`[selfRepair] Re-submitting after repair...`);
-      result = await temuXHR(page, config.createEndpoint, payload, { maxRetries: 1 });
+      console.error(`[selfRepair] Re-submitting draft after repair...`);
+      result = await temuXHR(page, submitEndpoint, payload, { maxRetries: 1 });
     }
 
     if (result.success) {
-      console.error(`[api-create] SUCCESS! productId=${result.data?.productId}`);
+      const draftId = result.data?.productDraftId || result.data?.draftId || result.data?.productId || 0;
+      console.error(`[api-create] SUCCESS! draftId=${draftId}`);
+      if (!draftId) {
+        return {
+          success: false,
+          message: "Temu 返回成功，但未拿到 draftId",
+          step: "draft_create",
+          draftSaved: false,
+        };
+      }
+      const savePayload = {
+        ...payload,
+        productDraftId: draftId,
+        draftId,
+      };
+      console.error(`[api-create] Saving draft content to ${config.draftSaveEndpoint}...`);
+      const saveResult = await temuXHR(page, config.draftSaveEndpoint, savePayload, { maxRetries: 1 });
+      if (!saveResult.success) {
+        const debugDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
+        fs.mkdirSync(debugDir, { recursive: true });
+        const debugFile = path.join(debugDir, `draft_save_failed_${Date.now()}.json`);
+        fs.writeFileSync(debugFile, JSON.stringify({
+          params: { title: params.title, price: params.price, categorySearch: params.categorySearch },
+          payload: savePayload,
+          response: saveResult.raw || saveResult,
+          draftId,
+        }, null, 2));
+        console.error(`[api-create] Draft save failed, details saved to: ${debugFile}`);
+        return {
+          success: false,
+          message: saveResult.errorMsg || "Temu 草稿内容保存失败",
+          step: "draft_save",
+          draftId,
+          draftSaved: false,
+          debugFile,
+          uploadedImageUrls: imageUrls,
+        };
+      }
+      result = saveResult;
+      const verification = await verifyDraftPersistedContent(page, draftId, { logPrefix: "[draft-verify]" }).catch((error) => ({
+        ok: false,
+        reason: "verify_error",
+        error: error?.message || String(error),
+        summary: { hasTitle: false, hasImages: false, hasSpecs: false },
+      }));
       await saveCookies();
+      if (!verification?.ok) {
+        const debugDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
+        fs.mkdirSync(debugDir, { recursive: true });
+        const debugFile = path.join(debugDir, `draft_verify_failed_${Date.now()}.json`);
+        fs.writeFileSync(debugFile, JSON.stringify({
+          params: { title: params.title, price: params.price, categorySearch: params.categorySearch },
+          payload,
+          response: result.data,
+          verification,
+        }, null, 2));
+        console.error(`[api-create] Draft verification failed, details saved to: ${debugFile}`);
+        return {
+          success: false,
+          message: "草稿箱只创建了空白草稿，标题/图片未真正保存",
+          step: "draft_verify",
+          productId: result.data?.productId,
+          draftId,
+          result: result.data,
+          draftSaved: false,
+          debugFile,
+          verification,
+          uploadedImageUrls: imageUrls,
+        };
+      }
       return {
         success: true,
-        message: "商品已创建并提交核价",
+        message: "商品已保存到Temu草稿箱（已校验标题和图片）",
         productId: result.data?.productId,
+        draftId,
         skcId: result.data?.productSkcList?.[0]?.productSkcId,
         skuId: result.data?.productSkuList?.[0]?.productSkuId,
         result: result.data,
+        draftSaved: true,
+        verification,
       };
     } else {
       console.error(`[api-create] Failed: ${result.errorCode} - ${result.errorMsg}`);
@@ -7511,30 +9623,13 @@ async function createProductViaAPI(params) {
       fs.writeFileSync(debugFile, JSON.stringify({ params: { title: params.title, price: params.price, categorySearch: params.categorySearch }, payload, response: result.raw }, null, 2));
       console.error(`[api-create] Debug payload saved to: ${debugFile}`);
 
-      // 尝试保存到 Temu 草稿箱（用 draft/add 接口）
-      let draftSaved = false;
-      try {
-        console.error(`[api-create] Saving to Temu drafts...`);
-        const draftResult = await temuXHR(page, config.draftEndpoint, payload, { maxRetries: 1 });
-        if (draftResult.success) {
-          draftSaved = true;
-          console.error(`[api-create] Saved to Temu drafts! draftId=${draftResult.data?.productId || draftResult.data?.draftId || "unknown"}`);
-        } else {
-          console.error(`[api-create] Temu draft save failed: ${draftResult.errorMsg}`);
-        }
-      } catch (e) {
-        console.error(`[api-create] Temu draft save error: ${e.message}`);
-      }
-
       return {
         success: false,
-        message: draftSaved
-          ? "核价失败，已保存到Temu草稿箱"
-          : (result.errorMsg || "核价提交失败"),
+        message: result.errorMsg || "保存Temu草稿箱失败",
         errorCode: result.errorCode,
         step: "submit",
         debugFile,
-        draftSaved,
+        draftSaved: false,
         uploadedImageUrls: imageUrls,
       };
     }
@@ -7569,6 +9664,7 @@ async function batchCreateViaAPI(params) {
   const csvContent = fs.readFileSync(csvPath, "utf8");
   const lines = csvContent.split("\n").filter(l => l.trim());
   const headers = lines[0];
+  const headerCols = headers.split(",").map(c => c.trim().replace(/^"|"$/g, ""));
   const startRow = params.startRow || 0;
   const count = params.count || 1;
   const intervalMin = normalizeIntervalMinutes(params.intervalMin, DEFAULT_PRODUCT_INTERVAL_MIN);
@@ -7578,21 +9674,36 @@ async function batchCreateViaAPI(params) {
 
   // 解析CSV列（支持多种列名）
   const colIndex = (names) => {
-    const cols = headers.split(",").map(c => c.trim().replace(/^"|"$/g, ""));
     for (const name of names) {
-      const idx = cols.findIndex(c => c.includes(name));
+      const idx = headerCols.findIndex(c => c.includes(name));
       if (idx >= 0) return idx;
     }
     return -1;
   };
+  const exactColIndex = (patterns) => headerCols.findIndex((columnName) => patterns.some((pattern) => pattern.test(columnName)));
   const nameIdx = colIndex(["商品名称", "title", "productName", "name"]);
   const imageIdx = colIndex(["商品原图", "image", "imageUrl", "图片"]);
   const imagesIdx = colIndex(["imageUrls", "多图", "images"]); // 多图列（用 | 分隔）
-  const catIdx = colIndex(["分类（中文）", "分类关键词", "category", "分类"]);
+  const frontCatIdx = colIndex(["前台分类（中文）"]);
+  const backCatIdx = colIndex(["后台分类"]);
+  const genericCatIdx = colIndex(["分类（中文）", "分类关键词", "category", "分类"]);
   const priceIdx = colIndex(["美元价格", "price", "价格", "USD"]);
   const priceCnyIdx = colIndex(["人民币价格", "priceCNY", "申报价"]);
+  const directLeafCatIdx = exactColIndex([/^leafCatId$/i, /^leafCategoryId$/i, /^catId$/i, /^categoryId$/i, /^叶子类目ID$/i]);
+  const catIdsJsonIdx = exactColIndex([/^catIds$/i, /^categoryIds$/i]);
+  const goodsIdIdx = exactColIndex([/^商品ID$/i, /^goodsId$/i, /^goods_id$/i]);
+  const productIdIdx = exactColIndex([/^productId$/i, /^spuId$/i, /^SPU ID$/i]);
+  const productSkcIdIdx = exactColIndex([/^productSkcId$/i, /^skcId$/i, /^SKC ID$/i]);
+  const catIdColumnIndexes = {};
+  const catNameColumnIndexes = {};
+  for (let level = 1; level <= 10; level += 1) {
+    const catIdIdx = exactColIndex([new RegExp(`^cat${level}Id$`, "i")]);
+    const catNameIdx = exactColIndex([new RegExp(`^cat${level}Name$`, "i")]);
+    if (catIdIdx >= 0) catIdColumnIndexes[`cat${level}Id`] = catIdIdx;
+    if (catNameIdx >= 0) catNameColumnIndexes[`cat${level}Name`] = catNameIdx;
+  }
 
-  console.error(`[batch-api] Columns: name=${nameIdx}, image=${imageIdx}, images=${imagesIdx}, cat=${catIdx}, price=${priceIdx}, priceCNY=${priceCnyIdx}`);
+  console.error(`[batch-api] Columns: name=${nameIdx}, image=${imageIdx}, images=${imagesIdx}, frontCat=${frontCatIdx}, backCat=${backCatIdx}, genericCat=${genericCatIdx}, leafCat=${directLeafCatIdx}, price=${priceIdx}, priceCNY=${priceCnyIdx}`);
 
   function parseCSVLine(line) {
     const result = [];
@@ -7612,9 +9723,28 @@ async function batchCreateViaAPI(params) {
   for (let i = startRow; i < startRow + total; i++) {
     const cols = parseCSVLine(lines[i + 1]);
     const productName = (nameIdx >= 0 ? cols[nameIdx] : "") || "";
-    const categoryCn = normalizeCategoryText((catIdx >= 0 ? cols[catIdx] : "") || "");
+    const frontCategoryCn = normalizeCategoryText((frontCatIdx >= 0 ? cols[frontCatIdx] : "") || "");
+    const backCategoryCn = normalizeCategoryText((backCatIdx >= 0 ? cols[backCatIdx] : "") || "");
+    const genericCategoryCn = normalizeCategoryText((genericCatIdx >= 0 ? cols[genericCatIdx] : "") || "");
+    const preferredCategoryCn = backCategoryCn || genericCategoryCn || frontCategoryCn;
     const priceUSD = priceIdx >= 0 ? normalizePriceNumber(cols[priceIdx], 0) : 0;
     const priceCNY = priceCnyIdx >= 0 ? normalizePriceNumber(cols[priceCnyIdx], 0) : (priceUSD > 0 ? priceUSD * 7 : 9.99);
+    const sourceProductId = goodsIdIdx >= 0 ? normalizeHistoryIdentifier(cols[goodsIdIdx]) : "";
+    const sourceSpuId = productIdIdx >= 0 ? normalizeHistoryIdentifier(cols[productIdIdx]) : "";
+    const sourceSkcId = productSkcIdIdx >= 0 ? normalizeHistoryIdentifier(cols[productSkcIdIdx]) : "";
+    const directLeafCatId = directLeafCatIdx >= 0 ? (Number(cols[directLeafCatIdx]) || 0) : 0;
+    const directCatIds = parseCategoryIdsCell(catIdsJsonIdx >= 0 ? cols[catIdsJsonIdx] : "") || {};
+    for (const [key, idx] of Object.entries(catIdColumnIndexes)) {
+      const nextId = Number(cols[idx]) || 0;
+      if (nextId > 0) directCatIds[key] = nextId;
+    }
+    for (const [key, idx] of Object.entries(catNameColumnIndexes)) {
+      const nextName = String(cols[idx] || "").trim();
+      if (nextName) directCatIds[key] = nextName;
+    }
+    if (!directCatIds._path && (backCategoryCn || preferredCategoryCn)) {
+      directCatIds._path = backCategoryCn || preferredCategoryCn;
+    }
 
     // 图片处理：优先多图列，否则单图列，最后用默认图
     let imageUrls = [];
@@ -7650,13 +9780,32 @@ async function batchCreateViaAPI(params) {
     }
 
     try {
+      const categoryLockMode = (directLeafCatId > 0 || Object.keys(directCatIds).some((key) => key !== "_path") || Boolean(backCategoryCn))
+        ? "strict"
+        : "guided";
       const createParams = {
         title: productName,
         price: priceCNY,
-        categorySearch: categoryCn || productName, // 用分类名或标题搜索
+        categorySearch: categoryLockMode === "guided"
+          ? productName
+          : (preferredCategoryCn || productName),
+        categorySearchVariants: categoryLockMode === "strict"
+          ? [backCategoryCn, genericCategoryCn, frontCategoryCn].map((value) => normalizeCategoryText(value)).filter(Boolean)
+          : buildGuidedCategorySearchVariants(
+              productName,
+              "",
+              backCategoryCn,
+            ),
+        categoryLockMode,
         keepOpen: false,
         config: params.config,
+        sourceProductId,
+        goodsId: sourceProductId || undefined,
+        productId: sourceSpuId || undefined,
+        productSkcId: sourceSkcId || undefined,
       };
+      if (directLeafCatId > 0) createParams.leafCatId = directLeafCatId;
+      if (Object.keys(directCatIds).length > 0) createParams.catIds = directCatIds;
 
       // 图片来源：已有 kwcdn URLs 或 AI 生成
       if (imageUrls.length > 0) {
@@ -7688,7 +9837,7 @@ async function batchCreateViaAPI(params) {
           delete retryParams.generateAI;
         }
         result = await createProductViaAPI(retryParams);
-        if (!result.success) {
+        if (!result.success && retryParams.categoryLockMode !== "strict") {
           console.error(`[batch-api] RETRY 2: trying different category...`);
           await randomDelay(1000, 2000);
           // 第二次重试：用商品标题搜索分类

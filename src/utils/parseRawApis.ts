@@ -156,6 +156,92 @@ function normalizeProductStatus(value: any): string {
   return toStringValue(value);
 }
 
+function normalizeSiteLabel(value: any): string {
+  if (value === null || value === undefined || value === "") return "";
+  if (typeof value === "number") {
+    if (value === 0) return "国内备货";
+    return String(value);
+  }
+
+  const text = toStringValue(value).trim();
+  if (!text) return "";
+  if (/^(国内备货|国内站|中国站|cn|domestic|domestic_stock)$/i.test(text)) return "国内备货";
+  if (/^(海外备货|国际站|global|overseas)$/i.test(text)) return "海外备货";
+  return text;
+}
+
+function normalizeSalesSiteLabel(item: any, inventoryInfo: any = {}): string {
+  const rawSite = pickFirst(
+    item.siteName,
+    item.siteLabel,
+    item.siteTypeName,
+    item.stockSiteName,
+    item.stockSiteTypeName,
+    item.inventoryRegionName,
+    item.inventoryRegion,
+    item.stationName,
+    item.stationLabel,
+    item.marketName,
+    item.market,
+    item.prepareSiteName,
+    item.skcSiteStatusName,
+    item.skcSiteStatus,
+    inventoryInfo.siteName,
+    inventoryInfo.siteLabel,
+    inventoryInfo.siteTypeName,
+    inventoryInfo.inventoryRegionName,
+    inventoryInfo.inventoryRegion,
+  );
+
+  if (rawSite === 0 || rawSite === 1 || rawSite === "0" || rawSite === "1") return "国内备货";
+  if (rawSite === 2 || rawSite === "2") return "海外备货";
+  return normalizeSiteLabel(rawSite);
+}
+
+function normalizeTodaySalesValue(item: any): number {
+  const quantityInfo = item?.skuQuantityTotalInfo || item?.skuQuantityTotalInfoVO || {};
+  return toNumberValue(
+    pickFirst(
+      item.todaySaleVolume,
+      item.todaySales,
+      item.todaySaleNum,
+      item.todaySaleQuantity,
+      item.todayPaySaleVolume,
+      quantityInfo.todaySaleVolume,
+      item.todayPayNum,
+      item.todayOrderNum,
+      item.saleVolumeToday,
+      item.curDaySaleVolume,
+    ),
+  );
+}
+
+function normalizeProductSkuSummary(item: any) {
+  const specList = toArray(item?.productSkuSpecList).map((spec: any) => ({
+    parentSpecName: toStringValue(spec?.parentSpecName),
+    specName: toStringValue(spec?.specName),
+    unitSpecName: toStringValue(spec?.unitSpecName),
+  }));
+
+  const specText = specList
+    .map((spec) => {
+      const name = spec.parentSpecName || "规格";
+      const value = spec.specName || spec.unitSpecName;
+      return value ? `${name}: ${value}` : "";
+    })
+    .filter(Boolean)
+    .join(" / ");
+
+  return {
+    productSkuId: toStringValue(pickFirst(item?.productSkuId, item?.skuId)),
+    thumbUrl: toStringValue(pickFirst(item?.thumbUrl, item?.imageUrl, item?.mainImageUrl)),
+    productSkuSpecList: specList,
+    specText,
+    specName: toStringValue(pickFirst(specList[0]?.specName, item?.specName)),
+    extCode: toStringValue(pickFirst(item?.extCode, item?.skuExtCode, item?.skuCode)),
+  };
+}
+
 function normalizeProductsFromList(items: any[], syncedAt = ""): any[] {
   return items.map((item: any) => {
     const categories = normalizeCategoryPath(
@@ -183,6 +269,7 @@ function normalizeProductsFromList(items: any[], syncedAt = ""): any[] {
       .map((sku: any) => toStringValue(pickFirst(sku.extCode, sku.skuExtCode, sku.skuCode)))
       .filter(Boolean)
       .join(", ");
+    const skuSummaries = toArray(item.productSkuSummaries || item.skuList).map(normalizeProductSkuSummary);
 
     return {
       title: toStringValue(pickFirst(item.productName, item.title, item.goodsName)),
@@ -192,17 +279,84 @@ function normalizeProductsFromList(items: any[], syncedAt = ""): any[] {
       skcId: toStringValue(pickFirst(item.productSkcId, item.skcId, item.skcExtId)),
       goodsId: toStringValue(item.goodsId),
       sku: toStringValue(pickFirst(item.extCode, item.skuExtCode, item.skuCode, skuExtCodes)),
+      extCode: toStringValue(pickFirst(item.extCode, item.skuExtCode, item.skuCode)),
       imageUrl: toStringValue(pickFirst(item.thumbUrl, item.mainImageUrl, item.goodsImageUrl, item.imageUrl)),
+      siteLabel: normalizeSiteLabel(
+        pickFirst(
+          item.siteName,
+          item.siteLabel,
+          item.siteTypeName,
+          item.stockSiteTypeName,
+          item.skcSiteStatusName,
+          item.skcSiteStatus,
+        ),
+      ),
       price: toStringValue(item.price),
       status: normalizeProductStatus(pickFirst(item.removeStatus, item.status)),
+      removeStatus: pickFirst(item.removeStatus, item.status),
+      productType: toStringValue(pickFirst(item.productTypeName, item.productType)),
+      sourceType: toStringValue(pickFirst(item.sourceTypeName, item.sourceType)),
       totalSales: toNumberValue(pickFirst(item.productTotalSalesVolume, item.totalSales)),
       last7DaysSales: toNumberValue(pickFirst(item.last7DaysSalesVolume, item.lastSevenDaysSalesVolume, item.last7DaysSales)),
       skcStatus: item.skcStatus,
       skcSiteStatus: item.skcSiteStatus,
+      flowLimitStatus: toStringValue(item.flowLimitStatus),
+      skuSummaries,
       createdAt: pickFirst(item.createdAt, item.createTime),
       syncedAt,
     };
   });
+}
+
+export function parseProductCountSummary(raw: any) {
+  const emptySummary = {
+    totalCount: 0,
+    onSaleCount: 0,
+    notPublishedCount: 0,
+    offSaleCount: 0,
+  };
+
+  if (!isRawApiFormat(raw)) return emptySummary;
+
+  const apis = getRawApis(raw);
+  const countResult = pickFirst(
+    findApi(apis, "product/skc/countStatus"),
+    findApi(apis, "countStatus"),
+  );
+
+  const countList = toArray(
+    pickFirst(
+      countResult?.skcTopStatusCountList,
+      countResult?.countStatusList,
+      countResult?.list,
+    ),
+  );
+
+  if (countList.length === 0) return emptySummary;
+
+  const summary = { ...emptySummary };
+  countList.forEach((item: any) => {
+    const status = String(
+      pickFirst(
+        item?.skcTopStatus,
+        item?.status,
+        item?.statusCode,
+        item?.key,
+      ) ?? "",
+    );
+    const count = toNumberValue(pickFirst(item?.count, item?.num, item?.value));
+    if (status === "0") summary.totalCount = count;
+    if (status === "100") summary.onSaleCount = count;
+    if (status === "200") summary.notPublishedCount = count;
+    if (status === "300") summary.offSaleCount = count;
+  });
+
+  if (!summary.totalCount) {
+    summary.totalCount =
+      summary.onSaleCount + summary.notPublishedCount + summary.offSaleCount;
+  }
+
+  return summary;
 }
 
 function dedupeByKey<T>(items: T[], getKey: (item: T) => string): T[] {
@@ -218,21 +372,55 @@ function dedupeByKey<T>(items: T[], getKey: (item: T) => string): T[] {
 }
 
 function normalizeSalesFlatItem(item: any, syncedAt = "") {
-  const inventoryInfo = item.inventoryNumInfo || item.inventoryInfo || {};
+  const quantityInfo = item.skuQuantityTotalInfo || item.skuQuantityTotalInfoVO || {};
+  const inventoryInfo = item.inventoryNumInfo || item.inventoryInfo || quantityInfo.inventoryNumInfo || {};
   return {
     key: toStringValue(pickFirst(item.key, item.skuId, item.productSkcId, item.skcId, item.spuId)),
     title: toStringValue(pickFirst(item.productName, item.title, item.goodsName)),
     category: normalizeCategoryPath(pickFirst(item.category, item.categories, item.categoryTree)),
     skcId: toStringValue(pickFirst(item.productSkcId, item.skcId, item.skcExtId)),
     spuId: toStringValue(pickFirst(item.productId, item.spuId, item.productSpuId)),
+    goodsId: toStringValue(item.goodsId),
     imageUrl: toStringValue(pickFirst(item.productSkcPicture, item.imageUrl, item.goodsImageUrl)),
-    todaySales: toNumberValue(pickFirst(item.todaySaleVolume, item.todaySales)),
-    last7DaysSales: toNumberValue(pickFirst(item.lastSevenDaysSaleVolume, item.last7DaysSales)),
-    last30DaysSales: toNumberValue(pickFirst(item.lastThirtyDaysSaleVolume, item.last30DaysSales)),
-    totalSales: toNumberValue(pickFirst(item.totalSaleVolume, item.totalSales)),
+    siteLabel: normalizeSalesSiteLabel(item, inventoryInfo),
+    skuId: toStringValue(pickFirst(item.skuId, item.productSkuId)),
+    skuName: toStringValue(pickFirst(item.skuName, item.name, item.skuAttributeName, item.attributeName)),
+    todaySales: normalizeTodaySalesValue(item),
+    last7DaysSales: toNumberValue(
+      pickFirst(
+        item.lastSevenDaysSaleVolume,
+        item.last7DaysSales,
+        item.last7DaySaleVolume,
+        item.sevenDaysSaleVolume,
+        item.nearSevenDaysSaleVolume,
+        quantityInfo.lastSevenDaysSaleVolume,
+      ),
+    ),
+    last30DaysSales: toNumberValue(
+      pickFirst(
+        item.lastThirtyDaysSaleVolume,
+        item.last30DaysSales,
+        item.last30DaySaleVolume,
+        item.thirtyDaysSaleVolume,
+        item.nearThirtyDaysSaleVolume,
+        quantityInfo.lastThirtyDaysSaleVolume,
+      ),
+    ),
+    totalSales: toNumberValue(
+      pickFirst(
+        item.totalSaleVolume,
+        item.totalSales,
+        item.accumulatedSaleVolume,
+        item.historySaleVolume,
+        quantityInfo.totalSaleVolume,
+      ),
+    ),
     warehouseStock: toNumberValue(pickFirst(inventoryInfo.warehouseInventoryNum, item.warehouseStock)),
-    adviceQuantity: toNumberValue(pickFirst(item.adviceQuantity, item.suggestStock)),
-    lackQuantity: toNumberValue(item.lackQuantity),
+    adviceQuantity: toNumberValue(pickFirst(item.adviceQuantity, item.suggestStock, quantityInfo.adviceQuantity)),
+    lackQuantity: toNumberValue(pickFirst(item.lackQuantity, quantityInfo.lackQuantity)),
+    occupyStock: toNumberValue(pickFirst(inventoryInfo.occupyInventoryNum, item.occupyStock)),
+    unavailableStock: toNumberValue(pickFirst(inventoryInfo.unavailableInventoryNum, item.unavailableStock)),
+    warehouseGroup: toStringValue(pickFirst(item.warehouseGroup, item.warehouseGroupName, inventoryInfo.warehouseGroup)),
     price: pickFirst(
       item.price,
       item.supplierPrice !== undefined ? formatFenPrice(item.supplierPrice) : "",
@@ -242,32 +430,92 @@ function normalizeSalesFlatItem(item: any, syncedAt = "") {
     supplyStatus: normalizeSupplyStatus(pickFirst(item.supplyStatusName, item.supplyStatus)),
     hotTag: toStringValue(pickFirst(item.hotTag?.tagName, item.hotTag, item.hotSaleTag)),
     isAdProduct: item.isAdProduct ? "广告商品" : toStringValue(item.isAdProduct),
-    availableSaleDays: pickFirst(item.availableSaleDays, inventoryInfo.availableSaleDays, null),
+    availableSaleDays: pickFirst(item.availableSaleDays, quantityInfo.availableSaleDays, inventoryInfo.availableSaleDays, null),
+    asfScore: item.asfScore ?? "",
+    buyerName: toStringValue(item.buyerName),
+    buyerUid: toStringValue(item.buyerUid),
+    commentNum: toNumberValue(item.commentNum),
+    inBlackList: item.inBlackList === undefined || item.inBlackList === null || item.inBlackList === ""
+      ? ""
+      : (item.inBlackList ? "是" : "否"),
+    pictureAuditStatus: toStringValue(pickFirst(item.pictureAuditStatusName, item.pictureAuditStatus)),
+    qualityAfterSalesRate: item.qualityAfterSalesRate ?? item.qualityAfterSalesRateValue ?? "",
+    predictTodaySaleVolume: toNumberValue(pickFirst(item.predictTodaySaleVolume, quantityInfo.predictTodaySaleVolume)),
+    sevenDaysSaleReference: toNumberValue(pickFirst(item.sevenDaysSaleReference, quantityInfo.sevenDaysSaleReference)),
     syncedAt,
   };
 }
 
 function normalizeSalesItemsFromSkuList(items: any[], syncedAt = ""): any[] {
   return items.flatMap((item: any, itemIndex: number) =>
-    toArray(item.skuList).map((sku: any, skuIndex: number) => ({
-      key: `${itemIndex}-${skuIndex}`,
-      title: toStringValue(pickFirst(item.productName, item.title)),
-      category: normalizeCategoryPath(item.category),
-      skcId: toStringValue(pickFirst(item.skcId, item.productSkcId)),
-      spuId: toStringValue(pickFirst(item.spuId, item.productId)),
-      imageUrl: toStringValue(pickFirst(item.imageUrl, item.productSkcPicture)),
-      skuId: toStringValue(sku.skuId),
-      skuName: toStringValue(pickFirst(sku.skuName, sku.name)),
-      skuCode: toStringValue(pickFirst(sku.skuCode, sku.extCode, sku.skuExtCode)),
-      price: toNumberValue(sku.price),
-      warehouseStock: toNumberValue(sku.warehouseStock),
-      occupyStock: toNumberValue(sku.occupyStock),
-      unavailableStock: toNumberValue(sku.unavailableStock),
-      warehouseGroup: toStringValue(sku.warehouseGroup),
-      suggestStock: toNumberValue(sku.suggestStock),
-      stockStatus: toStringValue(sku.stockStatus),
-      syncedAt,
-    })),
+    toArray(item.skuList).map((sku: any, skuIndex: number) => {
+      const quantityInfo = item.skuQuantityTotalInfo || item.skuQuantityTotalInfoVO || {};
+      return {
+        key: `${itemIndex}-${skuIndex}`,
+        title: toStringValue(pickFirst(item.productName, item.title)),
+        category: normalizeCategoryPath(item.category),
+        skcId: toStringValue(pickFirst(item.skcId, item.productSkcId)),
+        spuId: toStringValue(pickFirst(item.spuId, item.productId)),
+        goodsId: toStringValue(item.goodsId),
+        imageUrl: toStringValue(pickFirst(item.imageUrl, item.productSkcPicture)),
+        siteLabel: normalizeSalesSiteLabel(sku, item),
+        skuId: toStringValue(sku.skuId),
+        skuName: toStringValue(pickFirst(sku.skuName, sku.name)),
+        skuCode: toStringValue(pickFirst(sku.skuCode, sku.extCode, sku.skuExtCode)),
+        todaySales: normalizeTodaySalesValue({ ...item, ...sku }),
+        last7DaysSales: toNumberValue(
+          pickFirst(
+            sku.lastSevenDaysSaleVolume,
+            sku.last7DaysSales,
+            item.lastSevenDaysSaleVolume,
+            item.last7DaysSales,
+            quantityInfo.lastSevenDaysSaleVolume,
+          ),
+        ),
+        last30DaysSales: toNumberValue(
+          pickFirst(
+            sku.lastThirtyDaysSaleVolume,
+            sku.last30DaysSales,
+            item.lastThirtyDaysSaleVolume,
+            item.last30DaysSales,
+            quantityInfo.lastThirtyDaysSaleVolume,
+          ),
+        ),
+        totalSales: toNumberValue(
+          pickFirst(
+            sku.totalSaleVolume,
+            sku.totalSales,
+            item.totalSaleVolume,
+            item.totalSales,
+            quantityInfo.totalSaleVolume,
+          ),
+        ),
+        price: toNumberValue(sku.price),
+        warehouseStock: toNumberValue(sku.warehouseStock),
+        adviceQuantity: toNumberValue(pickFirst(sku.adviceQuantity, sku.suggestStock, item.adviceQuantity, item.suggestStock, quantityInfo.adviceQuantity)),
+        lackQuantity: toNumberValue(pickFirst(sku.lackQuantity, item.lackQuantity, quantityInfo.lackQuantity)),
+        occupyStock: toNumberValue(sku.occupyStock),
+        unavailableStock: toNumberValue(sku.unavailableStock),
+        warehouseGroup: toStringValue(sku.warehouseGroup),
+        suggestStock: toNumberValue(sku.suggestStock),
+        stockStatus: toStringValue(sku.stockStatus),
+        supplyStatus: normalizeSupplyStatus(pickFirst(sku.supplyStatusName, sku.supplyStatus, item.supplyStatusName, item.supplyStatus)),
+        hotTag: toStringValue(pickFirst(sku.hotTag?.tagName, sku.hotTag, item.hotTag?.tagName, item.hotTag, item.hotSaleTag)),
+        availableSaleDays: pickFirst(sku.availableSaleDays, item.availableSaleDays, quantityInfo.availableSaleDays, null),
+        asfScore: item.asfScore ?? "",
+        buyerName: toStringValue(item.buyerName),
+        buyerUid: toStringValue(item.buyerUid),
+        commentNum: toNumberValue(item.commentNum),
+        inBlackList: item.inBlackList === undefined || item.inBlackList === null || item.inBlackList === ""
+          ? ""
+          : (item.inBlackList ? "是" : "否"),
+        pictureAuditStatus: toStringValue(pickFirst(item.pictureAuditStatusName, item.pictureAuditStatus)),
+        qualityAfterSalesRate: item.qualityAfterSalesRate ?? item.qualityAfterSalesRateValue ?? "",
+        predictTodaySaleVolume: toNumberValue(pickFirst(sku.predictTodaySaleVolume, item.predictTodaySaleVolume, quantityInfo.predictTodaySaleVolume)),
+        sevenDaysSaleReference: toNumberValue(pickFirst(sku.sevenDaysSaleReference, item.sevenDaysSaleReference, quantityInfo.sevenDaysSaleReference)),
+        syncedAt,
+      };
+    }),
   );
 }
 
@@ -488,6 +736,7 @@ export function parseSalesData(raw: any): any {
     adSkcNum: toNumberValue(overallRaw.adSkcNum),
     shortageSkcNum: toNumberValue(overallRaw.shortageSkcNum),
     totalSkcNum: toNumberValue(overallRaw.totalSkcNum),
+    addedToSiteSkcNum: toNumberValue(overallRaw.addedToSiteSkcNum),
   };
 
   const itemSources = [

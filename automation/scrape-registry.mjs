@@ -27,7 +27,7 @@ export const SCRAPE_TASKS = {
   mainPages:      { type: "page", path: "/" },
 
   // ---- 商品管理 ----
-  lifecycle:      { type: "page", path: "/newon/product-select" },
+  lifecycle:      { type: "custom", path: "/newon/product-select" },
   checkup:        { type: "page", path: "/goods/checkup-center" },
   usRetrieval:    { type: "page", path: "/goods/retrieval-board" },
   retailPrice:    { type: "page", path: "/goods/recommended-retail-price" },

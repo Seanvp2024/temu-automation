@@ -1,6 +1,7 @@
 export const ACCOUNT_STORE_KEY = "temu_accounts";
 export const ACTIVE_ACCOUNT_ID_KEY = "temu_active_account_id";
 export const ACTIVE_ACCOUNT_CHANGED_EVENT = "temu:active-account-changed";
+export const STORE_VALUE_UPDATED_EVENT = "temu:store-value-updated";
 
 export interface MultiStoreAccount {
   id: string;
@@ -124,6 +125,17 @@ export function emitActiveAccountChanged(accountId: string | null) {
   );
 }
 
+export function emitStoreValueUpdated(baseKey: string, accountId: string | null = null) {
+  window.dispatchEvent(
+    new CustomEvent(STORE_VALUE_UPDATED_EVENT, {
+      detail: {
+        baseKey,
+        accountId: accountId || null,
+      },
+    }),
+  );
+}
+
 export async function syncScopedDataToGlobalStore(store: StoreLike, accountId: string | null) {
   if (!store) return;
 
@@ -162,11 +174,16 @@ export async function setStoreValueForActiveAccount(store: StoreLike, baseKey: s
 
   await store.set(baseKey, value);
   if (!ACCOUNT_SCOPED_BASE_KEYS.includes(baseKey as typeof ACCOUNT_SCOPED_BASE_KEYS[number])) {
+    emitStoreValueUpdated(baseKey, null);
     return;
   }
 
   const activeAccountId = await readActiveAccountId(store);
-  if (!activeAccountId) return;
+  if (!activeAccountId) {
+    emitStoreValueUpdated(baseKey, null);
+    return;
+  }
 
   await store.set(buildScopedStoreKey(activeAccountId, baseKey), value);
+  emitStoreValueUpdated(baseKey, activeAccountId);
 }

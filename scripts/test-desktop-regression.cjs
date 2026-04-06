@@ -69,6 +69,10 @@ async function waitForPlaceholder(page, text, timeout = 45000) {
   await page.getByPlaceholder(text).first().waitFor({ state: "visible", timeout });
 }
 
+async function waitForPlaceholderContains(page, text, timeout = 45000) {
+  await page.locator(`input[placeholder*="${text}"]`).first().waitFor({ state: "visible", timeout });
+}
+
 async function clickMenuItem(page, label) {
   const item = page.locator(".ant-layout-sider").getByText(label, { exact: true }).first();
   await item.waitFor({ state: "visible", timeout: 30000 });
@@ -364,7 +368,7 @@ async function runUiChecks(page) {
   console.log("[ok] 店铺概览页面");
 
   await clickMenuItem(page, "商品管理");
-  await waitForPlaceholder(page, "搜索商品名称/SKC/SPU/货号");
+  await waitForPlaceholderContains(page, "搜索商品名称");
   await page.getByRole("button", { name: "查看详情" }).first().waitFor({ state: "visible", timeout: 45000 });
   console.log("[ok] 商品列表页面");
 
@@ -375,19 +379,19 @@ async function runUiChecks(page) {
   console.log("[ok] 商品详情页面");
 
   await page.getByRole("button", { name: "返回" }).first().click();
-  await waitForPlaceholder(page, "搜索商品名称/SKC/SPU/货号");
+  await waitForPlaceholderContains(page, "搜索商品名称");
 
   await clickMenuItem(page, "上品管理");
   await waitForVisibleText(page, "上传商品表格");
   console.log("[ok] 上品管理页面");
 
   await clickMenuItem(page, "AI 出图");
-  await waitForVisibleText(page, "拖拽商品图片到此处", 90000);
+  await page.getByRole("button", { name: "历史记录" }).waitFor({ state: "visible", timeout: 90000 });
   await page.getByRole("button", { name: "历史记录" }).click();
   await waitForVisibleText(page, "历史记录");
   await waitForVisibleText(page, "自动化回归测试商品");
   await page.keyboard.press("Escape");
-  await waitForVisibleText(page, "拖拽商品图片到此处");
+  await page.getByRole("button", { name: "历史记录" }).waitFor({ state: "visible", timeout: 30000 });
   console.log("[ok] AI 出图页面");
 
   await clickMenuItem(page, "数据采集");

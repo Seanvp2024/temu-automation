@@ -97,6 +97,38 @@ function getResultRowMeta(item: any, index: number) {
   return `来源行：第 ${rowNumber} 行`;
 }
 
+function getResultSuccessIdentity(item: any) {
+  return (
+    item?.productDraftId
+    || item?.draftId
+    || item?.productId
+    || item?.skcId
+    || item?.skuId
+    || item?.result?.productDraftId
+    || item?.result?.draftId
+    || item?.result?.productId
+    || item?.result?.skcId
+    || item?.result?.skuId
+    || ""
+  );
+}
+
+function getResultSuccessDetail(item: any) {
+  const draftId = item?.productDraftId || item?.draftId || item?.result?.productDraftId || item?.result?.draftId;
+  const productId = item?.productId || item?.result?.productId;
+  const skcId = item?.skcId || item?.result?.skcId;
+  const skuId = item?.skuId || item?.result?.skuId;
+
+  const parts = [
+    draftId ? `草稿ID: ${draftId}` : "",
+    productId ? `商品ID: ${productId}` : "",
+    skcId ? `SKC ID: ${skcId}` : "",
+    skuId ? `SKU ID: ${skuId}` : "",
+  ].filter(Boolean);
+
+  return parts.join(" · ") || "保存成功";
+}
+
 function getBatchStatusLabel(status: string, running: boolean, paused: boolean) {
   if (paused) return "已暂停";
   if (status === "paused") return "已暂停";
@@ -525,7 +557,7 @@ function BatchCreate() {
   const visibleTaskHistory = taskHistory.slice(0, 3);
   const resultRows = results
     .map((item: any, index: number) => ({
-      key: `${item?.index ?? index}-${item?.productId ?? item?.message ?? ""}`,
+      key: `${item?.index ?? index}-${getResultSuccessIdentity(item) || item?.message || ""}`,
       ...item,
       displayName: getResultDisplayName(item, index),
       rowMeta: getResultRowMeta(item, index),
@@ -807,7 +839,7 @@ function BatchCreate() {
                   key: "message",
                   ellipsis: true,
                   render: (value: string, record: any) => record.success
-                    ? <span style={{ color: SUCCESS_COLOR }}>{`ID: ${record.productId}`}</span>
+                    ? <span style={{ color: SUCCESS_COLOR }}>{getResultSuccessDetail(record)}</span>
                     : <span style={{ color: "#ff4d4f" }}>{value || "未返回错误信息"}</span>,
                 },
               ]}

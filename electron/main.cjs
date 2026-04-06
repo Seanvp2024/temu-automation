@@ -524,6 +524,7 @@ function attachWorkerCredentials(action, params = {}) {
     return {
       ...nextParams,
       credentials: {
+        accountId: typeof nextParams.accountId === "string" ? nextParams.accountId.trim() : "",
         phone: loginPhone,
         password: typeof nextParams.password === "string" ? nextParams.password : "",
       },

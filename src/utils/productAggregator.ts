@@ -15,6 +15,7 @@ export interface AggregatedProduct {
   goodsId: string;
   skcId: string;
   spuId: string;
+  siteLabel: string;
   status: string;
   // 销售
   todaySales: number;
@@ -92,6 +93,7 @@ export async function aggregateProducts(): Promise<AggregatedProduct[]> {
       id: skcId || goodsId || spuId || `name:${nameKey}`,
       title: title || "", category: "", categories: "",
       imageUrl: ids.imageUrl || "", goodsId: goodsId || "", skcId: skcId || "", spuId: spuId || "",
+      siteLabel: "",
       status: "",
       todaySales: 0, last7DaysSales: 0, last30DaysSales: 0, totalSales: 0, price: "",
       exposeNum: 0, clickNum: 0, detailVisitNum: 0, addToCartUserNum: 0,
@@ -124,6 +126,7 @@ export async function aggregateProducts(): Promise<AggregatedProduct[]> {
     prod.category = p.category || prod.category;
     prod.categories = p.categories || prod.categories;
     prod.imageUrl = p.imageUrl || prod.imageUrl;
+    prod.siteLabel = p.siteLabel || prod.siteLabel;
     prod.status = p.status || prod.status;
     prod.totalSales = p.totalSales || prod.totalSales;
     prod.skcId = String(p.skcId || "") || prod.skcId;
@@ -164,6 +167,7 @@ export async function aggregateProducts(): Promise<AggregatedProduct[]> {
     });
     prod.title = prod.title || s.title || "";
     prod.imageUrl = prod.imageUrl || s.imageUrl || "";
+    prod.siteLabel = prod.siteLabel || s.siteLabel || "";
     prod.todaySales = s.todaySales || 0;
     prod.last7DaysSales = s.last7DaysSales || 0;
     prod.last30DaysSales = s.last30DaysSales || 0;

@@ -37,6 +37,71 @@ function normalizeLoginPhone(value = "") {
   return digits || raw;
 }
 
+async function findVisibleInput(page, selectors = []) {
+  for (const selector of selectors) {
+    const locator = page.locator(selector);
+    const count = await locator.count().catch(() => 0);
+    for (let index = 0; index < count; index += 1) {
+      const candidate = locator.nth(index);
+      const visible = await candidate.isVisible().catch(() => false);
+      const editable = await candidate.isEditable().catch(() => false);
+      if (visible && editable) return candidate;
+    }
+  }
+  return null;
+}
+
+async function fillInputVerified(input, value, options = {}) {
+  const {
+    label = "输入框",
+    logPrefix = "[input]",
+    normalize = (next) => String(next ?? "").trim(),
+    delayProvider = () => getTypingDelay(),
+  } = options;
+  const expected = normalize(value);
+  const readValue = async () => normalize(
+    await input.inputValue().catch(async () => input.evaluate((node) => node?.value || ""))
+  );
+  const clearInput = async () => {
+    await input.click({ clickCount: 3 }).catch(() => {});
+    await input.press("Control+A").catch(() => {});
+    await input.press("Backspace").catch(() => {});
+    await input.fill("").catch(() => {});
+    await input.evaluate((node) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(node, "");
+      node.dispatchEvent(new Event("input", { bubbles: true }));
+      node.dispatchEvent(new Event("change", { bubbles: true }));
+    }).catch(() => {});
+  };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await clearInput();
+    await randomDelay(120, 240);
+
+    if (attempt < 2) {
+      for (const char of String(value ?? "")) {
+        await input.type(char, { delay: delayProvider() });
+      }
+    } else {
+      await input.evaluate((node, nextValue) => {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        setter?.call(node, nextValue);
+        node.dispatchEvent(new Event("input", { bubbles: true }));
+        node.dispatchEvent(new Event("change", { bubbles: true }));
+        node.dispatchEvent(new Event("blur", { bubbles: true }));
+      }, String(value ?? ""));
+    }
+
+    await randomDelay(150, 320);
+    const actual = await readValue();
+    if (actual === expected) return true;
+    console.error(`${logPrefix} ${label} mismatch on attempt ${attempt + 1}: expected=${expected} actual=${actual || "<empty>"}`);
+  }
+
+  throw new Error(`${label}输入后校验失败`);
+}
+
 async function captureBrowserErrorScreenshot(page, prefix) {
   if (!page || page.isClosed?.() || !shouldCaptureErrorScreenshots()) return "";
   try {
@@ -214,17 +279,33 @@ export async function login(phone, password) {
     } catch (e) { logSilent("login.tab", e); }
 
     // 输入手机号
-    const ph = await page.waitForSelector('#usernameId, input[name="usernameId"], input[placeholder*="手机"]', { timeout: 10000 });
-    await ph.click(); await randomDelay(200, 500);
-    await ph.fill("");
-    for (const c of normalizedPhone) await ph.type(c, { delay: getTypingDelay() });
+    const ph = await findVisibleInput(page, [
+      '#usernameId',
+      'input[name="usernameId"]',
+      'input[placeholder*="手机"]',
+      'input[placeholder*="号码"]',
+      'input[type="tel"]',
+      'input[inputmode="numeric"]',
+    ]);
+    if (!ph) throw new Error("未找到手机号输入框");
+    await ph.click();
+    await randomDelay(200, 500);
+    await fillInputVerified(ph, normalizedPhone, {
+      label: "手机号",
+      logPrefix: "[login]",
+      normalize: normalizeLoginPhone,
+    });
     await randomDelay(800, 1500);
 
     // 输入密码
-    const pw = await page.waitForSelector('#passwordId, input[type="password"]', { timeout: 5000 });
-    await pw.click(); await randomDelay(200, 500);
-    await pw.fill("");
-    for (const c of password) await pw.type(c, { delay: getTypingDelay() });
+    const pw = await findVisibleInput(page, ['#passwordId', 'input[type="password"]']);
+    if (!pw) throw new Error("未找到密码输入框");
+    await pw.click();
+    await randomDelay(200, 500);
+    await fillInputVerified(pw, password, {
+      label: "密码",
+      logPrefix: "[login]",
+    });
     await randomDelay(800, 1500);
 
     // 勾选协议
