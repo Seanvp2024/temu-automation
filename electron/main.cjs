@@ -640,21 +640,20 @@ async function startWorker(options = {}) {
       : (process.env.AI_IMAGE_SERVER || getImageStudioBaseUrl(imageStudioPort))
   ).replace(/\/+$/, "");
 
-  if (worker && workerReady && workerAiImageServer === desiredAiImageServer) return;
-  if (workerStartPromise) {
-    if (
-      workerStartTargetAiImageServer === desiredAiImageServer
-      || !workerStartTargetAiImageServer
-      || !desiredAiImageServer
-    ) {
-      return workerStartPromise;
+  // 已有运行中的 worker：永不因 aiImageServer 变化而重启，避免中断正在执行的批量上品任务。
+  // 改为通过 HTTP 控制通道动态推送新地址，worker 会在下一次图片生成时使用新值。
+  if (worker && workerReady) {
+    if (workerAiImageServer !== desiredAiImageServer) {
+      const prev = workerAiImageServer;
+      workerAiImageServer = desiredAiImageServer;
+      console.log(`[Main] aiImageServer changed (${prev || "<empty>"} -> ${desiredAiImageServer}); pushing to running worker instead of restarting.`);
+      httpPost(workerPort, { action: "set_ai_image_server", params: { url: desiredAiImageServer } }, { authToken: workerAuthToken })
+        .catch((err) => console.log(`[Main] set_ai_image_server push failed (non-fatal): ${err?.message || err}`));
     }
-
-    try {
-      await workerStartPromise;
-    } catch {}
-
-    if (worker && workerReady && workerAiImageServer === desiredAiImageServer) return;
+    return;
+  }
+  if (workerStartPromise) {
+    return workerStartPromise;
   }
 
   workerStartTargetAiImageServer = desiredAiImageServer;
@@ -724,7 +723,7 @@ async function startWorker(options = {}) {
 
     worker.on("exit", (code) => {
       console.log(`[Main] Worker exited: ${code}`);
-      markAutoPricingTaskInterrupted("批量上品任务已中断，worker 已退出。");
+      markAutoPricingTaskInterrupted(`批量上品任务已中断，worker 进程退出 (code=${code})。请检查 worker 日志后重新发起。`);
       stopAutoPricingTaskSync();
       worker = null;
       workerReady = false;
@@ -2328,8 +2327,17 @@ ipcMain.handle("automation:auto-pricing", async (_e, params) => {
     };
   }
 
-  const imageStudio = await ensureImageStudioService();
-  await ensureWorkerStarted({ aiImageServer: imageStudio.url });
+  // 优先尝试启动 AI 出图服务，但 runtime 缺失时不应该让整个批量上品任务无法启动。
+  // 单个商品在生图阶段失败会被任务内部记录为 failed，但 worker 仍能跑分类搜索/属性匹配/草稿提交等其他阶段。
+  let imageStudioUrl = "";
+  try {
+    const imageStudio = await ensureImageStudioService();
+    imageStudioUrl = imageStudio?.url || "";
+  } catch (err) {
+    console.error(`[Main] Image studio unavailable, auto-pricing will run without it: ${err?.message || err}`);
+    imageStudioUrl = workerAiImageServer || process.env.AI_IMAGE_SERVER || getImageStudioBaseUrl(imageStudioPort);
+  }
+  await ensureWorkerStarted({ aiImageServer: imageStudioUrl });
   const credentials = getActiveWorkerCredentials();
 
   const now = new Date().toLocaleString("zh-CN");

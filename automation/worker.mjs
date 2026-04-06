@@ -1509,6 +1509,12 @@ async function tryAutoLoginInPopup(popup, logPrefix = "[popup-login]") {
       }
       lastLoginHint = loginHint || lastLoginHint;
 
+      if (loginHint && /密码错误|密码不正确|账号或密码|用户名或密码|账号密码|登录失败.*密码|password.*(incorrect|wrong|invalid)|incorrect.*password/i.test(loginHint)) {
+        __fatalLoginError = `登录失败（密码错误）：${loginHint}`;
+        console.error(`${logPrefix} Detected wrong-password hint, aborting all retries: ${loginHint}`);
+        throw new Error(__fatalLoginError);
+      }
+
       const stageAfterSubmit = await detectSellerPopupStage(popup);
       if (stageAfterSubmit !== "login") {
         return true;
@@ -1810,6 +1816,10 @@ async function handleOpenSellerAuthPages(logPrefix = "[popup-open]") {
 
 async function ensureSellerCentralSessionReady(page, targetPath = "/goods/list", logPrefix = "[session-ready]") {
   for (let attempt = 1; attempt <= 4; attempt += 1) {
+    if (__fatalLoginError) {
+      console.error(`${logPrefix} Aborting due to fatal login error: ${__fatalLoginError}`);
+      return false;
+    }
     const authPending = await isSellerCentralAuthPage(page);
     if (!authPending && page.url().includes("agentseller.temu.com")) {
       console.error(`${logPrefix} Ready on attempt ${attempt}: ${page.url()}`);
@@ -1850,6 +1860,10 @@ async function handleSellerAuthPopupPage(newPage, logPrefix = "[popup-monitor]")
     }
 
     for (let attempt = 0; attempt < 10; attempt++) {
+      if (__fatalLoginError) {
+        console.error(`${logPrefix} Aborting popup login loop due to fatal login error: ${__fatalLoginError}`);
+        return;
+      }
       try {
         const popupStage = await detectSellerPopupStage(newPage);
         console.error(`${logPrefix} Popup stage on attempt ${attempt + 1}: ${popupStage}`);
@@ -4824,6 +4838,18 @@ async function handleRequest(body) {
   const { action, params = {} } = body;
   switch (action) {
     case "ping": return { status: "pong" };
+    case "set_ai_image_server": {
+      // 主进程在 image studio URL 变化时调用此动作，热更新 AI 出图地址，不需重启 worker
+      const next = typeof params?.url === "string" ? params.url.trim().replace(/\/+$/, "") : "";
+      if (!next) {
+        return { status: "noop", reason: "empty url" };
+      }
+      const prev = AI_IMAGE_GEN_URL;
+      AI_IMAGE_GEN_URL = next;
+      process.env.AI_IMAGE_SERVER = next;
+      console.error(`[Worker] AI_IMAGE_GEN_URL updated: ${prev} -> ${next}`);
+      return { status: "updated", previous: prev, current: next };
+    }
     case "launch": await launch(params.accountId, params.headless); return { status: "launched" };
     case "login": await launch(params.accountId, params.headless); return { success: await loginWithTransientPassword(params.phone, params.password) };
     case "scrape_products": {
@@ -5606,6 +5632,8 @@ async function handleRequest(body) {
     }
     case "auto_pricing": {
       // 完整自动核价：CSV → AI生图 → 上传 → 提交核价
+      // 每次新任务开始前清除致命登录错误标志，允许用户在「账号管理」改正密码后重试
+      __fatalLoginError = null;
       await ensureBrowser();
       return await autoPricingFromCSV(params);
     }
@@ -6225,6 +6253,24 @@ async function verifyDraftPersistedContent(page, draftId, options = {}) {
   }
 }
 
+// 记录最近一次 category API 调用失败原因，供上层组装更具诊断价值的错误信息
+// （区分 "Temu API 失败/cookies 过期" 与 "类目真的找不到"）
+let __fatalLoginError = null;
+let __lastCategoryApiError = null;
+function __recordCategoryApiError(stage, result) {
+  __lastCategoryApiError = {
+    stage,
+    errorCode: result?.errorCode || null,
+    errorMsg: result?.errorMsg || result?.raw?.error || "",
+    at: new Date().toISOString(),
+  };
+}
+function __consumeLastCategoryApiError() {
+  const e = __lastCategoryApiError;
+  __lastCategoryApiError = null;
+  return e;
+}
+
 async function searchCategoryAPI(page, searchTerm, options = {}) {
   const cleanStr = (s) => s.replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "").replace(/[、，]/g, "");
   const searchHintSegments = extractCategoryRefinementSegments(searchTerm);
@@ -6242,7 +6288,11 @@ async function searchCategoryAPI(page, searchTerm, options = {}) {
     // 标题搜索模式：在所有一级分类的二级子分类中模糊匹配
     console.error(`[category] Title search: "${searchTerm.slice(0, 40)}"`);
     const rootResult = await temuXHR(page, "/anniston-agent-seller/category/children/list", { parentCatId: 0 }, { maxRetries: 2 });
-    if (!rootResult.success) return null;
+    if (!rootResult.success) {
+      __recordCategoryApiError("title-search:root", rootResult);
+      console.error(`[category] Title search aborted: root API failed (${rootResult.errorCode || "?"} ${rootResult.errorMsg || ""}). Cookies/login may have expired.`);
+      return null;
+    }
     const rootCats = rootResult.data?.categoryNodeVOS || [];
     const rootChildrenMap = new Map();
 
@@ -6467,7 +6517,12 @@ async function searchCategoryAPI(page, searchTerm, options = {}) {
 
   for (let level = 0; level < searchParts.length && level < 10; level++) {
     const result = await temuXHR(page, "/anniston-agent-seller/category/children/list", { parentCatId }, { maxRetries: 2 });
-    if (!result.success || !result.data?.categoryNodeVOS?.length) {
+    if (!result.success) {
+      __recordCategoryApiError(`path-search:level${level + 1}`, result);
+      console.error(`[category] Path search aborted at level ${level + 1}: API failed (${result.errorCode || "?"} ${result.errorMsg || ""}). Cookies/login may have expired.`);
+      break;
+    }
+    if (!result.data?.categoryNodeVOS?.length) {
       console.error(`[category] No children for parentCatId=${parentCatId} at level ${level + 1}`);
       break;
     }
@@ -6808,7 +6863,9 @@ const AI_DETAIL_IMAGE_TYPE_ORDER = [
 ];
 const REQUIRED_AI_DETAIL_IMAGE_COUNT = AI_DETAIL_IMAGE_TYPE_ORDER.length;
 
-const AI_IMAGE_GEN_URL = (process.env.AI_IMAGE_SERVER || "http://localhost:3210").replace(/\/+$/, "");
+// 注意：AI_IMAGE_GEN_URL 改为可变 let，运行时可通过 set_ai_image_server 动作热更新，
+// 避免主进程因 image studio URL 变化而重启 worker 中断批量上品任务。
+let AI_IMAGE_GEN_URL = (process.env.AI_IMAGE_SERVER || "http://localhost:3210").replace(/\/+$/, "");
 const AI_IMAGE_GEN_ORIGIN = (() => {
   try {
     return new URL(AI_IMAGE_GEN_URL).origin;
@@ -9067,7 +9124,18 @@ async function createProductViaAPI(params) {
     }
 
     if (!leafCatId) {
-      return { success: false, message: `分类搜索失败: "${params.categorySearch || params.title}"`, step: "category" };
+      const apiErr = __consumeLastCategoryApiError();
+      let detail = "";
+      if (apiErr) {
+        const isAuthLike = /未登录|login|auth|cookie|forbidden|权限|过期|超时|timeout|401|403/i.test(`${apiErr.errorMsg || ""} ${apiErr.errorCode || ""}`)
+          || apiErr.errorCode === 40001 || apiErr.errorCode === 40003;
+        detail = isAuthLike
+          ? `（疑似登录已过期或权限不足，建议在「账号管理」重新登录后重试。最近一次 ${apiErr.stage} 失败: ${apiErr.errorCode || "?"} ${apiErr.errorMsg || ""}）`
+          : `（最近一次类目接口 ${apiErr.stage} 失败: ${apiErr.errorCode || "?"} ${apiErr.errorMsg || ""}）`;
+      } else {
+        detail = "（已尝试全部分类路径变体与标题关键词，Temu 类目树中未找到匹配项，请确认表格里的【后台分类】路径是否准确，或在「账号管理」确认登录状态有效）";
+      }
+      return { success: false, message: `分类搜索失败: "${params.categorySearch || params.title}" ${detail}`, step: "category" };
     }
 
     // 确保 leafCatId 不为 undefined
