@@ -30,3 +30,4 @@ read_*.py
 tmp-*.py
 tmp-*.cmd
 tmp_*.cjs
+worker.mjs
