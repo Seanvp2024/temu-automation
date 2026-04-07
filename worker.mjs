@@ -1831,8 +1831,7 @@ async function handleOpenSellerAuthPages(logPrefix = "[popup-open]") {
 }
 
 async function ensureSellerCentralSessionReady(page, targetPath = "/goods/list", logPrefix = "[session-ready]") {
-  let dedicatedLoginAttempted = false;
-  for (let attempt = 1; attempt <= 6; attempt += 1) {
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
     if (__fatalLoginError) {
       console.error(`${logPrefix} Aborting due to fatal login error: ${__fatalLoginError}`);
       return false;
@@ -1854,21 +1853,6 @@ async function ensureSellerCentralSessionReady(page, targetPath = "/goods/list",
     if (await isSellerCentralAuthPage(page)) {
       await openSellerCentralTarget(page, targetPath, { lite: false, logPrefix: `${logPrefix}-goto` });
       await randomDelay(1500, 2500);
-    }
-
-    // 第 3 次仍未拿到授权 → 触发一次完整 dedicated 登录（会刷新 cookie）再继续重试
-    if (attempt === 3 && !dedicatedLoginAttempted) {
-      dedicatedLoginAttempted = true;
-      console.error(`${logPrefix} Auth still pending after ${attempt} attempts, invoking dedicated seller login fallback`);
-      const ok = await ensureDedicatedSellerLogin(`${logPrefix}-dedicated`);
-      if (ok && !page.isClosed?.()) {
-        try {
-          await openSellerCentralTarget(page, targetPath, { lite: false, logPrefix: `${logPrefix}-post-login` });
-          await randomDelay(1500, 2500);
-        } catch (error) {
-          logSilent("ui.action", error);
-        }
-      }
     }
   }
 
@@ -6831,10 +6815,6 @@ async function verifyDraftPersistedContent(page, draftId, options = {}) {
   if (!numericDraftId || !page) {
     return { ok: false, reason: "draft_id_invalid", summary: { hasTitle: false, hasImages: false, hasSpecs: false } };
   }
-  const logPrefix = options.logPrefix || "[draft-verify]";
-  const maxAttempts = Number(options.maxAttempts) || 3;
-  const perAttemptWait = Number(options.waitMs) || 6000;
-
   const captured = { raw: null };
   const listener = async (response) => {
     try {
@@ -6844,87 +6824,35 @@ async function verifyDraftPersistedContent(page, draftId, options = {}) {
     } catch {}
   };
   page.on("response", listener);
-
-  let lastSummary = { hasTitle: false, hasImages: false, hasSpecs: false };
-  let lastDomState = null;
-  let lastRawResult = {};
-
   try {
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      console.error(`${logPrefix} Attempt ${attempt}/${maxAttempts} for draftId=${numericDraftId}`);
-      try {
-        await openSellerCentralTarget(page, `/goods/edit?productDraftId=${numericDraftId}&from=productDraftList`, {
-          lite: false,
-          logPrefix,
-        });
-      } catch (error) {
-        console.error(`${logPrefix} navigate failed: ${error?.message || error}`);
-      }
-      await dismissCommonDialogs(page).catch(() => {});
-      await page.waitForTimeout(perAttemptWait).catch(() => {});
+    await openSellerCentralTarget(page, `/goods/edit?productDraftId=${numericDraftId}&from=productDraftList`, {
+      lite: false,
+      logPrefix: options.logPrefix || "[draft-verify]",
+    });
+    await dismissCommonDialogs(page).catch(() => {});
+    await page.waitForTimeout(options.waitMs || 8000).catch(() => {});
 
-      // 主动调用 draft/query API，兼容 listener 未捕获的情况
-      let draftResult = captured.raw?.result && typeof captured.raw.result === "object" ? captured.raw.result : null;
-      if (!draftResult || (Object.keys(draftResult).length === 0)) {
-        try {
-          const direct = await temuXHR(page, "/visage-agent-seller/product/draft/query", { productDraftId: numericDraftId }, { maxRetries: 1 });
-          if (direct.success && direct.data && typeof direct.data === "object") {
-            draftResult = direct.data;
-            console.error(`${logPrefix} Fetched draft via direct temuXHR`);
-          }
-        } catch (error) {
-          console.error(`${logPrefix} Direct query failed: ${error?.message || error}`);
-        }
-      }
+    const domState = await page.evaluate(() => {
+      const titleInput = document.querySelector('input[placeholder*="商品名称"], textarea[placeholder*="商品名称"]');
+      return {
+        titleInputValue: titleInput && "value" in titleInput ? String(titleInput.value || "").trim() : "",
+        bodyText: (document.body?.innerText || "").slice(0, 4000),
+      };
+    });
 
-      const domState = await page.evaluate(() => {
-        const titleInput = document.querySelector('input[placeholder*="商品名称"], textarea[placeholder*="商品名称"]');
-        const imgEls = document.querySelectorAll('img[src*="kwcdn"], img[src*="temu"], img[src*="cdnfe"]');
-        return {
-          titleInputValue: titleInput && "value" in titleInput ? String(titleInput.value || "").trim() : "",
-          domImageCount: imgEls.length,
-          bodyText: (document.body?.innerText || "").slice(0, 2000),
-        };
-      }).catch(() => ({ titleInputValue: "", domImageCount: 0, bodyText: "" }));
-
-      const summary = summarizeDraftVerificationResult(draftResult || {});
-      if (!summary.hasTitle && domState.titleInputValue) {
-        summary.hasTitle = true;
-        summary.title = domState.titleInputValue;
-      }
-      // DOM 兜底：页面已渲染出 CDN 图片即认为图片已保存
-      if (!summary.hasImages && domState.domImageCount >= 1) {
-        summary.hasImages = true;
-      }
-
-      lastSummary = summary;
-      lastDomState = domState;
-      lastRawResult = draftResult || {};
-
-      if (summary.hasTitle && summary.hasImages) {
-        return {
-          ok: true,
-          reason: "verified",
-          summary,
-          domState,
-          rawResult: lastRawResult,
-          attempts: attempt,
-        };
-      }
-
-      console.error(`${logPrefix} Attempt ${attempt} incomplete: hasTitle=${summary.hasTitle} hasImages=${summary.hasImages}`);
-      if (attempt < maxAttempts) {
-        await page.waitForTimeout(2000).catch(() => {});
-      }
+    const draftResult = captured.raw?.result && typeof captured.raw.result === "object" ? captured.raw.result : {};
+    const summary = summarizeDraftVerificationResult(draftResult);
+    if (!summary.hasTitle && domState.titleInputValue) {
+      summary.hasTitle = true;
+      summary.title = domState.titleInputValue;
     }
-
+    const ok = summary.hasTitle && summary.hasImages;
     return {
-      ok: false,
-      reason: "draft_shell_only",
-      summary: lastSummary,
-      domState: lastDomState,
-      rawResult: lastRawResult,
-      attempts: maxAttempts,
+      ok,
+      reason: ok ? "verified" : "draft_shell_only",
+      summary,
+      domState,
+      rawResult: draftResult,
     };
   } finally {
     page.off("response", listener);
