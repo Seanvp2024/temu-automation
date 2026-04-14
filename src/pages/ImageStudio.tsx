@@ -94,13 +94,13 @@ const PLAN_DISPLAY_SUBTITLES: Record<string, string> = {
 };
 const REDRAW_UI_TEXT = {
   score: "\u8bc4\u5206",
-  redraw: "\u91cd\u7ed8",
+  redraw: "\u5355\u5f20\u91cd\u7ed8",
   download: "\u4e0b\u8f7d",
-  redrawTitle: "\u91cd\u7ed8\u63d0\u793a\u8bcd",
+  redrawTitle: "\u5f53\u524d\u8fd9\u5f20\u56fe\u7684\u91cd\u7ed8\u5efa\u8bae",
   redrawPlaceholder: "\u4f8b\u5982\uff1a\u6539\u6210\u53a8\u623f\u53f0\u9762\uff0c\u4e0d\u8981\u4eba\u7269\uff0c\u753b\u9762\u66f4\u7b80\u6d01",
   directRedraw: "\u76f4\u63a5\u91cd\u7ed8",
   guidedRedraw: "\u5e26\u63d0\u793a\u91cd\u7ed8",
-  helper: "\u4e0d\u6ee1\u610f\u67d0\u4e00\u5f20\u56fe\u65f6\uff0c\u70b9\u51fb\u56fe\u7247\u4e0a\u7684\u91cd\u7ed8\u6309\u94ae\u5373\u53ef\u76f4\u63a5\u91cd\u7ed8\uff0c\u6216\u586b\u5199\u63d0\u793a\u8bcd\u540e\u65b0\u589e\u4e00\u4e2a\u5019\u9009\u7248\u672c\u3002",
+  helper: "\u6bcf\u5f20\u56fe\u90fd\u53ef\u4ee5\u5355\u72ec\u91cd\u7ed8\u3002\u70b9\u51fb\u67d0\u4e00\u5f20\u56fe\u7247\u4e0a\u7684\u91cd\u7ed8\u6309\u94ae\uff0c\u53ea\u4f1a\u91cd\u7ed8\u5f53\u524d\u8fd9\u5f20\uff0c\u5e76\u4fdd\u7559\u539f\u56fe\u65b0\u589e\u5019\u9009\u7248\u672c\u3002",
   needSuggestion: "\u5148\u8f93\u5165\u4f60\u7684\u4fee\u6539\u5efa\u8bae\uff0c\u518d\u91cd\u7ed8\u8fd9\u5f20\u56fe",
   redrawStarted: "\u5df2\u5f00\u59cb\u91cd\u7ed8",
 } as const;
@@ -125,6 +125,12 @@ type ImageVariant = ImageStudioGeneratedImage & {
 
 type ImageVariantMap = Record<string, ImageVariant[]>;
 
+type RedrawJobMeta = {
+  imageType: string;
+  suggestion: string;
+  prompt: string;
+};
+
 type ImageStudioLocationState = {
   prefill?: {
     title?: string;
@@ -133,6 +139,44 @@ type ImageStudioLocationState = {
     skcId?: string;
   };
 };
+
+type MarketingInfoField = "sellingPoints" | "targetAudience" | "usageScenes";
+
+const EMPTY_MARKETING_TRANSLATING_STATE: Record<MarketingInfoField, boolean> = {
+  sellingPoints: false,
+  targetAudience: false,
+  usageScenes: false,
+};
+
+function containsChineseText(value: string) {
+  return /[\u3400-\u9fff]/.test(value);
+}
+
+function containsLatinText(value: string) {
+  return /[A-Za-z]/.test(value);
+}
+
+function hasMarketingTranslation(value: string) {
+  if (!containsChineseText(value) || !containsLatinText(value)) {
+    return false;
+  }
+  return /[\uFF08(][^\uFF08\uFF09()]*[A-Za-z][^\uFF08\uFF09()]*[\uFF09)]\s*$/.test(value.trim());
+}
+
+function mergeMarketingTranslation(original: string, translated: string) {
+  const source = original.trim();
+  const english = translated.trim();
+
+  if (!source || !english || source === english || hasMarketingTranslation(source)) {
+    return source;
+  }
+
+  if (!containsChineseText(source)) {
+    return english;
+  }
+
+  return `${source} (${english})`;
+}
 
 const FALLBACK_STATUS: ImageStudioStatus = {
   status: "starting",
@@ -336,7 +380,7 @@ function dedupeTextList(values: string[]) {
 function trimTitle(text: string, maxLength: number) {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, maxLength - 1).trim()}…`;
+  return `${normalized.slice(0, Math.max(1, maxLength - 3)).trim()}...`;
 }
 
 function normalizeProductDisplayName(value?: string | null) {
@@ -356,25 +400,104 @@ function normalizeProductDisplayName(value?: string | null) {
   return primarySegment || withoutAsciiParen || normalized;
 }
 
-function buildTitleSuggestions(analysis: ImageStudioAnalysis) {
-  const productName = normalizeProductDisplayName(analysis.productName) || analysis.category.trim() || "商品";
-  const category = analysis.category.trim();
-  const materials = analysis.materials.trim();
-  const colors = analysis.colors.trim();
-  const size = analysis.estimatedDimensions.trim();
-  const sellingPoints = dedupeTextList(analysis.sellingPoints).slice(0, 3);
+function sanitizeTitleFragment(
+  value?: string | null,
+  options: { keepMeasurements?: boolean } = {},
+) {
+  let normalized = (value || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
 
-  const keywordFocused = trimTitle(
-    [productName, category, materials, colors, size, ...sellingPoints.slice(0, 2)].filter(Boolean).join(" | "),
-    96,
+  normalized = normalized
+    .replace(/[（(][^（）()]*#(?:[0-9A-Fa-f]{3,8})[^（）()]*[）)]/g, "")
+    .replace(/[（(][^（）()]*[A-Za-z][^（）()]*[）)]/g, "")
+    .replace(/~?\s*#(?:[0-9A-Fa-f]{3,8})\b/g, "")
+    .replace(/\s*\/\s*\d+(?:\.\d+)?\s*(?:in|inch|inches)\b/gi, "")
+    .replace(/\b\d+(?:\.\d+)?\s*(?:in|inch|inches)\b/gi, "")
+    .replace(/[（(]([\u3400-\u9fff0-9A-Za-z\s.+-]{1,24})[）)]/g, " $1 ")
+    .replace(/(\d+(?:\.\d+)?)\s*(cm|mm|m|kg|g|ml|l)\b/gi, (_match, amount, unit) => `${amount}${String(unit).toLowerCase()}`)
+    .replace(/\s*[|｜/／;；]+\s*/g, "，")
+    .replace(/\s*,\s*/g, "，")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!options.keepMeasurements) {
+    normalized = normalized.replace(/\b\d+(?:\.\d+)?(?:cm|mm|m|kg|g|ml|l)\b/gi, "");
+  }
+
+  return normalized
+    .replace(/^[，、,\s]+|[，、,\s]+$/g, "")
+    .replace(/，{2,}/g, "，")
+    .trim();
+}
+
+function dedupeTitleSegments(values: Array<string | null | undefined>) {
+  const result: string[] = [];
+  for (const rawValue of values) {
+    if (typeof rawValue !== "string") continue;
+    const value = rawValue.trim();
+    if (!value) continue;
+    if (result.some((current) => current === value || current.includes(value) || value.includes(current))) {
+      continue;
+    }
+    result.push(value);
+  }
+  return result;
+}
+
+function extractTitleSegments(
+  value?: string | null,
+  options: { keepMeasurements?: boolean; maxItems?: number } = {},
+) {
+  const normalized = sanitizeTitleFragment(value, options);
+  if (!normalized) return [];
+
+  const segments = dedupeTitleSegments(
+    normalized
+      .split(/[，,、]/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .filter((item) => containsChineseText(item) || (options.keepMeasurements && /\d+(?:\.\d+)?(?:cm|mm|m|kg|g|ml|l)/i.test(item)))
+      .filter((item) => !/^[A-Za-z][A-Za-z0-9&+\-./'\s]{2,}$/.test(item)),
   );
-  const benefitFocused = trimTitle(
-    [productName, ...sellingPoints, size].filter(Boolean).join("，"),
-    88,
+
+  return typeof options.maxItems === "number" ? segments.slice(0, options.maxItems) : segments;
+}
+
+function joinTitleSegments(values: string[], maxLength: number) {
+  return trimTitle(
+    dedupeTitleSegments(values)
+      .filter(Boolean)
+      .join("，")
+      .replace(/，{2,}/g, "，")
+      .replace(/^[，、]+|[，、]+$/g, "")
+      .trim(),
+    maxLength,
   );
-  const conciseFocused = trimTitle(
-    [productName, sellingPoints[0], colors || materials].filter(Boolean).join("，"),
-    72,
+}
+
+function buildTitleSuggestions(analysis: ImageStudioAnalysis) {
+  const productName = sanitizeTitleFragment(normalizeProductDisplayName(analysis.productName), { keepMeasurements: true })
+    || extractTitleSegments(analysis.category, { maxItems: 1 })[0]
+    || "商品";
+  const materials = extractTitleSegments(analysis.materials, { maxItems: 2 });
+  const colors = extractTitleSegments(analysis.colors, { maxItems: 2 });
+  const sizes = extractTitleSegments(analysis.estimatedDimensions, { keepMeasurements: true, maxItems: 2 });
+  const sellingPoints = dedupeTitleSegments(
+    dedupeTextList(analysis.sellingPoints)
+      .flatMap((item) => extractTitleSegments(item, { keepMeasurements: true, maxItems: 2 })),
+  ).slice(0, 4);
+
+  const keywordFocused = joinTitleSegments(
+    [productName, ...materials, ...colors, ...sizes, ...sellingPoints.slice(0, 2)],
+    110,
+  );
+  const benefitFocused = joinTitleSegments(
+    [productName, ...sellingPoints, ...sizes.slice(0, 1), ...materials.slice(0, 1)],
+    90,
+  );
+  const conciseFocused = joinTitleSegments(
+    [productName, sellingPoints[0] || materials[0], colors[0] || sizes[0]],
+    65,
   );
 
   return [
@@ -517,6 +640,7 @@ export default function ImageStudio() {
   const [downloadingAll, setDownloadingAll] = useState(false);
   const [downloadingTypes, setDownloadingTypes] = useState<Record<string, boolean>>({});
   const [redrawingTypes, setRedrawingTypes] = useState<Record<string, boolean>>({});
+  const [translatingFields, setTranslatingFields] = useState<Record<MarketingInfoField, boolean>>(EMPTY_MARKETING_TRANSLATING_STATE);
   const [currentJobId, setCurrentJobId] = useState("");
   const [activeStep, setActiveStep] = useState(0);
   const [backgroundJobs, setBackgroundJobs] = useState<any[]>([]);
@@ -528,8 +652,7 @@ export default function ImageStudio() {
   const plansRef = useRef<ImageStudioPlan[]>([]);
   const imageVariantsRef = useRef<ImageVariantMap>({});
   const activeVariantIdsRef = useRef<Record<string, string>>({});
-  const currentJobModeRef = useRef<"full" | "redraw">("full");
-  const currentRedrawMetaRef = useRef<{ imageType: string; suggestion: string; prompt: string } | null>(null);
+  const redrawJobsRef = useRef<Record<string, RedrawJobMeta>>({});
   const appliedPrefillRef = useRef("");
 
   useEffect(() => {
@@ -658,6 +781,17 @@ export default function ImageStudio() {
     return variants.find((item) => item.variantId === activeVariantId) || variants[variants.length - 1];
   };
 
+  const clearRedrawJob = (jobId?: string) => {
+    if (!jobId) return null;
+    const redrawMeta = redrawJobsRef.current[jobId];
+    if (!redrawMeta) return null;
+    const nextJobs = { ...redrawJobsRef.current };
+    delete nextJobs[jobId];
+    redrawJobsRef.current = nextJobs;
+    setRedrawingTypes((prev) => ({ ...prev, [redrawMeta.imageType]: false }));
+    return redrawMeta;
+  };
+
   useEffect(() => {
     refreshStatus(true).then((nextStatus) => {
       if (nextStatus.ready) {
@@ -674,7 +808,6 @@ export default function ImageStudio() {
     const unsubscribe = window.electronAPI?.onImageStudioEvent?.((payload) => {
       if (!payload) return;
 
-      // 后台 job 完成/失败时刷新后台任务列表
       if (payload.type === "generate:complete" || payload.type === "generate:error" || payload.type === "generate:cancelled") {
         refreshBackgroundJobs();
         if (payload.type === "generate:complete") {
@@ -682,11 +815,13 @@ export default function ImageStudio() {
         }
       }
 
-      // 只有当前前台 job 才更新详细 UI 状态
-      if (payload.jobId !== currentJobIdRef.current) return;
+      const redrawMeta = payload.jobId ? redrawJobsRef.current[payload.jobId] : undefined;
+      const isForegroundJob = payload.jobId === currentJobIdRef.current;
+      const isRedrawJob = Boolean(redrawMeta);
+      if (!isForegroundJob && !isRedrawJob) return;
 
       if (payload.type === "generate:event" && payload.event?.imageType) {
-        const imageType = payload.event?.imageType || "";
+        const imageType = payload.event.imageType || "";
         startTransition(() => {
           setResults((prev) => {
             const next = { ...prev };
@@ -711,7 +846,7 @@ export default function ImageStudio() {
               next[imageType] = {
                 ...current,
                 status: "error",
-                error: payload.event.error || "生成失败",
+                error: payload.event.error || "\u751f\u6210\u5931\u8d25",
               };
             }
 
@@ -719,17 +854,16 @@ export default function ImageStudio() {
           });
         });
 
-        if (payload.event?.status === "done" && payload.event?.imageUrl) {
-          const isRedraw = currentJobModeRef.current === "redraw" && currentRedrawMetaRef.current?.imageType === imageType;
-          const currentPlan = plansRef.current.find((plan) => plan.imageType === imageType);
+        if (payload.event.status === "done" && payload.event.imageUrl) {
+          const imagePrompt = redrawMeta?.prompt || plansRef.current.find((plan) => plan.imageType === imageType)?.prompt;
           appendGeneratedVariant(
             {
               imageType,
               imageUrl: payload.event.imageUrl,
             },
             {
-              prompt: isRedraw ? currentRedrawMetaRef.current?.prompt : currentPlan?.prompt,
-              suggestion: isRedraw ? currentRedrawMetaRef.current?.suggestion : "",
+              prompt: imagePrompt,
+              suggestion: redrawMeta?.suggestion || "",
               activate: true,
             },
           );
@@ -737,16 +871,27 @@ export default function ImageStudio() {
       }
 
       if (payload.type === "generate:complete") {
+        if (isRedrawJob && redrawMeta) {
+          clearRedrawJob(payload.jobId);
+          const redrawLabel = IMAGE_TYPE_LABELS[redrawMeta.imageType] || redrawMeta.imageType;
+          if (payload.historySaveError) {
+            message.warning(`${redrawLabel} \u5df2\u65b0\u589e\u4e00\u4e2a\u5019\u9009\u7248\u672c\uff0c\u4f46\u81ea\u52a8\u4fdd\u5b58\u5386\u53f2\u5931\u8d25\uff1a${payload.historySaveError}`);
+          } else if (payload.historySaved) {
+            message.success(`${redrawLabel} \u5df2\u65b0\u589e\u4e00\u4e2a\u5019\u9009\u7248\u672c\uff0c\u5e76\u5df2\u81ea\u52a8\u4fdd\u5b58\u5230\u5386\u53f2\u8bb0\u5f55`);
+          } else {
+            message.success(`${redrawLabel} \u5df2\u65b0\u589e\u4e00\u4e2a\u5019\u9009\u7248\u672c`);
+          }
+          return;
+        }
+
         setGenerating(false);
         setCurrentJobId("");
-        const redrawMeta = currentRedrawMetaRef.current;
-        const wasRedraw = currentJobModeRef.current === "redraw";
         const completedImages = sortImagesBySelectedTypes(Array.isArray(payload.results) ? payload.results : [], selectedImageTypesRef.current);
         const nextVariantMap = completedImages.reduce<ImageVariantMap>((acc, item) => {
           const currentPlan = plansRef.current.find((plan) => plan.imageType === item.imageType);
           return appendVariantToMap(acc, item, {
-            prompt: wasRedraw && redrawMeta?.imageType === item.imageType ? redrawMeta.prompt : currentPlan?.prompt,
-            suggestion: wasRedraw && redrawMeta?.imageType === item.imageType ? redrawMeta.suggestion : "",
+            prompt: currentPlan?.prompt,
+            suggestion: "",
           });
         }, imageVariantsRef.current);
         const nextActiveVariantIds = { ...activeVariantIdsRef.current };
@@ -758,53 +903,62 @@ export default function ImageStudio() {
         });
         setImageVariants(nextVariantMap);
         setActiveVariantIds(nextActiveVariantIds);
-        if (redrawMeta?.imageType) {
-          setRedrawingTypes((prev) => ({ ...prev, [redrawMeta.imageType]: false }));
-        }
-        currentJobModeRef.current = "full";
-        currentRedrawMetaRef.current = null;
-        if (wasRedraw && redrawMeta?.imageType) {
-          const redrawLabel = IMAGE_TYPE_LABELS[redrawMeta.imageType] || redrawMeta.imageType;
-          if (payload.historySaveError) {
-            message.warning(`${redrawLabel} 已新增一个候选版本，但自动保存历史失败：${payload.historySaveError}`);
-          } else if (payload.historySaved) {
-            message.success(`${redrawLabel} 已新增一个候选版本，并已自动保存到历史记录`);
-          } else {
-            message.success(`${redrawLabel} 已新增一个候选版本`);
-          }
+        if (payload.historySaveError) {
+          message.warning(`AI \u51fa\u56fe\u5df2\u5b8c\u6210\uff0c\u4f46\u81ea\u52a8\u4fdd\u5b58\u5386\u53f2\u5931\u8d25\uff1a${payload.historySaveError}`);
+        } else if (payload.historySaved) {
+          message.success("AI \u51fa\u56fe\u5df2\u5b8c\u6210\uff0c\u5e76\u5df2\u81ea\u52a8\u4fdd\u5b58\u5230\u5386\u53f2\u8bb0\u5f55");
         } else {
-          if (payload.historySaveError) {
-            message.warning(`AI 出图已完成，但自动保存历史失败：${payload.historySaveError}`);
-          } else if (payload.historySaved) {
-            message.success("AI 出图已完成，并已自动保存到历史记录");
-          } else {
-            message.success("AI 出图已完成");
-          }
+          message.success("AI \u51fa\u56fe\u5df2\u5b8c\u6210");
         }
       }
 
       if (payload.type === "generate:error") {
+        if (isRedrawJob && redrawMeta) {
+          clearRedrawJob(payload.jobId);
+          const redrawLabel = IMAGE_TYPE_LABELS[redrawMeta.imageType] || redrawMeta.imageType;
+          setResults((prev) => {
+            const current = getResultState(prev, redrawMeta.imageType);
+            const hasImage = Boolean(current.imageUrl || getActiveVariant(redrawMeta.imageType)?.imageUrl);
+            return {
+              ...prev,
+              [redrawMeta.imageType]: {
+                ...current,
+                status: hasImage ? "done" : "error",
+                error: payload.error || "AI \u51fa\u56fe\u5931\u8d25",
+              },
+            };
+          });
+          message.error(`${redrawLabel} \u91cd\u7ed8\u5931\u8d25\uff1a${payload.error || "AI \u51fa\u56fe\u5931\u8d25"}`);
+          return;
+        }
+
         setGenerating(false);
         setCurrentJobId("");
-        const redrawMeta = currentRedrawMetaRef.current;
-        if (redrawMeta?.imageType) {
-          setRedrawingTypes((prev) => ({ ...prev, [redrawMeta.imageType]: false }));
-        }
-        currentJobModeRef.current = "full";
-        currentRedrawMetaRef.current = null;
-        message.error(payload.error || "AI 出图失败");
+        message.error(payload.error || "AI \u51fa\u56fe\u5931\u8d25");
       }
 
       if (payload.type === "generate:cancelled") {
+        if (isRedrawJob && redrawMeta) {
+          clearRedrawJob(payload.jobId);
+          setResults((prev) => {
+            const current = getResultState(prev, redrawMeta.imageType);
+            const hasImage = Boolean(current.imageUrl || getActiveVariant(redrawMeta.imageType)?.imageUrl);
+            return {
+              ...prev,
+              [redrawMeta.imageType]: {
+                ...current,
+                status: hasImage ? "done" : "idle",
+                error: "",
+              },
+            };
+          });
+          message.info(payload.message || `${IMAGE_TYPE_LABELS[redrawMeta.imageType] || redrawMeta.imageType} \u5df2\u53d6\u6d88\u91cd\u7ed8`);
+          return;
+        }
+
         setGenerating(false);
         setCurrentJobId("");
-        const redrawMeta = currentRedrawMetaRef.current;
-        if (redrawMeta?.imageType) {
-          setRedrawingTypes((prev) => ({ ...prev, [redrawMeta.imageType]: false }));
-        }
-        currentJobModeRef.current = "full";
-        currentRedrawMetaRef.current = null;
-        message.info(payload.message || "已取消本次生成");
+        message.info(payload.message || "\u5df2\u53d6\u6d88\u672c\u6b21\u751f\u6210");
       }
     });
 
@@ -947,12 +1101,16 @@ export default function ImageStudio() {
 
   const handleStartGenerate = async (runInBackground = false) => {
     if (!imageStudioAPI) return;
+    if (Object.values(redrawingTypes).some(Boolean)) {
+      message.warning("\u5f53\u524d\u8fd8\u6709\u56fe\u7247\u91cd\u7ed8\u4efb\u52a1\u5728\u8fd0\u884c\uff0c\u8bf7\u7b49\u5f85\u5b8c\u6210\u540e\u518d\u5f00\u59cb\u6574\u6279\u51fa\u56fe");
+      return;
+    }
     if (uploadFiles.length === 0) {
-      message.warning("请先上传商品素材图");
+      message.warning("\u8bf7\u5148\u4e0a\u4f20\u5546\u54c1\u7d20\u6750\u56fe");
       return;
     }
     if (plans.length === 0) {
-      message.warning("请先生成出图方案");
+      message.warning("\u8bf7\u5148\u751f\u6210\u51fa\u56fe\u65b9\u6848");
       return;
     }
     const nextJobId = `image_job_${Date.now()}`;
@@ -960,8 +1118,7 @@ export default function ImageStudio() {
     if (!runInBackground) {
       setGenerating(true);
       setCurrentJobId(nextJobId);
-      currentJobModeRef.current = "full";
-      currentRedrawMetaRef.current = null;
+      redrawJobsRef.current = {};
       setResults(plans.reduce<ResultStateMap>((acc, plan) => {
         acc[plan.imageType] = createEmptyResultState("queued");
         return acc;
@@ -987,18 +1144,18 @@ export default function ImageStudio() {
         productName: displayProductName,
       });
       if (runInBackground) {
-        message.success(`「${displayProductName}」已在后台生成，完成后会自动保存到历史记录`);
+        message.success(`\u300c${displayProductName}\u300d\u5df2\u5728\u540e\u53f0\u751f\u6210\uff0c\u5b8c\u6210\u540e\u4f1a\u81ea\u52a8\u4fdd\u5b58\u5230\u5386\u53f2\u8bb0\u5f55`);
         refreshBackgroundJobs();
         resetStudio();
       } else {
-        message.success("AI 出图任务已开始");
+        message.success("AI \u51fa\u56fe\u4efb\u52a1\u5df2\u5f00\u59cb");
       }
     } catch (error) {
       if (!runInBackground) {
         setGenerating(false);
         setCurrentJobId("");
       }
-      message.error(error instanceof Error ? error.message : "启动出图失败");
+      message.error(error instanceof Error ? error.message : "\u542f\u52a8\u51fa\u56fe\u5931\u8d25");
     }
   };
 
@@ -1134,6 +1291,49 @@ export default function ImageStudio() {
     setAnalysis((prev) => ({ ...prev, [field]: value }));
   };
 
+  const handleTranslateAnalysisField = async (field: MarketingInfoField, label: string) => {
+    if (!imageStudioAPI?.translate) {
+      message.error("\u5f53\u524d\u7248\u672c\u6682\u4e0d\u652f\u6301\u7ffb\u8bd1");
+      return;
+    }
+
+    const items = Array.isArray(analysis[field]) ? analysis[field] : [];
+    const translatableIndexes: number[] = [];
+    const texts: string[] = [];
+
+    items.forEach((item, index) => {
+      const source = typeof item === "string" ? item.trim() : "";
+      if (!source || !containsChineseText(source) || hasMarketingTranslation(source)) {
+        return;
+      }
+      translatableIndexes.push(index);
+      texts.push(source);
+    });
+
+    if (texts.length === 0) {
+      message.info(`${label} \u6682\u65e0\u9700\u8981\u7ffb\u8bd1\u7684\u5185\u5bb9`);
+      return;
+    }
+
+    setTranslatingFields((prev) => ({ ...prev, [field]: true }));
+    try {
+      const result = await imageStudioAPI.translate({ texts });
+      const translations = Array.isArray(result?.translations) ? result.translations : [];
+      const nextItems = [...items];
+
+      translatableIndexes.forEach((itemIndex, translationIndex) => {
+        nextItems[itemIndex] = mergeMarketingTranslation(items[itemIndex] || "", translations[translationIndex] || "");
+      });
+
+      updateAnalysisField(field, nextItems);
+      message.success(`${label} \u5df2\u8865\u9f50\u82f1\u6587\u7ffb\u8bd1`);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "\u7ffb\u8bd1\u5931\u8d25");
+    } finally {
+      setTranslatingFields((prev) => ({ ...prev, [field]: false }));
+    }
+  };
+
   const updatePlanPrompt = (imageType: string, prompt: string) => {
     setPlans((prev) => prev.map((plan) => (
       plan.imageType === imageType
@@ -1172,23 +1372,27 @@ export default function ImageStudio() {
   const handleSingleRedraw = async (imageType: string, mode: "direct" | "guided" = "guided") => {
     if (!imageStudioAPI) return;
     if (generating) {
-      message.warning("当前还有生成任务在运行，请先等待完成或取消");
+      message.warning("\u5f53\u524d\u8fd8\u6709\u751f\u6210\u4efb\u52a1\u5728\u8fd0\u884c\uff0c\u8bf7\u5148\u7b49\u5f85\u5b8c\u6210\u6216\u53d6\u6d88");
       return;
     }
-    // 历史恢复后 uploadFiles 为空：自动用当前 active 变体的成品图作素材
+    if (redrawingTypes[imageType]) {
+      message.warning(`${IMAGE_TYPE_LABELS[imageType] || imageType} \u6b63\u5728\u91cd\u7ed8\u4e2d\uff0c\u8bf7\u7a0d\u5019`);
+      return;
+    }
+
     let effectiveFiles = uploadFiles;
     if (effectiveFiles.length === 0) {
       try {
         const fallbackVariant = getActiveVariant(imageType);
         const fallbackUrl = fallbackVariant?.imageUrl;
         if (!fallbackUrl) {
-          message.warning("请先上传商品素材图");
+          message.warning("\u8bf7\u5148\u4e0a\u4f20\u5546\u54c1\u7d20\u6750\u56fe");
           return;
         }
         const resp = await fetch(fallbackUrl);
-        if (!resp.ok) throw new Error(`下载素材失败 ${resp.status}`);
+        if (!resp.ok) throw new Error(`\u4e0b\u8f7d\u7d20\u6750\u5931\u8d25 ${resp.status}`);
         const blob = await resp.blob();
-        const ext = (blob.type.includes("png") ? "png" : "jpg");
+        const ext = blob.type.includes("png") ? "png" : "jpg";
         const file = new File([blob], `redraw-source-${imageType}.${ext}`, { type: blob.type || "image/jpeg" });
         effectiveFiles = [{
           uid: `redraw-source-${imageType}-${Date.now()}`,
@@ -1196,8 +1400,8 @@ export default function ImageStudio() {
           status: "done",
           originFileObj: file as any,
         } as UploadFile];
-      } catch (e) {
-        message.error(e instanceof Error ? `自动复用历史图失败：${e.message}` : "自动复用历史图失败");
+      } catch (error) {
+        message.error(error instanceof Error ? `\u81ea\u52a8\u590d\u7528\u5386\u53f2\u56fe\u5931\u8d25\uff1a${error.message}` : "\u81ea\u52a8\u590d\u7528\u5386\u53f2\u56fe\u5931\u8d25");
         return;
       }
     }
@@ -1210,7 +1414,7 @@ export default function ImageStudio() {
 
     const basePlan = plans.find((plan) => plan.imageType === imageType);
     if (!basePlan) {
-      message.warning("当前图类型还没有出图方案，请先生成方案");
+      message.warning("\u5f53\u524d\u56fe\u7c7b\u578b\u8fd8\u6ca1\u6709\u51fa\u56fe\u65b9\u6848\uff0c\u8bf7\u5148\u751f\u6210\u65b9\u6848");
       return;
     }
 
@@ -1221,14 +1425,18 @@ export default function ImageStudio() {
     const redrawPlan: ImageStudioPlan = {
       ...basePlan,
       prompt: nextPrompt,
-      title: `${basePlan.title || IMAGE_TYPE_LABELS[imageType] || imageType} · 候选重绘`,
+      title: `${basePlan.title || IMAGE_TYPE_LABELS[imageType] || imageType} \u00b7 \u5019\u9009\u91cd\u7ed8`,
     };
     const nextJobId = `image_redraw_${imageType}_${Date.now()}`;
 
-    setGenerating(true);
-    setCurrentJobId(nextJobId);
-    currentJobModeRef.current = "redraw";
-    currentRedrawMetaRef.current = { imageType, suggestion: mode === "guided" ? suggestion : "", prompt: nextPrompt };
+    redrawJobsRef.current = {
+      ...redrawJobsRef.current,
+      [nextJobId]: {
+        imageType,
+        suggestion: mode === "guided" ? suggestion : "",
+        prompt: nextPrompt,
+      },
+    };
     setOpenRedrawComposerFor(null);
     setRedrawingTypes((prev) => ({ ...prev, [imageType]: true }));
     setResults((prev) => ({
@@ -1250,14 +1458,21 @@ export default function ImageStudio() {
         productName: displayProductName,
       });
       message.success(`${REDRAW_UI_TEXT.redrawStarted}${IMAGE_TYPE_LABELS[imageType] || imageType}`);
-      return;
     } catch (error) {
-      setGenerating(false);
-      setCurrentJobId("");
-      currentJobModeRef.current = "full";
-      currentRedrawMetaRef.current = null;
-      setRedrawingTypes((prev) => ({ ...prev, [imageType]: false }));
-      message.error(error instanceof Error ? error.message : "启动重绘失败");
+      clearRedrawJob(nextJobId);
+      setResults((prev) => {
+        const current = getResultState(prev, imageType);
+        const hasImage = Boolean(current.imageUrl || getActiveVariant(imageType)?.imageUrl);
+        return {
+          ...prev,
+          [imageType]: {
+            ...current,
+            status: hasImage ? "done" : "error",
+            error: error instanceof Error ? error.message : "\u542f\u52a8\u91cd\u7ed8\u5931\u8d25",
+          },
+        };
+      });
+      message.error(error instanceof Error ? error.message : "\u542f\u52a8\u91cd\u7ed8\u5931\u8d25");
     }
   };
 
@@ -1309,7 +1524,44 @@ export default function ImageStudio() {
     () => Object.values(results).filter((result) => result.status === "done").length,
     [results],
   );
-  const progressPercent = planCount > 0 ? Math.round((completedCount / planCount) * 100) : 0;
+  const activeGeneratingCount = useMemo(
+    () => Object.values(results).filter((result) => result.status === "generating").length,
+    [results],
+  );
+  const activeRedrawCount = useMemo(
+    () => Object.values(redrawingTypes).filter(Boolean).length,
+    [redrawingTypes],
+  );
+  const hasActiveRedraws = activeRedrawCount > 0;
+  const progressPercent = useMemo(() => {
+    if (planCount <= 0) return 0;
+    const completedPercent = (completedCount / planCount) * 100;
+    if (!generating && activeRedrawCount <= 0) {
+      return Math.round(completedPercent);
+    }
+    if (completedPercent > 0) {
+      return Math.round(completedPercent);
+    }
+    if (activeGeneratingCount > 0) {
+      return Math.max(8, Math.round((activeGeneratingCount / planCount) * 20));
+    }
+    if (activeRedrawCount > 0) {
+      return Math.max(8, Math.round((activeRedrawCount / planCount) * 20));
+    }
+    return 0;
+  }, [activeGeneratingCount, activeRedrawCount, completedCount, generating, planCount]);
+  const progressDescription = useMemo(() => {
+    if (!generating && activeRedrawCount > 0) {
+      return `\u5f53\u524d\u6709 ${activeRedrawCount} \u5f20\u56fe\u7247\u6b63\u5728\u91cd\u7ed8\uff0c\u5b8c\u6210\u540e\u4f1a\u81ea\u52a8\u8ffd\u52a0\u5230\u5404\u81ea\u5019\u9009\u7248\u672c\u3002`;
+    }
+    if (generatedImages.length > 0) {
+      return `\u5f53\u524d\u5df2\u5b8c\u6210 ${successCount}/${planCount} \u5f20\u56fe\u7247\uff0c\u53ef\u4ee5\u7ee7\u7eed\u8bc4\u5206\u3001\u4fdd\u5b58\u548c\u590d\u5236\u6807\u9898\u3002`;
+    }
+    if (generating) {
+      return "\u56fe\u7247\u5df2\u7ecf\u5f00\u59cb\u751f\u6210\uff0c\u7ed3\u679c\u4f1a\u5728\u4e0b\u65b9\u9646\u7eed\u51fa\u73b0\u3002";
+    }
+    return "\u65b9\u6848\u786e\u8ba4\u540e\u5f00\u59cb\u751f\u6210\u56fe\u7247\uff0c\u5e76\u5728\u4e0b\u65b9\u67e5\u770b\u5b8c\u6210\u7ed3\u679c\u3002";
+  }, [activeRedrawCount, generatedImages.length, generating, planCount, successCount]);
   const hasUploads = uploadFiles.length > 0;
   const hasAnalysis = useMemo(() => hasAnalysisContent(analysis), [analysis]);
   const hasPlans = plans.length > 0;
@@ -1404,8 +1656,7 @@ export default function ImageStudio() {
     setRedrawingTypes({});
     setGenerating(false);
     setCurrentJobId("");
-    currentJobModeRef.current = "full";
-    currentRedrawMetaRef.current = null;
+    redrawJobsRef.current = {};
     setActiveStep(0);
   };
 
@@ -1859,22 +2110,38 @@ export default function ImageStudio() {
 
   const renderAnalysisListEditor = (
     label: string,
-    field: "sellingPoints" | "targetAudience" | "usageScenes",
+    field: MarketingInfoField,
     placeholder: string,
   ) => {
     const items = (analysis[field] || []).length > 0 ? analysis[field] : [""];
+    const canTranslate = items.some((item) => {
+      const source = typeof item === "string" ? item.trim() : "";
+      return Boolean(source) && containsChineseText(source) && !hasMarketingTranslation(source);
+    });
     return (
       <div style={{ background: "#fff", border: "1px solid #f0f0f0", borderRadius: 12, padding: "14px 16px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 12 }}>
           <Text style={{ fontSize: 12, color: "#999" }}>{label}</Text>
-          <Button
-            size="small"
-            type="text"
-            style={{ color: TEMU_ORANGE, paddingInline: 0 }}
-            onClick={() => updateAnalysisField(field, [...items, ""])}
-          >
-            新增一条
-          </Button>
+          <Space size={12}>
+            <Button
+              size="small"
+              type="text"
+              loading={translatingFields[field]}
+              disabled={!canTranslate}
+              style={{ color: TEMU_ORANGE, paddingInline: 0 }}
+              onClick={() => handleTranslateAnalysisField(field, label)}
+            >
+              {"\u7ffb\u8bd1\u672c\u7ec4"}
+            </Button>
+            <Button
+              size="small"
+              type="text"
+              style={{ color: TEMU_ORANGE, paddingInline: 0 }}
+              onClick={() => updateAnalysisField(field, [...items, ""])}
+            >
+              {"\u65b0\u589e\u4e00\u6761"}
+            </Button>
+          </Space>
         </div>
         <div style={{ display: "grid", gap: 10 }}>
           {items.map((item, index) => (
@@ -2202,13 +2469,11 @@ export default function ImageStudio() {
             <div>
               <Title level={4} style={{ margin: 0, color: TEMU_TEXT }}>生图进度</Title>
               <Text type="secondary" style={{ display: "block", marginTop: 6 }}>
-                {generatedImages.length > 0
-                  ? `当前已完成 ${successCount}/${planCount} 张图片，可以继续评分、保存和复制标题。`
-                  : "方案确认后开始生成图片，并在下方查看完成结果。"}
+                {progressDescription}
               </Text>
             </div>
             <Space wrap>
-              <Button onClick={() => setActiveStep(2)} disabled={generating} style={{ borderRadius: 14 }}>上一步</Button>
+              <Button onClick={() => setActiveStep(2)} disabled={generating || hasActiveRedraws} style={{ borderRadius: 14 }}>上一步</Button>
               <Button danger icon={<StopOutlined />} onClick={handleCancelGenerate} disabled={!generating || !currentJobId} style={{ borderRadius: 14 }}>
                 取消任务
               </Button>
@@ -2217,7 +2482,7 @@ export default function ImageStudio() {
                 icon={<RocketOutlined />}
                 onClick={() => handleStartGenerate(false)}
                 loading={generating}
-                disabled={plans.length === 0 || uploadFiles.length === 0}
+                disabled={plans.length === 0 || uploadFiles.length === 0 || hasActiveRedraws}
                 style={{
                   minWidth: 144,
                   borderRadius: 14,
@@ -2232,7 +2497,7 @@ export default function ImageStudio() {
                 <Button
                   icon={<ThunderboltOutlined />}
                   onClick={() => handleStartGenerate(true)}
-                  disabled={plans.length === 0 || uploadFiles.length === 0 || generating}
+                  disabled={plans.length === 0 || uploadFiles.length === 0 || generating || hasActiveRedraws}
                   style={{ borderRadius: 14 }}
                 >
                   后台生成
@@ -2337,7 +2602,7 @@ export default function ImageStudio() {
                                 icon={<ReloadOutlined />}
                                 onClick={() => setOpenRedrawComposerFor((prev) => (prev === image.imageType ? null : image.imageType))}
                                 loading={Boolean(redrawingTypes[image.imageType])}
-                                disabled={generating && !redrawingTypes[image.imageType]}
+                                disabled={generating || Boolean(redrawingTypes[image.imageType])}
                                 style={{
                                   width: 38,
                                   height: 38,
@@ -2394,6 +2659,9 @@ export default function ImageStudio() {
                                   style={{ color: "#94a3b8" }}
                                 />
                               </div>
+                              <Text type="secondary" style={{ display: "block", marginBottom: 10, lineHeight: 1.6 }}>
+                                这里只会重绘当前这张图，不会影响其他图片。
+                              </Text>
                               <TextArea
                                 autoSize={{ minRows: 4, maxRows: 6 }}
                                 value={redrawSuggestions[image.imageType] || ""}
@@ -2405,7 +2673,7 @@ export default function ImageStudio() {
                                 <Button
                                   onClick={() => handleSingleRedraw(image.imageType, "direct")}
                                   loading={Boolean(redrawingTypes[image.imageType])}
-                                  disabled={generating && !redrawingTypes[image.imageType]}
+                                  disabled={generating || Boolean(redrawingTypes[image.imageType])}
                                   style={{ borderRadius: 12 }}
                                 >
                                   {REDRAW_UI_TEXT.directRedraw}
@@ -2415,7 +2683,7 @@ export default function ImageStudio() {
                                   icon={<RocketOutlined />}
                                   onClick={() => handleSingleRedraw(image.imageType, "guided")}
                                   loading={Boolean(redrawingTypes[image.imageType])}
-                                  disabled={generating && !redrawingTypes[image.imageType]}
+                                  disabled={generating || Boolean(redrawingTypes[image.imageType])}
                                   style={{
                                     borderRadius: 12,
                                     border: "none",
@@ -2562,7 +2830,7 @@ export default function ImageStudio() {
                   paddingTop: 4,
                 }}
               >
-                <Text type="secondary">不满意某一张图时，可以直接填写建议重绘，系统会保留原图并新增候选版本。</Text>
+                <Text type="secondary">每张图都支持单独重绘，系统会保留原图，并为当前这张图新增候选版本。</Text>
                 <Space wrap>
                   <Button onClick={resetStudio} style={{ borderRadius: 14 }}>
                     重新开始

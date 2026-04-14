@@ -19,7 +19,8 @@ process.on("unhandledRejection", (reason) => {
 
 let mainWindow = null;
 let worker = null;
-let workerPort = 19280;
+const DEFAULT_WORKER_PORT = Number(process.env.TEMU_WORKER_PORT) > 0 ? Number(process.env.TEMU_WORKER_PORT) : 19280;
+let workerPort = DEFAULT_WORKER_PORT;
 let workerReady = false;
 let workerAiImageServer = "";
 let workerAuthToken = "";
@@ -38,7 +39,6 @@ const ACCOUNT_SCOPED_STORE_KEYS = new Set([
   "temu_orders",
   "temu_sales",
   "temu_flux",
-  "temu_task_manager_state",
   "temu_raw_goodsData",
   "temu_raw_lifecycle",
   "temu_raw_yunduOverall",
@@ -112,11 +112,22 @@ const STORE_KEY_PATTERN = /^[A-Za-z0-9._:-]+$/;
 
 const AUTO_PRICING_FILTER_KEYWORDS = {
   liquid: [
-    "液体", "液态", "喷雾", "香水", "精油", "乳液", "爽肤水", "精华", "面霜", "乳霜", "溶液",
-    "洗发水", "沐浴露", "洗衣液", "护理液", "清洁液", "清洁剂", "墨水", "胶水", "机油", "酒精", "染发剂",
+    "液体", "液态", "喷雾", "香水", "精油", "乳液", "爽肤水", "精华液", "精华水", "面霜", "乳霜", "溶液",
+    "洗发水", "护发素", "沐浴露", "沐浴乳", "洗衣液", "柔顺剂", "护理液", "清洁液", "清洁剂", "消毒液", "消毒水",
+    "墨水", "胶水", "机油", "酒精", "染发剂", "染发膏", "卸妆水", "卸妆油", "卸妆乳", "化妆水", "柔肤水",
+    "粉底液", "气垫", "bb霜", "cc霜", "防晒霜", "防晒乳", "防晒喷雾", "隔离霜", "粉底", "遮瑕液",
+    "眼线液", "睫毛液", "眉笔液", "腮红液", "高光液", "修容液", "唇釉", "唇蜜", "唇彩", "唇油",
+    "指甲油", "甲油", "甲油胶", "洗甲水", "洗手液", "洗洁精", "洗衣凝珠", "洗面奶", "洁面乳", "洁面液",
+    "护手霜", "身体乳", "润肤乳", "润肤露", "保湿水", "爽身粉液", "花露水", "驱蚊液", "杀虫剂",
+    "啤酒", "饮料", "饮品", "果汁", "牛奶", "蜂蜜", "酱油", "醋", "食用油",
+    "打火机油", "稀释剂", "稀释液", "颜料", "油漆", "涂料", "万能胶", "502", "ab胶",
   ],
   paste: [
-    "膏体", "膏状", "牙膏", "乳膏", "软膏", "凝胶", "啫喱", "胶泥", "泥膜", "发蜡", "唇膏", "浆糊",
+    "膏体", "膏状", "牙膏", "乳膏", "软膏", "凝胶", "啫喱", "胶泥", "泥膜", "发蜡", "发胶", "摩丝",
+    "唇膏", "口红", "润唇膏", "唇膜", "面膜", "睡眠面膜", "眼膜", "鼻膜", "护手膏", "身体霜",
+    "睫毛膏", "眼影膏", "腮红膏", "高光膏", "遮瑕膏", "粉底膏", "修容膏", "眉膏",
+    "护肤膏", "万金油", "清凉油", "凡士林", "护臀膏", "蚊虫膏", "膏药",
+    "牙膏状", "啫喱膏", "浆糊", "黄油", "奶油", "果酱", "酱料",
   ],
   electric: [
     "带电", "电池", "锂电", "纽扣电池", "充电", "充电器", "适配器", "usb", "电动", "电机", "插电", "无线充", "电源",
@@ -569,7 +580,15 @@ function httpPost(port, body, options = {}) {
           const buf = Buffer.concat(chunks).toString("utf8");
           try {
             const json = JSON.parse(buf);
-            if (json.type === "error") reject(new Error(json.message));
+            if (json.type === "error") {
+              const code = json?.code ? String(json.code) : "";
+              const error = new Error(code ? `[${code}] ${json.message}` : json.message);
+              if (code) error.code = code;
+              if (json?.action) error.action = json.action;
+              if (typeof json?.duration === "number") error.duration = json.duration;
+              if (json?.screenshotFile) error.screenshotFile = json.screenshotFile;
+              reject(error);
+            }
             else resolve(json.data);
           } catch (e) {
             reject(new Error("Worker 返回无效 JSON: " + buf.substring(0, 200)));
@@ -677,6 +696,7 @@ async function startWorker(options = {}) {
     // 先尝试关闭旧的 worker
     await shutdownOldWorker();
     workerAuthToken = createWorkerAuthToken();
+    workerPort = await findAvailableWorkerPort(DEFAULT_WORKER_PORT);
 
     // 打包模式优先用 ELECTRON_RUN_AS_NODE（能读 asar），否则用外部 Node
     const workerPath = app.isPackaged
@@ -802,16 +822,30 @@ async function ensureWorkerStarted(options = {}, retries = 1) {
   }
 }
 
-async function sendCmd(action, params = {}) {
+function resolveSendCmdTimeout(params, requestOptions) {
+  if (Number(params?.timeoutMs) > 0) {
+    return Number(params.timeoutMs);
+  }
+  if (typeof requestOptions === "number" && Number(requestOptions) > 0) {
+    return Number(requestOptions);
+  }
+  if (Number(requestOptions?.timeoutMs) > 0) {
+    return Number(requestOptions.timeoutMs);
+  }
+  return 0;
+}
+
+async function sendCmd(action, params = {}, requestOptions = {}) {
   if (!workerReady) {
     await ensureWorkerStarted();
   }
   const nextParams = attachWorkerCredentials(action, params);
   const payload = { action, params: nextParams };
-  if (Number(params?.timeoutMs) > 0) {
-    payload.timeoutMs = Number(params.timeoutMs);
+  const timeoutMs = resolveSendCmdTimeout(params, requestOptions);
+  if (timeoutMs > 0) {
+    payload.timeoutMs = timeoutMs;
   }
-  const keepLongRunningWorkerAlive = action === "auto_pricing";
+  const keepLongRunningWorkerAlive = action === "auto_pricing" || action === "competitor_auto_register";
   try {
     return await httpPost(workerPort, payload);
   } catch (error) {
@@ -1680,6 +1714,7 @@ function routeNeedsImageStudioRuntimeConfig(routePath) {
   return [
     "/api/analyze",
     "/api/regenerate-analysis",
+    "/api/translate",
     "/api/plans",
     "/api/generate",
     "/api/score",
@@ -1814,7 +1849,7 @@ function getImageStudioErrorMessage(routePath, response, payload) {
   }
 
   if (isHtmlErrorPayload(payload)) {
-    if (routePath === "/api/analyze" || routePath === "/api/regenerate-analysis") {
+    if (routePath === "/api/analyze" || routePath === "/api/regenerate-analysis" || routePath === "/api/translate") {
       return "AI 商品分析失败，请检查分析模型是否支持图片输入";
     }
     return `AI 出图服务内部错误 (${response.status})`;
@@ -1825,7 +1860,7 @@ function getImageStudioErrorMessage(routePath, response, payload) {
     return isImageStudioConnectionError(message) ? getImageStudioConnectionErrorHint(routePath) : message;
   }
 
-  if (routePath === "/api/analyze" || routePath === "/api/regenerate-analysis") {
+  if (routePath === "/api/analyze" || routePath === "/api/regenerate-analysis" || routePath === "/api/translate") {
     return `AI 商品分析失败 (${response.status})`;
   }
 
@@ -1944,11 +1979,100 @@ function normalizeImageStudioPlanList(payload) {
   return [];
 }
 
+function normalizeImageStudioTranslationList(payload, fallbackTexts = []) {
+  if (Array.isArray(payload)) {
+    return payload.map((item, index) => (typeof item === "string" ? item : String(fallbackTexts[index] || "")));
+  }
+  if (Array.isArray(payload?.translations)) {
+    return payload.translations.map((item, index) => (typeof item === "string" ? item : String(fallbackTexts[index] || "")));
+  }
+  return Array.isArray(fallbackTexts) ? [...fallbackTexts] : [];
+}
+
 function getImageStudioPlanForType(plans = [], imageType = "") {
   if (!Array.isArray(plans) || !imageType) {
     return null;
   }
   return plans.find((plan) => plan?.imageType === imageType) || null;
+}
+
+function getImageStudioGeneratePlanGroups(plans = [], options = {}) {
+  const normalizedPlans = Array.isArray(plans)
+    ? plans.filter((plan) => plan && typeof plan === "object")
+    : [];
+  const prioritizeMain = Boolean(options?.prioritizeMain);
+
+  if (!prioritizeMain || normalizedPlans.length <= 1) {
+    return normalizedPlans.length > 0 ? [normalizedPlans] : [];
+  }
+
+  const mainPlans = normalizedPlans.filter((plan) => plan?.imageType === "main");
+  const otherPlans = normalizedPlans.filter((plan) => plan?.imageType !== "main");
+
+  if (mainPlans.length === 0 || otherPlans.length === 0) {
+    return [normalizedPlans];
+  }
+
+  return [mainPlans, otherPlans];
+}
+
+async function streamImageStudioGenerateBatch({ target, jobId, payload = {}, controller, plans = [], onEvent }) {
+  if (!Array.isArray(plans) || plans.length === 0) {
+    return;
+  }
+
+  const response = await imageStudioFetch("/api/generate", {
+    method: "POST",
+    body: createImageStudioFormData({
+      files: payload.files,
+      fields: {
+        plans,
+        productMode: payload.productMode,
+        imageLanguage: payload.imageLanguage,
+        imageSize: payload.imageSize,
+      },
+    }),
+    signal: controller?.signal,
+  });
+
+  if (!response.ok) {
+    const errorPayload = await readImageStudioResponse(response);
+    const message = errorPayload && typeof errorPayload === "object" && typeof errorPayload.error === "string"
+      ? errorPayload.error
+      : (typeof errorPayload === "string" && errorPayload ? errorPayload : "AI 图片请求失败");
+    throw new Error(message);
+  }
+
+  if (!response.body) {
+    throw new Error("AI 图片返回为空，无法读取响应流");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    buffer = parseImageStudioSseChunk(buffer, (eventPayload) => {
+      emitImageStudioEvent(target, {
+        jobId,
+        type: "generate:event",
+        event: eventPayload,
+      });
+      onEvent?.(eventPayload);
+    });
+  }
+
+  parseImageStudioSseChunk(buffer, (eventPayload) => {
+    emitImageStudioEvent(target, {
+      jobId,
+      type: "generate:event",
+      event: eventPayload,
+    });
+    onEvent?.(eventPayload);
+  });
 }
 
 async function saveImageStudioHistorySnapshot(payload = {}) {
@@ -1974,10 +2098,12 @@ async function saveImageStudioHistorySnapshot(payload = {}) {
 
 function parseImageStudioSseChunk(buffer, onEvent) {
   let remaining = buffer;
-  let boundaryIndex = remaining.indexOf("\n\n");
-  while (boundaryIndex !== -1) {
+  let boundaryMatch = remaining.match(/\r?\n\r?\n/);
+  while (boundaryMatch) {
+    const boundaryIndex = boundaryMatch.index ?? -1;
+    if (boundaryIndex < 0) break;
     const chunk = remaining.slice(0, boundaryIndex);
-    remaining = remaining.slice(boundaryIndex + 2);
+    remaining = remaining.slice(boundaryIndex + boundaryMatch[0].length);
     const lines = chunk.split(/\r?\n/);
     for (const line of lines) {
       const trimmed = line.trim();
@@ -1988,7 +2114,7 @@ function parseImageStudioSseChunk(buffer, onEvent) {
         onEvent(JSON.parse(payloadText));
       } catch {}
     }
-    boundaryIndex = remaining.indexOf("\n\n");
+    boundaryMatch = remaining.match(/\r?\n\r?\n/);
   }
   return remaining;
 }
@@ -2000,6 +2126,10 @@ async function streamImageStudioGenerate(target, jobId, payload = {}) {
   const emittedComplete = { current: false };
   const normalizedPlans = Array.isArray(payload.plans) ? payload.plans : [];
   const totalPlans = normalizedPlans.length;
+  const planGroups = getImageStudioGeneratePlanGroups(normalizedPlans, {
+    prioritizeMain: false,
+  });
+  const mainPriorityEnabled = false;
 
   const appendGeneratedImage = (eventPayload) => {
     if (eventPayload?.status !== "done" || !eventPayload?.imageUrl) {
@@ -2098,6 +2228,48 @@ async function streamImageStudioGenerate(target, jobId, payload = {}) {
   try {
     updateImageStudioJob(jobId, { status: "running", progress: { done: 0, total: totalPlans, step: "开始生成" } });
     emitImageStudioEvent(target, { jobId, type: "generate:started" });
+    if (mainPriorityEnabled) {
+      updateImageStudioJob(jobId, {
+        progress: {
+          done: 0,
+          total: totalPlans,
+          step: "主图优先生成中...",
+        },
+      });
+
+      for (let groupIndex = 0; groupIndex < planGroups.length; groupIndex += 1) {
+        if (controller.signal.aborted) {
+          break;
+        }
+
+        const currentPlans = planGroups[groupIndex] || [];
+        const isMainStage = currentPlans.some((plan) => plan?.imageType === "main");
+
+        updateImageStudioJob(jobId, {
+          progress: {
+            done: generatedImages.length,
+            total: totalPlans,
+            step: isMainStage ? "主图优先生成中..." : "主图已完成，继续生成其他图片",
+          },
+        });
+
+        await streamImageStudioGenerateBatch({
+          target,
+          jobId,
+          payload,
+          controller,
+          plans: currentPlans,
+          onEvent: appendGeneratedImage,
+        });
+      }
+
+      if (controller.signal.aborted) {
+        throw new Error("generate cancelled");
+      }
+
+      await emitComplete();
+      return;
+    }
 
     const response = await imageStudioFetch("/api/generate", {
       method: "POST",
@@ -2247,10 +2419,13 @@ async function createWindow() {
     }
   }
 
-  // DevTools: 按 F12 手动打开，不自动打开（避免遮挡页面）
+  // DevTools: 按 F12 手动打开
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (input.key === "F12") mainWindow.webContents.toggleDevTools();
   });
+  if (isDev && process.env.TEMU_OPEN_DEVTOOLS === "1") {
+    mainWindow.webContents.openDevTools({ mode: "bottom" });
+  }
   mainWindow.on("closed", () => { mainWindow = null; });
 }
 
@@ -2707,6 +2882,9 @@ ipcMain.handle("automation:scrape-delivery", async () => { return sendCmd("scrap
 ipcMain.handle("automation:scrape-global-performance", async (_e, params) => {
   return sendCmd("scrape_global_performance", { range: params?.range || "30d" });
 });
+ipcMain.handle("automation:scrape-flux-product-detail", async (_e, params) => {
+  return sendCmd("scrape_flux_product_detail", params || {});
+});
 ipcMain.handle("automation:scrape-skc-region-detail", async (_e, params) => {
   return sendCmd("scrape_skc_region_detail", { productId: params?.productId, range: params?.range || "30d" });
 });
@@ -2727,6 +2905,28 @@ ipcMain.handle("automation:close", async () => {
 ipcMain.handle("automation:ping", async () => {
   return sendCmd("ping");
 });
+
+// ============ 竞品分析 IPC ============
+
+ipcMain.handle("competitor:search", async (_e, params) => sendCmd("competitor_search", params || {}));
+ipcMain.handle("competitor:track", async (_e, params) => sendCmd("competitor_track", params || {}));
+ipcMain.handle("competitor:batch-track", async (_e, params) => sendCmd("competitor_batch_track", params || {}));
+ipcMain.handle("competitor:auto-register", async (_e, params) => sendCmd("competitor_auto_register", params || {}, { timeoutMs: 10 * 60 * 1000 }));
+ipcMain.handle("competitor:set-yunqi-token", async (_e, token) => sendCmd("set_yunqi_token", { token }));
+ipcMain.handle("competitor:get-yunqi-token", async () => sendCmd("get_yunqi_token", {}));
+ipcMain.handle("competitor:set-yunqi-credentials", async (_e, params) => sendCmd("yunqi_set_credentials", params || {}));
+ipcMain.handle("competitor:get-yunqi-credentials", async () => sendCmd("yunqi_get_credentials", {}));
+ipcMain.handle("competitor:delete-yunqi-credentials", async () => sendCmd("yunqi_delete_credentials", {}));
+ipcMain.handle("competitor:yunqi-auto-login", async () => sendCmd("yunqi_auto_login", {}, { timeoutMs: 2 * 60 * 1000 }));
+
+// ============ 云启数据库 IPC ============
+ipcMain.handle("competitor:fetch-yunqi-token", async () => sendCmd("fetch_yunqi_token_from_browser", {}, { timeoutMs: 5 * 60 * 1000 }));
+ipcMain.handle("yunqi-db:import", async (_e, params) => sendCmd("yunqi_db_import", params || {}, { timeoutMs: 120000 }));
+ipcMain.handle("yunqi-db:search", async (_e, params) => sendCmd("yunqi_db_search", params || {}));
+ipcMain.handle("yunqi-db:stats", async () => sendCmd("yunqi_db_stats", {}));
+ipcMain.handle("yunqi-db:top", async (_e, params) => sendCmd("yunqi_db_top", params || {}));
+ipcMain.handle("yunqi-db:info", async () => sendCmd("yunqi_db_info", {}));
+ipcMain.handle("yunqi-db:sync-online", async (_e, params) => sendCmd("yunqi_db_sync_online", params || {}, { timeoutMs: 300000 }));
 
 // ============ AI 出图 IPC ============
 
@@ -2831,6 +3031,42 @@ ipcMain.handle("image-studio:regenerate-analysis", async (_event, payload) => {
       return requestRegenerateAnalysis();
     }
     throw error;
+  }
+});
+
+ipcMain.handle("image-studio:translate", async (_event, payload) => {
+  const texts = Array.isArray(payload?.texts)
+    ? payload.texts.map((item) => (typeof item === "string" ? item : String(item || "")))
+    : [];
+
+  if (texts.length === 0) {
+    return { translations: [] };
+  }
+
+  await normalizeAnalyzeModelBeforeRequest();
+
+  try {
+    const result = await imageStudioJson("/api/translate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ texts }),
+    });
+    return {
+      translations: normalizeImageStudioTranslationList(result, texts),
+    };
+  } catch (error) {
+    const upgraded = await ensureCompatibleAnalyzeModel();
+    if (!upgraded) {
+      throw error;
+    }
+    const result = await imageStudioJson("/api/translate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ texts }),
+    });
+    return {
+      translations: normalizeImageStudioTranslationList(result, texts),
+    };
   }
 });
 
@@ -3329,9 +3565,20 @@ ipcMain.handle("store:get", async (_, key) => {
   return recoverScopedStoreValueIfNeeded(normalizedKey, value);
 });
 
+ipcMain.handle("store:get-many", async (_, keys) => {
+  const list = Array.isArray(keys) ? keys : [];
+  const entries = await Promise.all(
+    list.map(async (key) => {
+      const normalizedKey = normalizeStoreKey(key);
+      const value = await readStoreJsonWithRecoveryAsync(getStoreFilePath(normalizedKey), normalizedKey);
+      return [key, await recoverScopedStoreValueIfNeeded(normalizedKey, value)];
+    }),
+  );
+  return Object.fromEntries(entries);
+});
+
 const _storeWriteLocks = new Map();
-ipcMain.handle("store:set", async (_, key, data) => {
-  const normalizedKey = normalizeStoreKey(key);
+async function persistStoreValue(normalizedKey, data) {
   // 串行化同 key 写入，避免并发文件冲突
   const prev = _storeWriteLocks.get(normalizedKey) || Promise.resolve();
   let resolveLock;
@@ -3363,4 +3610,41 @@ ipcMain.handle("store:set", async (_, key, data) => {
       _storeWriteLocks.delete(normalizedKey);
     }
   }
+}
+
+function tryAcquireLoopbackPort(port) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.unref();
+    probe.once("error", () => resolve(0));
+    probe.listen({ host: "127.0.0.1", port }, () => {
+      const address = probe.address();
+      const nextPort = address && typeof address === "object" ? Number(address.port) : 0;
+      probe.close(() => resolve(nextPort > 0 ? nextPort : 0));
+    });
+  });
+}
+
+async function findAvailableWorkerPort(preferredPort = DEFAULT_WORKER_PORT) {
+  const preferred = await tryAcquireLoopbackPort(preferredPort);
+  if (preferred > 0) return preferred;
+
+  const fallback = await tryAcquireLoopbackPort(0);
+  if (fallback > 0) return fallback;
+
+  throw new Error("无法分配可用的 Worker 端口");
+}
+
+ipcMain.handle("store:set", async (_, key, data) => {
+  const normalizedKey = normalizeStoreKey(key);
+  return persistStoreValue(normalizedKey, data);
+});
+
+ipcMain.handle("store:set-many", async (_, entries) => {
+  const nextEntries = entries && typeof entries === "object" ? Object.entries(entries) : [];
+  for (const [key, value] of nextEntries) {
+    const normalizedKey = normalizeStoreKey(key);
+    await persistStoreValue(normalizedKey, value);
+  }
+  return true;
 });

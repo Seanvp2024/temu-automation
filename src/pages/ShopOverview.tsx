@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import {
   Alert,
   Button,
@@ -18,20 +18,22 @@ import {
 import { ReloadOutlined } from "@ant-design/icons";
 import { parseDashboardData, parseFluxData, parseSalesData } from "../utils/parseRawApis";
 import { APP_SETTINGS_KEY, normalizeAppSettings } from "../utils/appSettings";
-import { setStoreValueForActiveAccount } from "../utils/multiStore";
+import {
+  setStoreValueForActiveAccount,
+} from "../utils/multiStore";
 import {
   COLLECTION_DIAGNOSTICS_KEY,
   getCollectionDataIssue,
   normalizeCollectionDiagnostics,
   type CollectionDiagnostics,
 } from "../utils/collectionDiagnostics";
-import { getFirstExistingStoreValue, getStoreValue, STORE_KEY_ALIASES } from "../utils/storeCompat";
-import { ACTIVE_ACCOUNT_CHANGED_EVENT } from "../utils/multiStore";
+import { useStoreRefresh } from "../hooks/useStoreRefresh";
+import { getStoreValues, STORE_KEY_ALIASES } from "../utils/storeCompat";
 import PageHeader from "../components/PageHeader";
 import StatCard from "../components/StatCard";
 import EmptyGuide from "../components/EmptyGuide";
 
-const { Text } = Typography;
+const { Text, Paragraph } = Typography;
 
 const store = window.electronAPI?.store;
 
@@ -134,17 +136,6 @@ const ShopOverview: React.FC = () => {
   const [stockNotice, setStockNotice] = useState<{ type: "info" | "warning" | "error"; message: string } | null>(null);
   const [savingStockThreshold, setSavingStockThreshold] = useState(false);
 
-  useEffect(() => {
-    loadAllData();
-    const handleActiveAccountChanged = () => {
-      void loadAllData();
-    };
-    window.addEventListener(ACTIVE_ACCOUNT_CHANGED_EVENT, handleActiveAccountChanged);
-    return () => {
-      window.removeEventListener(ACTIVE_ACCOUNT_CHANGED_EVENT, handleActiveAccountChanged);
-    };
-  }, []);
-
   const loadAllData = async () => {
     setLoading(true);
     setDashboard(null);
@@ -162,42 +153,43 @@ const ShopOverview: React.FC = () => {
     setCheckup(null);
     setQcDetail(null);
     try {
-      const results = await Promise.allSettled([
-        getStoreValue(store, "temu_dashboard"),
-        getStoreValue(store, "temu_flux"),
-        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.performance),
-        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.soldout),
-        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.delivery),
-        getStoreValue(store, "temu_raw_qualityDashboard"),
-        getStoreValue(store, "temu_raw_governDashboard"),
-        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.marketingActivity),
-        getStoreValue(store, "temu_raw_adsHome"),
-        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.fluxUS),
-        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.fluxEU),
-        getStoreValue(store, "temu_raw_qualityDashboardEU"),
-        getStoreValue(store, "temu_raw_checkup"),
-        getFirstExistingStoreValue(store, STORE_KEY_ALIASES.qcDetail),
-        getStoreValue(store, COLLECTION_DIAGNOSTICS_KEY),
-        getStoreValue(store, APP_SETTINGS_KEY),
+      const storeValues = await getStoreValues(store, [
+        "temu_dashboard",
+        "temu_flux",
+        ...STORE_KEY_ALIASES.performance,
+        ...STORE_KEY_ALIASES.soldout,
+        ...STORE_KEY_ALIASES.delivery,
+        "temu_raw_qualityDashboard",
+        "temu_raw_governDashboard",
+        ...STORE_KEY_ALIASES.marketingActivity,
+        "temu_raw_adsHome",
+        ...STORE_KEY_ALIASES.fluxUS,
+        ...STORE_KEY_ALIASES.fluxEU,
+        "temu_raw_qualityDashboardEU",
+        "temu_raw_checkup",
+        ...STORE_KEY_ALIASES.qcDetail,
+        COLLECTION_DIAGNOSTICS_KEY,
+        APP_SETTINGS_KEY,
       ]);
-      const val = (i: number) => results[i].status === "fulfilled" ? (results[i] as PromiseFulfilledResult<any>).value : null;
+      const pickFirst = (keys: readonly string[]) =>
+        keys.map((key) => storeValues[key]).find((value) => value !== null && value !== undefined) ?? null;
 
-      const dashRaw = val(0);
-      const fluxRaw = val(1);
-      const perfRaw = val(2);
-      const soldoutRaw = val(3);
-      const deliveryRaw = val(4);
-      const qualityRaw = val(5);
-      const governRaw = val(6);
-      const marketingRaw = val(7);
-      const adsRaw = val(8);
-      const fluxUSRaw = val(9);
-      const fluxEURaw = val(10);
-      const qualityEURaw = val(11);
-      const checkupRaw = val(12);
-      const qcDetailRaw = val(13);
-      const diagnosticsRaw = val(14);
-      const appSettingsRaw = val(15);
+      const dashRaw = storeValues.temu_dashboard;
+      const fluxRaw = storeValues.temu_flux;
+      const perfRaw = pickFirst(STORE_KEY_ALIASES.performance);
+      const soldoutRaw = pickFirst(STORE_KEY_ALIASES.soldout);
+      const deliveryRaw = pickFirst(STORE_KEY_ALIASES.delivery);
+      const qualityRaw = storeValues.temu_raw_qualityDashboard;
+      const governRaw = storeValues.temu_raw_governDashboard;
+      const marketingRaw = pickFirst(STORE_KEY_ALIASES.marketingActivity);
+      const adsRaw = storeValues.temu_raw_adsHome;
+      const fluxUSRaw = pickFirst(STORE_KEY_ALIASES.fluxUS);
+      const fluxEURaw = pickFirst(STORE_KEY_ALIASES.fluxEU);
+      const qualityEURaw = storeValues.temu_raw_qualityDashboardEU;
+      const checkupRaw = storeValues.temu_raw_checkup;
+      const qcDetailRaw = pickFirst(STORE_KEY_ALIASES.qcDetail);
+      const diagnosticsRaw = storeValues[COLLECTION_DIAGNOSTICS_KEY];
+      const appSettingsRaw = storeValues[APP_SETTINGS_KEY];
 
       if (dashRaw) setDashboard(parseDashboardData(dashRaw));
       if (fluxRaw) setFlux(parseFluxData(fluxRaw));
@@ -226,6 +218,35 @@ const ShopOverview: React.FC = () => {
   };
 
   // ========== 数据提取 ==========
+
+  useStoreRefresh({
+    load: loadAllData,
+    watchKeys: [
+      "temu_dashboard",
+      "temu_flux",
+      "temu_raw_performance",
+      "temu_performance",
+      "temu_raw_soldout",
+      "temu_soldout",
+      "temu_raw_delivery",
+      "temu_delivery",
+      "temu_raw_qualityDashboard",
+      "temu_raw_governDashboard",
+      "temu_raw_marketingActivity",
+      "temu_marketing_activity",
+      "temu_raw_adsHome",
+      "temu_raw_fluxUS",
+      "temu_flux_us",
+      "temu_raw_fluxEU",
+      "temu_flux_eu",
+      "temu_raw_qualityDashboardEU",
+      "temu_raw_checkup",
+      "temu_raw_qcDetail",
+      "temu_qc_detail",
+      COLLECTION_DIAGNOSTICS_KEY,
+      APP_SETTINGS_KEY,
+    ],
+  });
 
   const stats = dashboard?.statistics;
   const ranking = dashboard?.ranking;
@@ -655,13 +676,20 @@ const ShopOverview: React.FC = () => {
                     dataSource={productList.map((p: any, i: number) => ({ key: i, ...p }))}
                     columns={[
                       {
-                        title: "商品名称", dataIndex: "productName", key: "name", width: 350, ellipsis: true,
+                        title: "商品名称", dataIndex: "productName", key: "name", width: 420,
                         render: (v: string, r: any) => (
-                          <Space>
+                          <Space align="start">
                             {r.productImageList?.carouselImageUrls?.[0] && (
                               <img src={r.productImageList.carouselImageUrls[0]} alt="" style={{ width: 40, height: 40, borderRadius: 6, objectFit: "cover" }} />
                             )}
-                            <span style={{ fontSize: 13 }}>{v?.slice(0, 60) || "-"}</span>
+                            <div style={{ minWidth: 0 }}>
+                              <Paragraph
+                                ellipsis={{ rows: 2, tooltip: v || "-" }}
+                                style={{ marginBottom: 0, fontSize: 13, lineHeight: 1.5 }}
+                              >
+                                {v || "-"}
+                              </Paragraph>
+                            </div>
                           </Space>
                         ),
                       },
@@ -683,6 +711,7 @@ const ShopOverview: React.FC = () => {
                     bordered={false}
                     pagination={{ pageSize: 10 }}
                     size="small"
+                    scroll={{ x: 860 }}
                   />
                 </div>
               </div>
@@ -721,14 +750,19 @@ const ShopOverview: React.FC = () => {
                 dataSource={qcItems.map((item: any, i: number) => ({ key: i, ...item }))}
                 columns={[
                   {
-                    title: "商品信息", dataIndex: "productName", key: "name", width: 300, ellipsis: true,
+                    title: "商品信息", dataIndex: "productName", key: "name", width: 360,
                     render: (v: string, r: any) => {
                       const img = r.productImageList?.carouselImageUrls?.[0] || r.imageUrl || r.goodsImageUrl;
                       return (
-                        <Space>
+                        <Space align="start">
                           {img && <img src={img} alt="" style={{ width: 40, height: 40, borderRadius: 6, objectFit: "cover" }} />}
-                          <div>
-                            <div style={{ fontSize: 13, fontWeight: 500 }}>{(v || r.goodsName || "-").slice(0, 50)}</div>
+                          <div style={{ minWidth: 0 }}>
+                            <Paragraph
+                              ellipsis={{ rows: 2, tooltip: v || r.goodsName || "-" }}
+                              style={{ marginBottom: 0, fontSize: 13, fontWeight: 500, lineHeight: 1.5 }}
+                            >
+                              {v || r.goodsName || "-"}
+                            </Paragraph>
                             <div style={{ fontSize: 11, color: "#999" }}>
                               {r.spuId ? `SPU: ${r.spuId}` : ""} {r.skcId ? `SKC: ${r.skcId}` : ""} {r.productSkcId ? `SKC: ${r.productSkcId}` : ""}
                             </div>
@@ -770,6 +804,7 @@ const ShopOverview: React.FC = () => {
                 bordered={false}
                 pagination={{ pageSize: 10 }}
                 size="small"
+                scroll={{ x: 980 }}
               />
             </div>
           </div>
@@ -1007,7 +1042,17 @@ const ShopOverview: React.FC = () => {
             rowKey="key"
             pagination={{ pageSize: 10 }}
             columns={[
-              { title: "商品", dataIndex: "title", key: "title", ellipsis: true },
+              {
+                title: "商品",
+                dataIndex: "title",
+                key: "title",
+                width: 320,
+                render: (value: string) => (
+                  <Paragraph ellipsis={{ rows: 2, tooltip: value || "-" }} style={{ marginBottom: 0, lineHeight: 1.5 }}>
+                    {value || "-"}
+                  </Paragraph>
+                ),
+              },
               { title: "SKC", dataIndex: "skcId", key: "skcId", width: 140 },
               { title: "SKU", dataIndex: "skuCode", key: "skuCode", width: 140 },
               {
@@ -1021,6 +1066,7 @@ const ShopOverview: React.FC = () => {
               },
               { title: "供货状态", dataIndex: "supplyStatus", key: "supplyStatus", width: 140 },
             ]}
+            scroll={{ x: 820 }}
           />
         ) : (
           <EmptyGuide title={stockLastCheckedAt ? "当前没有低库存商品" : "尚未执行库存检查"} description="点击「立即检查」开始库存预警检查" />

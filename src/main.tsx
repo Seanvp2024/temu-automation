@@ -23,12 +23,12 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
           colorInfo: "#1677ff",
           borderRadius: 12,
           fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif',
-          fontSize: 14,
+          fontSize: 16,
           colorBgContainer: "#ffffff",
           colorBgLayout: "#f7f8fa",
           colorText: "#1a1a2e",
           colorTextSecondary: "#8c8c8c",
-          controlHeight: 40,
+          controlHeight: 42,
         },
         components: {
           Card: {
@@ -39,24 +39,24 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
             borderRadiusLG: 10,
             headerBg: "#fafafa",
             headerColor: "#595959",
-            fontSize: 13,
+            fontSize: 15,
           },
           Tag: {
             borderRadiusSM: 4,
           },
           Button: {
             borderRadius: 10,
-            controlHeight: 40,
-            controlHeightLG: 44,
+            controlHeight: 42,
+            controlHeightLG: 46,
           },
           Menu: {
             itemBorderRadius: 10,
             itemMarginInline: 8,
-            itemHeight: 44,
+            itemHeight: 46,
           },
           Statistic: {
-            titleFontSize: 13,
-            contentFontSize: 28,
+            titleFontSize: 15,
+            contentFontSize: 30,
           },
           Tabs: {
             cardGutter: 4,

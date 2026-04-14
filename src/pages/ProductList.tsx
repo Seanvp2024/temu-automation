@@ -1,20 +1,32 @@
-import { useEffect, useMemo, useState } from "react";
-import { Alert, Button, Card, Col, Divider, Drawer, Empty, Image, Input, Modal, Popover, Radio, Row, Segmented, Space, Spin, Statistic, Table, Tabs, Tag, Tooltip, Typography, message } from "antd";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Alert, Button, Card, Checkbox, Col, Divider, Drawer, Empty, Image, Input, Modal, Popover, Progress, Radio, Row, Segmented, Space, Spin, Statistic, Table, Tabs, Tag, Tooltip, Typography, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
   AppstoreOutlined,
+  DownOutlined,
+  EyeOutlined,
   FireOutlined,
   PictureOutlined,
   SearchOutlined,
+  SettingOutlined,
   ShoppingCartOutlined,
   StopOutlined,
   SyncOutlined,
+  UpOutlined,
   WarningOutlined,
 } from "@ant-design/icons";
 import {
   Area,
   AreaChart,
+  Bar,
+  BarChart,
   CartesianGrid,
+  Cell,
+  Legend,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip as ReTooltip,
   XAxis,
@@ -25,6 +37,7 @@ import EmptyGuide from "../components/EmptyGuide";
 import PageHeader from "../components/PageHeader";
 import {
   parseOrdersData,
+  parseFluxData,
   parseProductCountSummary,
   parseProductsData,
   parseSalesData,
@@ -39,6 +52,7 @@ import { getStoreValue } from "../utils/storeCompat";
 import { ACTIVE_ACCOUNT_CHANGED_EVENT, STORE_VALUE_UPDATED_EVENT } from "../utils/multiStore";
 
 const store = window.electronAPI?.store;
+const automation = window.electronAPI?.automation;
 
 type StatusFilter = "all" | "在售" | "已下架" | "未发布" | "other" | "saleOut" | "soonSaleOut" | "shortage" | "advice";
 
@@ -56,6 +70,54 @@ type ProductSkuSummary = {
   specName: string;
   extCode: string;
 };
+
+type FluxSiteKey = "global" | "us" | "eu";
+
+interface ProductFluxSiteData {
+  siteKey: FluxSiteKey;
+  siteLabel: string;
+  syncedAt: string;
+  summary: ProductTrafficSummary | null;
+  summaryByRange: Record<string, ProductTrafficSummary>;
+  items: any[];
+  itemsByRange: Record<string, any[]>;
+  availableRanges: string[];
+  primaryRangeLabel: string;
+}
+
+interface ProductTrafficSummary {
+  siteKey: FluxSiteKey;
+  siteLabel: string;
+  syncedAt: string;
+  dataDate: string;
+  updateTime: string;
+  growDataText: string;
+  exposeNum: number;
+  clickNum: number;
+  detailVisitNum: number;
+  detailVisitorNum: number;
+  addToCartUserNum: number;
+  collectUserNum: number;
+  buyerNum: number;
+  payGoodsNum: number;
+  payOrderNum: number;
+  searchExposeNum: number;
+  searchClickNum: number;
+  searchPayGoodsNum: number;
+  recommendExposeNum: number;
+  recommendClickNum: number;
+  recommendPayGoodsNum: number;
+  trendExposeNum: number;
+  trendPayOrderNum: number;
+  exposeClickRate: number;
+  clickPayRate: number;
+  dataOrigin?: "flux" | "gp" | "mall";
+  rangeTotal?: number;
+  changeRate?: number;
+  coveredRegions?: number;
+  trendPoints?: Array<{ date: string; sales: number }>;
+  regionRows?: Array<{ regionId?: string | number; regionName?: string; sales?: number }>;
+}
 
 interface ProductItem {
   title: string;
@@ -110,6 +172,9 @@ interface ProductItem {
   salesRaw?: any;
   salesRawSku?: any;
   trendDaily?: Array<{ date: string; salesNumber: number }>;
+  fluxItems?: any[];
+  fluxSyncedAt?: string;
+  fluxSites?: ProductFluxSiteData[];
 }
 
 interface ProductSourceState {
@@ -138,8 +203,85 @@ const EMPTY_COUNT_SUMMARY: ProductCountSummary = {
   offSaleCount: 0,
 };
 
+const PRODUCT_ID_LOOKUP_FIELDS = [
+  "skcId",
+  "skuId",
+  "spuId",
+  "productId",
+  "productSkcId",
+  "productSkuId",
+  "productSpuId",
+  "goodsSkcId",
+] as const;
+
 const EMPTY_IMAGE_FALLBACK =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mN8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+
+const PRODUCT_FLUX_SITE_OPTIONS: Array<{ key: FluxSiteKey; label: string }> = [
+  { key: "global", label: "全球" },
+  { key: "us", label: "美国" },
+  { key: "eu", label: "欧区" },
+];
+
+const PRODUCT_FLUX_RANGE_ORDER = ["今日", "近7日", "近30日", "本周", "本月", "昨日"];
+
+const EMPTY_PARSED_FLUX = {
+  summary: null,
+  items: [],
+  syncedAt: "",
+  summaryByRange: {} as Record<string, any>,
+  itemsByRange: {} as Record<string, any[]>,
+  availableRanges: [] as string[],
+  primaryRangeLabel: "",
+};
+
+function getParsedFluxSnapshot(source: any) {
+  const parsed = source
+    ? parseFluxData(source)
+    : { summary: null, items: [], syncedAt: "", summaryByRange: {}, itemsByRange: {}, availableRanges: [], primaryRangeLabel: "近7日" };
+  const rangeItemCount = Object.values(parsed?.itemsByRange || {}).reduce((total: number, items: any) => {
+    return total + (Array.isArray(items) ? items.length : 0);
+  }, 0);
+  const rangeTrendCount = Object.values(parsed?.summaryByRange || {}).reduce((total: number, summary: any) => {
+    return total + (Array.isArray(summary?.trendList) ? summary.trendList.length : 0);
+  }, 0);
+  return {
+    source,
+    parsed,
+    itemCount: Math.max(Array.isArray(parsed?.items) ? parsed.items.length : 0, rangeItemCount),
+    trendCount: Math.max(Array.isArray(parsed?.summary?.trendList) ? parsed.summary.trendList.length : 0, rangeTrendCount),
+    syncedAt: String(parsed?.syncedAt || ""),
+  };
+}
+
+function pickPreferredFluxSource(primarySource: any, fallbackSource: any) {
+  if (!fallbackSource) return primarySource;
+  if (!primarySource) return fallbackSource;
+
+  const primary = getParsedFluxSnapshot(primarySource);
+  const fallback = getParsedFluxSnapshot(fallbackSource);
+
+  if (fallback.itemCount > 0 && primary.itemCount === 0) return fallbackSource;
+  if (fallback.itemCount > primary.itemCount) return fallbackSource;
+  if (fallback.trendCount > primary.trendCount && fallback.itemCount >= primary.itemCount) return fallbackSource;
+  if (fallback.syncedAt && !primary.syncedAt) return fallbackSource;
+  return primarySource;
+}
+
+const PRODUCT_TRAFFIC_COLORS = {
+  expose: "#ff8a1f",
+  clickRate: "#4e79a7",
+  clickPayRate: "#16a34a",
+  detail: "#2563eb",
+  cart: "#9333ea",
+  collect: "#ec4899",
+  order: "#0f766e",
+  search: "#ff8a1f",
+  recommend: "#4e79a7",
+  other: "#f6bd16",
+  grid: "#eceef2",
+  axis: "#8c8c8c",
+};
 
 function normalizeLookupValue(value: string) {
   return (value || "").replace(/\s+/g, "").trim().toLowerCase();
@@ -342,6 +484,409 @@ function renderStatusTag(text: string, color: "default" | "success" | "warning" 
   return <Tag color={color}>{text}</Tag>;
 }
 
+function sortFluxRangeLabels(labels: string[]) {
+  return Array.from(new Set(labels.filter(Boolean))).sort((left, right) => {
+    const leftIndex = PRODUCT_FLUX_RANGE_ORDER.indexOf(left);
+    const rightIndex = PRODUCT_FLUX_RANGE_ORDER.indexOf(right);
+    if (leftIndex === -1 && rightIndex === -1) return left.localeCompare(right, "zh-CN");
+    if (leftIndex === -1) return 1;
+    if (rightIndex === -1) return -1;
+    return leftIndex - rightIndex;
+  });
+}
+
+function mapGpRangeLabel(range: string) {
+  switch (String(range || "").trim()) {
+    case "1d":
+      return "昨日";
+    case "7d":
+      return "近7日";
+    case "30d":
+      return "近30日";
+    default:
+      return String(range || "").trim() || "近7日";
+  }
+}
+
+function getRangeDaysByLabel(label: string) {
+  switch (label) {
+    case "昨日":
+      return 1;
+    case "近7日":
+      return 7;
+    case "近30日":
+      return 30;
+    default:
+      return 1;
+  }
+}
+
+function normalizeGpTrendPoints(trend: any[] = []) {
+  return trend
+    .map((item) => ({
+      date: String(item?.day || item?.date || "").trim(),
+      sales: Number(item?.quantity ?? item?.sales ?? item?.value) || 0,
+    }))
+    .filter((item) => Boolean(item.date))
+    .sort((left, right) => left.date.localeCompare(right.date));
+}
+
+function buildGpFallbackFluxSite(gp: any): ProductFluxSiteData | null {
+  if (!gp || !gp.productId) return null;
+  const availableRangeKeys = Array.from(
+    new Set(
+      (Array.isArray(gp.availableRanges) ? gp.availableRanges : [gp.defaultRange || "7d"])
+        .map((item: any) => String(item || "").trim())
+        .filter(Boolean),
+    ),
+  ) as string[];
+  const summaryByRange: Record<string, ProductTrafficSummary> = {};
+  const itemsByRange: Record<string, any[]> = {};
+  const trendPoints = normalizeGpTrendPoints(gp.trend);
+  const defaultRangeKey = String(gp.defaultRange || availableRangeKeys[0] || "7d");
+
+  for (const rangeKey of availableRangeKeys) {
+    const rangeLabel = mapGpRangeLabel(rangeKey);
+    const detail = gp.regionDetailsByRange?.[rangeKey] || (rangeKey === defaultRangeKey ? gp.regionDetail : null) || null;
+    const regionRows = Array.isArray(detail?.rows) ? detail.rows : [];
+    const rangeTotal = Number(detail?.total) || (rangeKey === defaultRangeKey ? Number(gp.sales) || 0 : 0);
+    itemsByRange[rangeLabel] = regionRows;
+    summaryByRange[rangeLabel] = {
+      siteKey: "global",
+      siteLabel: "全球",
+      syncedAt: gp.syncedAt || "",
+      dataDate: trendPoints[trendPoints.length - 1]?.date || "",
+      updateTime: gp.syncedAt || "",
+      growDataText:
+        Number.isFinite(Number(gp.changeRate)) && Number(gp.changeRate) !== 0
+          ? `动销变化 ${Number(gp.changeRate) > 0 ? "+" : ""}${Number(gp.changeRate).toFixed(1)}%`
+          : "已采集动销快照",
+      exposeNum: 0,
+      clickNum: 0,
+      detailVisitNum: 0,
+      detailVisitorNum: 0,
+      addToCartUserNum: 0,
+      collectUserNum: 0,
+      buyerNum: rangeTotal,
+      payGoodsNum: rangeTotal,
+      payOrderNum: rangeTotal,
+      searchExposeNum: 0,
+      searchClickNum: 0,
+      searchPayGoodsNum: 0,
+      recommendExposeNum: 0,
+      recommendClickNum: 0,
+      recommendPayGoodsNum: 0,
+      trendExposeNum: 0,
+      trendPayOrderNum: rangeTotal,
+      exposeClickRate: 0,
+      clickPayRate: 0,
+      dataOrigin: "gp",
+      rangeTotal,
+      changeRate: Number(gp.changeRate) || 0,
+      coveredRegions: regionRows.length,
+      trendPoints,
+      regionRows,
+    };
+  }
+
+  const availableRanges = sortFluxRangeLabels(Object.keys(summaryByRange));
+  if (availableRanges.length === 0) return null;
+  const primaryRangeLabel = availableRanges.includes(mapGpRangeLabel(defaultRangeKey))
+    ? mapGpRangeLabel(defaultRangeKey)
+    : availableRanges[0];
+
+  return {
+    siteKey: "global",
+    siteLabel: "全球",
+    syncedAt: gp.syncedAt || "",
+    summary: summaryByRange[primaryRangeLabel] || null,
+    summaryByRange,
+    items: itemsByRange[primaryRangeLabel] || [],
+    itemsByRange,
+    availableRanges,
+    primaryRangeLabel,
+  };
+}
+
+function toPercentValue(value: unknown, fallbackNumerator?: number, fallbackDenominator?: number) {
+  const raw = Number(value);
+  if (Number.isFinite(raw) && raw > 1) return raw;
+  if (Number.isFinite(raw) && raw >= 0) return raw * 100;
+  if (fallbackDenominator && fallbackDenominator > 0) {
+    return (Number(fallbackNumerator || 0) / fallbackDenominator) * 100;
+  }
+  return 0;
+}
+
+function formatTrafficNumber(value: unknown) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "-";
+  return num.toLocaleString("zh-CN");
+}
+
+function formatTrafficPercent(value: unknown) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "-";
+  return `${num >= 10 ? num.toFixed(1) : num.toFixed(2)}%`;
+}
+
+function buildTrafficSummary(source: any, siteKey: FluxSiteKey, siteLabel: string, syncedAt: string): ProductTrafficSummary {
+  const exposeNum = toNumberValue(source?.exposeNum);
+  const clickNum = toNumberValue(source?.clickNum);
+  const detailVisitNum = toNumberValue(source?.detailVisitNum || source?.detailVisitorNum);
+  const detailVisitorNum = toNumberValue(source?.detailVisitorNum || source?.detailVisitNum);
+  const addToCartUserNum = toNumberValue(source?.addToCartUserNum);
+  const collectUserNum = toNumberValue(source?.collectUserNum);
+  const buyerNum = toNumberValue(source?.buyerNum);
+  const payGoodsNum = toNumberValue(source?.payGoodsNum);
+  const payOrderNum = toNumberValue(source?.payOrderNum);
+  const searchExposeNum = toNumberValue(source?.searchExposeNum);
+  const searchClickNum = toNumberValue(source?.searchClickNum);
+  const searchPayGoodsNum = toNumberValue(source?.searchPayGoodsNum);
+  const recommendExposeNum = toNumberValue(source?.recommendExposeNum);
+  const recommendClickNum = toNumberValue(source?.recommendClickNum);
+  const recommendPayGoodsNum = toNumberValue(source?.recommendPayGoodsNum);
+  const trendExposeNum = toNumberValue(source?.trendExposeNum);
+  const trendPayOrderNum = toNumberValue(source?.trendPayOrderNum);
+
+  return {
+    siteKey,
+    siteLabel,
+    syncedAt,
+    dataDate: normalizeText(source?.dataDate),
+    updateTime: normalizeText(source?.updateTime),
+    growDataText: normalizeText(source?.growDataText),
+    exposeNum,
+    clickNum,
+    detailVisitNum,
+    detailVisitorNum,
+    addToCartUserNum,
+    collectUserNum,
+    buyerNum,
+    payGoodsNum,
+    payOrderNum,
+    searchExposeNum,
+    searchClickNum,
+    searchPayGoodsNum,
+    recommendExposeNum,
+    recommendClickNum,
+    recommendPayGoodsNum,
+    trendExposeNum,
+    trendPayOrderNum,
+    exposeClickRate: toPercentValue(source?.exposeClickRate, clickNum, exposeNum),
+    clickPayRate: toPercentValue(source?.clickPayRate, buyerNum, clickNum),
+  };
+}
+
+function summarizeFluxItems(items: any[], siteKey: FluxSiteKey, siteLabel: string, syncedAt: string) {
+  const aggregate = items.reduce(
+    (accumulator, item) => ({
+      exposeNum: accumulator.exposeNum + toNumberValue(item?.exposeNum),
+      clickNum: accumulator.clickNum + toNumberValue(item?.clickNum),
+      detailVisitNum: accumulator.detailVisitNum + toNumberValue(item?.detailVisitNum || item?.detailVisitorNum),
+      detailVisitorNum: accumulator.detailVisitorNum + toNumberValue(item?.detailVisitorNum || item?.detailVisitNum),
+      addToCartUserNum: accumulator.addToCartUserNum + toNumberValue(item?.addToCartUserNum),
+      collectUserNum: accumulator.collectUserNum + toNumberValue(item?.collectUserNum),
+      buyerNum: accumulator.buyerNum + toNumberValue(item?.buyerNum),
+      payGoodsNum: accumulator.payGoodsNum + toNumberValue(item?.payGoodsNum),
+      payOrderNum: accumulator.payOrderNum + toNumberValue(item?.payOrderNum),
+      searchExposeNum: accumulator.searchExposeNum + toNumberValue(item?.searchExposeNum),
+      searchClickNum: accumulator.searchClickNum + toNumberValue(item?.searchClickNum),
+      searchPayGoodsNum: accumulator.searchPayGoodsNum + toNumberValue(item?.searchPayGoodsNum),
+      recommendExposeNum: accumulator.recommendExposeNum + toNumberValue(item?.recommendExposeNum),
+      recommendClickNum: accumulator.recommendClickNum + toNumberValue(item?.recommendClickNum),
+      recommendPayGoodsNum: accumulator.recommendPayGoodsNum + toNumberValue(item?.recommendPayGoodsNum),
+      trendExposeNum: accumulator.trendExposeNum + toNumberValue(item?.trendExposeNum),
+      trendPayOrderNum: accumulator.trendPayOrderNum + toNumberValue(item?.trendPayOrderNum),
+      dataDate: normalizeText(item?.dataDate) || accumulator.dataDate,
+      updateTime: normalizeText(item?.updateTime) || accumulator.updateTime,
+      growDataText: normalizeText(item?.growDataText) || accumulator.growDataText,
+    }),
+    {
+      exposeNum: 0,
+      clickNum: 0,
+      detailVisitNum: 0,
+      detailVisitorNum: 0,
+      addToCartUserNum: 0,
+      collectUserNum: 0,
+      buyerNum: 0,
+      payGoodsNum: 0,
+      payOrderNum: 0,
+      searchExposeNum: 0,
+      searchClickNum: 0,
+      searchPayGoodsNum: 0,
+      recommendExposeNum: 0,
+      recommendClickNum: 0,
+      recommendPayGoodsNum: 0,
+      trendExposeNum: 0,
+      trendPayOrderNum: 0,
+      dataDate: "",
+      updateTime: "",
+      growDataText: "",
+    },
+  );
+
+  return buildTrafficSummary(aggregate, siteKey, siteLabel, syncedAt);
+}
+
+function matchesFluxRecord(record: any, idCandidates: Set<string>) {
+  const idMatched = PRODUCT_ID_LOOKUP_FIELDS.some((field) => {
+    const text = normalizeText(record?.[field]);
+    return Boolean(text) && idCandidates.has(text);
+  });
+  return idMatched;
+}
+
+function parseMallFluxTrend(raw: any) {
+  const apis = Array.isArray(raw?.apis) ? raw.apis : [];
+  const rows = apis
+    .filter((api: any) => String(api?.path || "").includes("/flow/analysis/mall/list"))
+    .flatMap((api: any) => {
+      const payload = api?.data?.result ?? api?.data?.data ?? api?.data ?? {};
+      return Array.isArray(payload?.list) ? payload.list : [];
+    })
+    .map((item: any) => ({
+      statDate: normalizeText(item?.statDate),
+      totalPageView: toNumberValue(item?.totalPageView),
+      totalVisitorsNum: toNumberValue(item?.totalVisitorsNum),
+      totalPayBuyerNum: toNumberValue(item?.totalPayBuyerNum),
+      totalPayGoodsNum: toNumberValue(item?.totalPayGoodsNum),
+      goodsPageView: toNumberValue(item?.goodsPageView),
+      goodsVisitorsNum: toNumberValue(item?.goodsVisitorsNum),
+      goodsDetailPayBuyerNum: toNumberValue(item?.goodsDetailPayBuyerNum),
+      goodsDetailPayConversionRate: Number(item?.goodsDetailPayConversionRate) || 0,
+    }))
+    .filter((item: any) => item.statDate);
+
+  return rows.sort((left: any, right: any) => left.statDate.localeCompare(right.statDate));
+}
+
+function buildMallFallbackFluxSite(raw: any, siteKey: FluxSiteKey, siteLabel: string): ProductFluxSiteData | null {
+  const rows = parseMallFluxTrend(raw);
+  if (!rows.length) return null;
+
+  const latestRow = rows[rows.length - 1];
+  const latestMonth = String(latestRow?.statDate || "").slice(0, 7);
+  const rangeRowsMap: Record<string, any[]> = {
+    今日: latestRow ? [latestRow] : [],
+    近7日: rows.slice(-7),
+    近30日: rows.slice(-30),
+  };
+
+  if (rows.length > 1) {
+    rangeRowsMap.昨日 = [rows[rows.length - 2]];
+  }
+
+  if (latestMonth) {
+    const monthRows = rows.filter((item: any) => String(item?.statDate || "").startsWith(latestMonth));
+    if (monthRows.length) {
+      rangeRowsMap.本月 = monthRows;
+    }
+  }
+
+  const buildSummary = (rangeLabel: string, rangeRows: any[]): ProductTrafficSummary => {
+    const exposeNum = rangeRows.reduce((sum, item) => sum + (item.goodsPageView || item.totalPageView || 0), 0);
+    const clickNum = rangeRows.reduce((sum, item) => sum + (item.goodsVisitorsNum || item.totalVisitorsNum || 0), 0);
+    const buyerNum = rangeRows.reduce((sum, item) => sum + (item.goodsDetailPayBuyerNum || item.totalPayBuyerNum || 0), 0);
+    const payGoodsNum = rangeRows.reduce((sum, item) => sum + (item.totalPayGoodsNum || 0), 0);
+
+    return {
+      siteKey,
+      siteLabel,
+      syncedAt: normalizeText(raw?.finishedAt || raw?.periodEnd || ""),
+      dataDate: normalizeText(rangeRows[rangeRows.length - 1]?.statDate || latestRow?.statDate),
+      updateTime: normalizeText(raw?.finishedAt || raw?.periodEnd || latestRow?.statDate),
+      growDataText: "已采集站点流量趋势",
+      exposeNum,
+      clickNum,
+      detailVisitNum: clickNum,
+      detailVisitorNum: clickNum,
+      addToCartUserNum: 0,
+      collectUserNum: 0,
+      buyerNum,
+      payGoodsNum,
+      payOrderNum: payGoodsNum,
+      searchExposeNum: 0,
+      searchClickNum: 0,
+      searchPayGoodsNum: 0,
+      recommendExposeNum: 0,
+      recommendClickNum: 0,
+      recommendPayGoodsNum: 0,
+      trendExposeNum: exposeNum,
+      trendPayOrderNum: payGoodsNum,
+      exposeClickRate: toPercentValue(undefined, clickNum, exposeNum),
+      clickPayRate: toPercentValue(undefined, buyerNum, clickNum),
+      dataOrigin: "mall",
+      trendPoints: rangeRows.map((item) => ({
+        date: normalizeText(item?.statDate),
+        sales: toNumberValue(item?.totalPayGoodsNum),
+      })),
+      regionRows: [],
+    };
+  };
+
+  const summaryByRange = Object.fromEntries(
+    Object.entries(rangeRowsMap)
+      .filter(([, rangeRows]) => Array.isArray(rangeRows) && rangeRows.length > 0)
+      .map(([rangeLabel, rangeRows]) => [rangeLabel, buildSummary(rangeLabel, rangeRows)]),
+  ) as Record<string, ProductTrafficSummary>;
+
+  const availableRanges = sortFluxRangeLabels(Object.keys(summaryByRange));
+  if (!availableRanges.length) return null;
+
+  const primaryRangeLabel = availableRanges.includes("近7日")
+    ? "近7日"
+    : availableRanges.includes("今日")
+      ? "今日"
+      : availableRanges[0];
+
+  return {
+    siteKey,
+    siteLabel,
+    syncedAt: normalizeText(raw?.finishedAt || raw?.periodEnd || ""),
+    summary: summaryByRange[primaryRangeLabel] || null,
+    summaryByRange,
+    items: [],
+    itemsByRange: {},
+    availableRanges,
+    primaryRangeLabel,
+  };
+}
+
+function mergeFluxSiteData(primary: ProductFluxSiteData | null, fallback: ProductFluxSiteData | null): ProductFluxSiteData | null {
+  if (!primary) return fallback;
+  if (!fallback) return primary;
+
+  const summaryByRange = {
+    ...fallback.summaryByRange,
+    ...primary.summaryByRange,
+  };
+  const itemsByRange = {
+    ...fallback.itemsByRange,
+    ...primary.itemsByRange,
+  };
+  const availableRanges = sortFluxRangeLabels([
+    ...Object.keys(summaryByRange),
+    ...primary.availableRanges,
+    ...fallback.availableRanges,
+  ]);
+  const primaryRangeLabel = availableRanges.includes(primary.primaryRangeLabel)
+    ? primary.primaryRangeLabel
+    : (availableRanges.includes(fallback.primaryRangeLabel) ? fallback.primaryRangeLabel : availableRanges[0]);
+
+  return {
+    siteKey: primary.siteKey,
+    siteLabel: primary.siteLabel,
+    syncedAt: primary.syncedAt || fallback.syncedAt,
+    summary: summaryByRange[primaryRangeLabel] || primary.summary || fallback.summary || null,
+    summaryByRange,
+    items: itemsByRange[primaryRangeLabel] || primary.items || fallback.items || [],
+    itemsByRange,
+    availableRanges,
+    primaryRangeLabel,
+  };
+}
+
 export default function ProductList() {
   const [products, setProducts] = useState<ProductItem[]>([]);
   const [salesSummary, setSalesSummary] = useState<any>(null);
@@ -354,41 +899,80 @@ export default function ProductList() {
   const [sourceState, setSourceState] = useState<ProductSourceState>(EMPTY_SOURCES);
   const [selectedProduct, setSelectedProduct] = useState<ProductItem | null>(null);
   const [drawerTab, setDrawerTab] = useState<string>("overview");
+  const [activeFluxSiteKey, setActiveFluxSiteKey] = useState<FluxSiteKey>("global");
+  const [activeFluxRangeLabel, setActiveFluxRangeLabel] = useState("");
+  const [fluxHistoryData, setFluxHistoryData] = useState<any[]>([]);
   const [gpDetailOpen, setGpDetailOpen] = useState(false);
   const [gpDetailLoading, setGpDetailLoading] = useState(false);
-  const [gpDetailRow, setGpDetailRow] = useState<{ productId: number | null; productName?: string; skcId?: any } | null>(null);
+  const [gpDetailRow, setGpDetailRow] = useState<{
+    productId: number | null;
+    productName?: string;
+    skcId?: any;
+    availableRanges?: Array<"1d" | "7d" | "30d">;
+    defaultRange?: "1d" | "7d" | "30d";
+    regionDetailsByRange?: Partial<Record<"1d" | "7d" | "30d", any>>;
+    fallbackDetail?: any;
+  } | null>(null);
   const [gpDetailData, setGpDetailData] = useState<any>(null);
   const [gpDetailRange, setGpDetailRange] = useState<"1d" | "7d" | "30d">("7d");
+  const gpDetailRangeOptions: Array<"1d" | "7d" | "30d"> = ["30d", "7d", "1d"];
+  const gpDetailCacheMissingMessage = "该商品的动销详情还没有进入缓存，请先到数据采集运行“动销详情 / 地区明细”。";
 
-  const openGpDetail = async (record: any, range?: "1d" | "7d" | "30d") => {
+  const openGpDetail = (record: any, range?: "1d" | "7d" | "30d") => {
     const gp = record?.gp;
     const pid = gp?.productId;
-    if (!pid) { message.error("该商品缺少 productId，请先在 数据采集 页运行 一键采集"); return; }
-    const r = range || gpDetailRange;
-    setGpDetailRange(r);
-    setGpDetailRow({ productId: pid, productName: gp.productName || record.title, skcId: record.skcId });
-    setGpDetailOpen(true);
-    setGpDetailLoading(true);
-    // 优先从缓存（一键采集时已预拉）
-    const cached = gp.regionDetail;
-    if (cached && cached.rows?.length) {
-      setGpDetailData(cached);
-      setGpDetailLoading(false);
+    if (!pid) {
+      message.error(gpDetailCacheMissingMessage);
       return;
     }
-    setGpDetailData(null);
-    try {
-      const api = (window as any).electronAPI?.automation;
-      const res = await api?.scrapeSkcRegionDetail?.(pid, r);
-      if (res && typeof res === "object") {
-        setGpDetailData(res);
-        if (res.error) message.warning(res.error);
-      }
-    } catch (e: any) {
-      message.error(`查询失败：${e?.message || e}`);
-    } finally {
-      setGpDetailLoading(false);
-    }
+    const r = range || gpDetailRange;
+    const normalizedRanges = Array.from(
+      new Set(
+        (Array.isArray(gp?.availableRanges) ? gp.availableRanges : [gp?.defaultRange || "7d"])
+          .map((item: any) => String(item || "").trim())
+          .filter((item: string) => item === "1d" || item === "7d" || item === "30d"),
+      ),
+    ) as Array<"1d" | "7d" | "30d">;
+    const availableRanges: Array<"1d" | "7d" | "30d"> = normalizedRanges.length > 0 ? normalizedRanges : ["7d"];
+    const regionDetailsByRange = (gp?.regionDetailsByRange && typeof gp.regionDetailsByRange === "object")
+      ? gp.regionDetailsByRange
+      : {};
+    const cachedDetail = regionDetailsByRange[r] || gp?.regionDetail || null;
+    setGpDetailRange(r);
+    setGpDetailRow({
+      productId: pid,
+      productName: gp.productName || record.title,
+      skcId: record.skcId,
+      availableRanges,
+      defaultRange: (gp?.defaultRange || availableRanges[0] || "7d") as "1d" | "7d" | "30d",
+      regionDetailsByRange,
+      fallbackDetail: gp?.regionDetail || null,
+    });
+    setGpDetailOpen(true);
+    setGpDetailLoading(false);
+    setGpDetailData(
+      cachedDetail || {
+        error: gpDetailCacheMissingMessage,
+      },
+    );
+  };
+
+  const openCompetitorAnalysis = (currentProduct: ProductItem | null) => {
+    if (!currentProduct) return;
+    navigate("/competitor", {
+      state: {
+        prefillProduct: {
+          token: `${Date.now()}-${currentProduct.goodsId || currentProduct.skcId || currentProduct.spuId || currentProduct.title || "product"}`,
+          activateStep: 1,
+          productId: currentProduct.skcId || "",
+          skcId: currentProduct.skcId || "",
+          spuId: currentProduct.spuId || "",
+          goodsId: currentProduct.goodsId || "",
+          skuId: currentProduct.sku || "",
+          title: currentProduct.title || "",
+        },
+      },
+    });
   };
   const location = useLocation();
   const navigate = useNavigate();
@@ -401,7 +985,20 @@ export default function ProductList() {
     let reloadTimer: ReturnType<typeof setTimeout> | null = null;
     const handleStoreValueUpdated = (event: Event) => {
       const detail = (event as CustomEvent<{ baseKey?: string | null }>)?.detail;
-      if (!detail?.baseKey || !["temu_products", "temu_sales", "temu_orders", COLLECTION_DIAGNOSTICS_KEY].includes(detail.baseKey)) {
+      if (!detail?.baseKey || ![
+        "temu_products",
+        "temu_sales",
+        "temu_orders",
+        "temu_flux",
+        "temu_raw_fluxUS",
+        "temu_raw_fluxEU",
+        "temu_raw_mallFlux",
+        "temu_raw_mallFluxUS",
+        "temu_raw_mallFluxEU",
+        "temu_raw_globalPerformance",
+        "temu_flux_history",
+        COLLECTION_DIAGNOSTICS_KEY,
+      ].includes(detail.baseKey)) {
         return;
       }
       if (reloadTimer) clearTimeout(reloadTimer);
@@ -424,37 +1021,120 @@ export default function ProductList() {
     }
   }, [location.pathname]);
 
+  useEffect(() => {
+    if (!selectedProduct) return;
+    const sites = Array.isArray(selectedProduct.fluxSites) ? selectedProduct.fluxSites : [];
+    const defaultSite = sites.find((site) => site.siteKey === "global") || sites[0] || null;
+    setActiveFluxSiteKey(defaultSite?.siteKey || "global");
+    setActiveFluxRangeLabel(defaultSite?.primaryRangeLabel || defaultSite?.availableRanges?.[0] || "");
+  }, [selectedProduct?.skcId, selectedProduct?.goodsId, selectedProduct?.spuId]);
+
+  useEffect(() => {
+    if (!selectedProduct) return;
+    const sites = Array.isArray(selectedProduct.fluxSites) ? selectedProduct.fluxSites : [];
+    const site = sites.find((item) => item.siteKey === activeFluxSiteKey) || sites[0] || null;
+    if (!site) return;
+    if (!site.availableRanges.includes(activeFluxRangeLabel)) {
+      setActiveFluxRangeLabel(site.primaryRangeLabel || site.availableRanges[0] || "");
+    }
+  }, [activeFluxSiteKey, activeFluxRangeLabel, selectedProduct]);
+
   const loadProducts = async () => {
     setLoading(true);
     try {
-      const [accounts, rawProducts, rawSales, rawOrders, diagnosticsRaw, rawLifecycle, rawFlowPrice, rawYunduOverall, rawGlobalPerf] = await Promise.all([
+      const [
+        accounts,
+        rawProducts,
+        rawSales,
+        rawOrders,
+        rawFlux,
+        rawFluxUS,
+        rawFluxEU,
+        rawMallFlux,
+        rawMallFluxUS,
+        rawMallFluxEU,
+        diagnosticsRaw,
+        rawLifecycle,
+        rawFlowPrice,
+        rawYunduOverall,
+        rawGlobalPerf,
+        rawFluxHistory,
+        debugFlux,
+        debugFluxUS,
+        debugFluxEU,
+        debugMallFlux,
+        debugMallFluxUS,
+        debugMallFluxEU,
+      ] = await Promise.all([
         store?.get("temu_accounts"),
         getStoreValue(store, "temu_products"),
         getStoreValue(store, "temu_sales"),
         getStoreValue(store, "temu_orders"),
+        getStoreValue(store, "temu_flux"),
+        getStoreValue(store, "temu_raw_fluxUS"),
+        getStoreValue(store, "temu_raw_fluxEU"),
+        getStoreValue(store, "temu_raw_mallFlux"),
+        getStoreValue(store, "temu_raw_mallFluxUS"),
+        getStoreValue(store, "temu_raw_mallFluxEU"),
         getStoreValue(store, COLLECTION_DIAGNOSTICS_KEY),
         getStoreValue(store, "temu_raw_lifecycle"),
         getStoreValue(store, "temu_raw_flowPrice"),
         getStoreValue(store, "temu_raw_yunduOverall"),
         getStoreValue(store, "temu_raw_globalPerformance"),
+        getStoreValue(store, "temu_flux_history"),
+        automation?.readScrapeData?.("flux").catch(() => null),
+        automation?.readScrapeData?.("fluxUS").catch(() => null),
+        automation?.readScrapeData?.("fluxEU").catch(() => null),
+        automation?.readScrapeData?.("mallFlux").catch(() => null),
+        automation?.readScrapeData?.("mallFluxUS").catch(() => null),
+        automation?.readScrapeData?.("mallFluxEU").catch(() => null),
       ]);
 
-      // 全球业务表现：按 skcId 索引
+      // 全球业务表现 / 动销详情：按 skcId 索引，优先读取采集阶段预拉的多时间段缓存
       const gpSkcMap = new Map<string, any>();
       try {
-        const skcSales: any[] = (rawGlobalPerf as any)?.skcSales || [];
-        const regionDetails: any = (rawGlobalPerf as any)?.regionDetails || {};
+        const bundle = rawGlobalPerf && typeof rawGlobalPerf === "object" ? rawGlobalPerf as any : {};
+        const rawRanges = bundle?.ranges && typeof bundle.ranges === "object" ? bundle.ranges : null;
+        const fallbackRange = typeof bundle?.range === "string" ? bundle.range : "7d";
+        const availableRanges = Array.from(
+          new Set(
+            (Array.isArray(bundle?.availableRanges) ? bundle.availableRanges : rawRanges ? Object.keys(rawRanges) : [fallbackRange])
+              .map((item: any) => String(item || "").trim())
+              .filter((item: string) => item === "1d" || item === "7d" || item === "30d"),
+          ),
+        ) as Array<"1d" | "7d" | "30d">;
+        const defaultRange = (availableRanges.includes(bundle?.defaultRange)
+          ? bundle.defaultRange
+          : (availableRanges.includes("7d") ? "7d" : availableRanges[0] || fallbackRange || "7d")) as "1d" | "7d" | "30d";
+        const rangeResults = Object.fromEntries(
+          availableRanges.map((rangeKey) => [rangeKey, rawRanges?.[rangeKey] || (rangeKey === fallbackRange ? bundle : null)]),
+        ) as Partial<Record<"1d" | "7d" | "30d", any>>;
+        const defaultPerf = rangeResults[defaultRange] || bundle;
+        const skcSales: any[] = Array.isArray(defaultPerf?.skcSales) ? defaultPerf.skcSales : [];
         for (const r of skcSales) {
           const k = r?.skcId != null ? String(r.skcId) : "";
           if (!k) continue;
           const pid = r.productId ?? null;
+          const regionDetailsByRange = pid != null
+            ? Object.fromEntries(
+                availableRanges
+                  .map((rangeKey) => [rangeKey, rangeResults[rangeKey]?.regionDetails?.[String(pid)] || null])
+                  .filter(([, detail]) => Boolean(detail)),
+              )
+            : {};
           gpSkcMap.set(k, {
             sales: Number(r.sales) || 0,
             changeRate: Number(r.changeRate) || 0,
             trend: Array.isArray(r.trend) ? r.trend : [],
             productId: pid,
             productName: r.productName,
-            regionDetail: pid != null ? regionDetails[String(pid)] : null,
+            syncedAt: bundle?.finishedAt || bundle?.periodEnd || "",
+            defaultRange,
+            availableRanges,
+            regionDetail: pid != null
+              ? (regionDetailsByRange[defaultRange] || defaultPerf?.regionDetails?.[String(pid)] || null)
+              : null,
+            regionDetailsByRange,
           });
         }
       } catch (e) { console.warn("[ProductList] globalPerf parse error", e); }
@@ -528,8 +1208,18 @@ export default function ProductList() {
       const parsedProducts = parseProductsData(rawProducts);
       const parsedSales = parseSalesData(rawSales);
       const parsedOrders = parseOrdersData(rawOrders);
+      const preferredFlux = pickPreferredFluxSource(rawFlux, debugFlux);
+      const preferredFluxUS = pickPreferredFluxSource(rawFluxUS, debugFluxUS);
+      const preferredFluxEU = pickPreferredFluxSource(rawFluxEU, debugFluxEU);
+      const preferredMallFlux = rawMallFlux || debugMallFlux;
+      const preferredMallFluxUS = rawMallFluxUS || debugMallFluxUS;
+      const preferredMallFluxEU = rawMallFluxEU || debugMallFluxEU;
+      const parsedFlux = preferredFlux ? parseFluxData(preferredFlux) : EMPTY_PARSED_FLUX;
+      const parsedFluxUS = preferredFluxUS ? parseFluxData(preferredFluxUS) : EMPTY_PARSED_FLUX;
+      const parsedFluxEU = preferredFluxEU ? parseFluxData(preferredFluxEU) : EMPTY_PARSED_FLUX;
       const productCounts = parseProductCountSummary(rawProducts);
       const salesItems = Array.isArray(parsedSales?.items) ? parsedSales.items : [];
+      const fluxItems = Array.isArray(parsedFlux?.items) ? parsedFlux.items : [];
 
       setSalesSummary(parsedSales?.summary || null);
       setCountSummary(productCounts);
@@ -886,10 +1576,107 @@ export default function ProductList() {
         }
       }
 
+      const fluxSources: Array<{ siteKey: FluxSiteKey; siteLabel: string; parsed: typeof EMPTY_PARSED_FLUX }> = [
+        { siteKey: "global", siteLabel: "全球", parsed: parsedFlux },
+        { siteKey: "us", siteLabel: "美国", parsed: parsedFluxUS },
+        { siteKey: "eu", siteLabel: "欧区", parsed: parsedFluxEU },
+      ];
+      const mallFallbackSources: Array<{ siteKey: FluxSiteKey; siteLabel: string; raw: any }> = [
+        { siteKey: "global", siteLabel: "全球", raw: preferredMallFlux },
+        { siteKey: "us", siteLabel: "美国", raw: preferredMallFluxUS },
+        { siteKey: "eu", siteLabel: "欧区", raw: preferredMallFluxEU },
+      ];
+
+      if (
+        fluxSources.some((item) => Array.isArray(item.parsed?.items) && item.parsed.items.length > 0)
+        || mallFallbackSources.some((item) => Boolean(item.raw))
+      ) {
+        for (const product of mergedProducts) {
+          const idCandidates = new Set(
+            [product.skcId, product.spuId, product.skuId, product.sku, product.extCode]
+              .map((value) => normalizeText(value))
+              .filter(Boolean),
+          );
+          const fluxSites = fluxSources
+            .map(({ siteKey, siteLabel, parsed }) => {
+              const matchedByRange = Object.entries(parsed?.itemsByRange || {}).reduce<Record<string, any[]>>((accumulator, [label, items]) => {
+                const matchedItems = (Array.isArray(items) ? items : []).filter((item: any) => matchesFluxRecord(item, idCandidates));
+                if (matchedItems.length > 0) accumulator[label] = matchedItems;
+                return accumulator;
+              }, {});
+              const availableRanges = sortFluxRangeLabels(Object.keys(matchedByRange));
+              if (availableRanges.length === 0) return null;
+              const primaryRangeLabel = availableRanges.includes(parsed?.primaryRangeLabel)
+                ? parsed.primaryRangeLabel
+                : availableRanges[0];
+              const summaryByRange = Object.fromEntries(
+                availableRanges.map((label) => [
+                  label,
+                  summarizeFluxItems(matchedByRange[label] || [], siteKey, siteLabel, parsed?.syncedAt || ""),
+                ]),
+              ) as Record<string, ProductTrafficSummary>;
+
+              return {
+                siteKey,
+                siteLabel,
+                syncedAt: parsed?.syncedAt || "",
+                summary: summaryByRange[primaryRangeLabel] || null,
+                summaryByRange,
+                items: matchedByRange[primaryRangeLabel] || [],
+                itemsByRange: matchedByRange,
+                availableRanges,
+                primaryRangeLabel,
+              } satisfies ProductFluxSiteData;
+            })
+            .map((site: ProductFluxSiteData | null) => {
+              if (!site) return null;
+              const fallback = buildMallFallbackFluxSite(
+                mallFallbackSources.find((item) => item.siteKey === site.siteKey)?.raw,
+                site.siteKey,
+                site.siteLabel,
+              );
+              return mergeFluxSiteData(site, fallback);
+            })
+            .filter((site): site is ProductFluxSiteData => Boolean(site));
+
+          for (const fallbackSource of mallFallbackSources) {
+            if (fluxSites.some((site) => site.siteKey === fallbackSource.siteKey)) continue;
+            const fallback = buildMallFallbackFluxSite(fallbackSource.raw, fallbackSource.siteKey, fallbackSource.siteLabel);
+            if (fallback) fluxSites.push(fallback);
+          }
+
+          if (fluxSites.length > 0) {
+            product.fluxSites = fluxSites;
+            const globalFlux = fluxSites.find((item) => item.siteKey === "global") || fluxSites[0];
+            product.fluxItems = globalFlux?.items || [];
+            product.fluxSyncedAt = globalFlux?.syncedAt || "";
+          } else if ((product as any).gp) {
+            const fallbackSite = buildGpFallbackFluxSite((product as any).gp);
+            if (fallbackSite) {
+              product.fluxSites = [fallbackSite];
+              product.fluxItems = fallbackSite.items || [];
+              product.fluxSyncedAt = fallbackSite.syncedAt || "";
+            }
+          }
+        }
+      }
+
+      for (const product of mergedProducts) {
+        if (Array.isArray(product.fluxSites) && product.fluxSites.length > 0) continue;
+        if (!(product as any).gp) continue;
+        const fallbackSite = buildGpFallbackFluxSite((product as any).gp);
+        if (!fallbackSite) continue;
+        product.fluxSites = [fallbackSite];
+        product.fluxItems = fallbackSite.items || [];
+        product.fluxSyncedAt = fallbackSite.syncedAt || "";
+      }
+
       setProducts(mergedProducts);
+      setFluxHistoryData(Array.isArray(rawFluxHistory) ? rawFluxHistory : []);
     } catch (error) {
       console.error("加载商品失败", error);
       setProducts([]);
+      setFluxHistoryData([]);
       setSalesSummary(null);
       setCountSummary(EMPTY_COUNT_SUMMARY);
       setDiagnostics(null);
@@ -942,19 +1729,122 @@ export default function ProductList() {
 
   const numColor = (val: number, base = "#52c41a") => ({ color: val > 0 ? base : "#999", fontWeight: val > 0 ? 500 : 400 });
 
+  // 扁平化数据：每个 SKU 一行 + 合计行，商品信息用 rowSpan 跨行
+  const flatRows = useMemo(() => {
+    const rows: any[] = [];
+    for (const product of filteredProducts) {
+      const skuList: any[] = Array.isArray(product.salesRaw?.skuQuantityDetailList)
+        ? product.salesRaw.skuQuantityDetailList
+        : [];
+      if (skuList.length > 1) {
+        // 多 SKU：每个 SKU 一行 + 合计行
+        const spanCount = skuList.length + 1; // +1 for 合计 row
+        skuList.forEach((sku: any, idx: number) => {
+          rows.push({
+            ...product,
+            _flatKey: `${product.skcId || product.goodsId || product.spuId}-sku-${idx}`,
+            _rowSpan: idx === 0 ? spanCount : 0,
+            _isTotal: false,
+            _skuId: sku.productSkuId,
+            _skuSpec: sku.className,
+            _skuExtCode: sku.skuExtCode,
+            _skuPrice: sku.supplierPrice != null ? (Number(sku.supplierPrice) / 100).toFixed(2) : null,
+            _skuTodaySales: sku.todaySaleVolume ?? 0,
+            _sku7dSales: sku.lastSevenDaysSaleVolume ?? 0,
+            _sku30dSales: sku.lastThirtyDaysSaleVolume ?? 0,
+            _skuLack: sku.lackQuantity ?? 0,
+            _skuAdvice: sku.adviceQuantity ?? 0,
+            _skuStock: sku.sellerWhStock ?? 0,
+            _skuOccupy: sku.inventoryNumInfo?.expectedOccupiedInventoryNum ?? 0,
+            _skuUnavail: sku.inventoryNumInfo?.unavailableWarehouseInventoryNum ?? 0,
+            _skuInTransit: sku.inventoryNumInfo?.waitReceiveNum ?? 0,
+          });
+        });
+        // 合计行
+        const tToday = skuList.reduce((s: number, k: any) => s + (k.todaySaleVolume || 0), 0);
+        const t7d = skuList.reduce((s: number, k: any) => s + (k.lastSevenDaysSaleVolume || 0), 0);
+        const t30d = skuList.reduce((s: number, k: any) => s + (k.lastThirtyDaysSaleVolume || 0), 0);
+        const tLack = skuList.reduce((s: number, k: any) => s + (k.lackQuantity || 0), 0);
+        const tAdvice = skuList.reduce((s: number, k: any) => s + (k.adviceQuantity || 0), 0);
+        const tStock = skuList.reduce((s: number, k: any) => s + (k.sellerWhStock || 0), 0);
+        const tOccupy = skuList.reduce((s: number, k: any) => s + (k.inventoryNumInfo?.expectedOccupiedInventoryNum || 0), 0);
+        const tUnavail = skuList.reduce((s: number, k: any) => s + (k.inventoryNumInfo?.unavailableWarehouseInventoryNum || 0), 0);
+        const tInTransit = skuList.reduce((s: number, k: any) => s + (k.inventoryNumInfo?.waitReceiveNum || 0), 0);
+        rows.push({
+          ...product,
+          _flatKey: `${product.skcId || product.goodsId || product.spuId}-total`,
+          _rowSpan: 0,
+          _isTotal: true,
+          _skuTodaySales: tToday,
+          _sku7dSales: t7d,
+          _sku30dSales: t30d,
+          _skuLack: tLack,
+          _skuAdvice: tAdvice,
+          _skuStock: tStock,
+          _skuOccupy: tOccupy,
+          _skuUnavail: tUnavail,
+          _skuInTransit: tInTransit,
+        });
+      } else if (skuList.length === 1) {
+        // 单 SKU：一行，带 SKU 信息
+        const sku = skuList[0];
+        rows.push({
+          ...product,
+          _flatKey: `${product.skcId || product.goodsId || product.spuId}-single`,
+          _rowSpan: 1,
+          _isTotal: false,
+          _skuId: sku.productSkuId,
+          _skuSpec: sku.className,
+          _skuExtCode: sku.skuExtCode,
+          _skuPrice: sku.supplierPrice != null ? (Number(sku.supplierPrice) / 100).toFixed(2) : null,
+          _skuTodaySales: sku.todaySaleVolume ?? 0,
+          _sku7dSales: sku.lastSevenDaysSaleVolume ?? 0,
+          _sku30dSales: sku.lastThirtyDaysSaleVolume ?? 0,
+          _skuLack: sku.lackQuantity ?? 0,
+          _skuAdvice: sku.adviceQuantity ?? 0,
+          _skuStock: sku.sellerWhStock ?? 0,
+          _skuOccupy: sku.inventoryNumInfo?.expectedOccupiedInventoryNum ?? 0,
+          _skuUnavail: sku.inventoryNumInfo?.unavailableWarehouseInventoryNum ?? 0,
+          _skuInTransit: sku.inventoryNumInfo?.waitReceiveNum ?? 0,
+        });
+      } else {
+        // 无 SKU 明细：使用商品级聚合数据
+        rows.push({
+          ...product,
+          _flatKey: `${product.skcId || product.goodsId || product.spuId}-no-sku`,
+          _rowSpan: 1,
+          _isTotal: false,
+          _skuTodaySales: product.todaySales || 0,
+          _sku7dSales: product.last7DaysSales || 0,
+          _sku30dSales: product.last30DaysSales || 0,
+          _skuLack: product.lackQuantity || 0,
+          _skuOccupy: product.occupyStock || 0,
+          _skuUnavail: product.unavailableStock || 0,
+          _skuInTransit: 0,
+        });
+      }
+    }
+    return rows;
+  }, [filteredProducts]);
+
+  // 商品级列的 onCell：用 rowSpan 合并
+  const productCellSpan = (record: any) => ({ rowSpan: record._rowSpan, style: { verticalAlign: "top" as const } });
+  const productCellSpanMiddle = (record: any) => ({ rowSpan: record._rowSpan, style: { verticalAlign: "middle" as const } });
+
   const columns: ColumnsType<ProductItem> = [
     {
       title: "商品图片",
       key: "imageUrl",
-      width: 60,
+      width: 96,
+      onCell: productCellSpan,
       render: (_: any, record: ProductItem) => {
         const url = normalizeImageUrl(record.imageUrl);
         return url ? (
           <div onClick={(e) => e.stopPropagation()} style={{ display: "inline-block" }}>
-            <Image src={url} width={45} height={45} style={{ objectFit: "cover", borderRadius: 4 }} preview={{ mask: false }} fallback={EMPTY_IMAGE_FALLBACK} />
+            <Image src={url} width={80} height={80} style={{ objectFit: "cover", borderRadius: 8 }} preview={{ mask: false }} fallback={EMPTY_IMAGE_FALLBACK} />
           </div>
         ) : (
-          <div style={{ width: 45, height: 45, background: "#f0f0f0", borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center" }}><PictureOutlined /></div>
+          <div style={{ width: 80, height: 80, background: "#f0f0f0", borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center" }}><PictureOutlined /></div>
         );
       },
     },
@@ -962,8 +1852,9 @@ export default function ProductList() {
       title: "商品信息",
       dataIndex: "title",
       key: "title",
-      width: 380,
+      width: 420,
       fixed: "left",
+      onCell: productCellSpan,
       render: (text: string, record: any) => {
         const raw = record.salesRaw || {};
         const y = record.yundu;
@@ -977,16 +1868,13 @@ export default function ProductList() {
         const statusTags: string[] = y?.statusTags || [];
         const sites: any[] = y?.addedSiteList || [];
         const offSites: any[] = y?.onceAddSiteList || [];
-        const trend = (gp?.trend || []).map((t: any) => ({ day: String(t.day || "").slice(5), v: t.quantity }));
-        const changeRate = gp?.changeRate || 0;
-        const up = changeRate >= 0;
         const siteName = (s: any) => s?.siteName || s?.regionName || s?.name || s?.code || (typeof s === "string" ? s : "?");
         const buyerLine = y?.buyerName || record.operatorContact || record.operatorNick;
 
         return (
-          <div style={{ fontSize: 11, lineHeight: 1.55 }}>
+          <div style={{ fontSize: 14, lineHeight: 1.55 }}>
             <Tooltip title={text || "-"} placement="topLeft">
-              <div style={{ fontWeight: 500, fontSize: 12, marginBottom: 2, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+              <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 2, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
                 {text || "-"}
               </div>
             </Tooltip>
@@ -1004,53 +1892,36 @@ export default function ProductList() {
 
             {/* 状态标签行 */}
             <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 3 }}>
-              {stockOut && <Tag color="red" style={{ fontSize: 10, margin: 0 }}>已断货</Tag>}
-              {(record.hotTag === "true" || raw.hotTag === true) && <Tag color="volcano" style={{ fontSize: 10, margin: 0 }}>🔥 热销款</Tag>}
-              {raw.isAdProduct && <Tag color="blue" style={{ fontSize: 10, margin: 0 }}>广告</Tag>}
-              {tags.map((t, i) => <Tag key={`yt${i}`} color="red" style={{ fontSize: 10, margin: 0 }}>{t}</Tag>)}
-              {statusTags.map((t, i) => <Tag key={`ys${i}`} color="volcano" style={{ fontSize: 10, margin: 0 }}>{t}</Tag>)}
+              {stockOut && <Tag color="red" style={{ fontSize: 12, margin: 0 }}>已断货</Tag>}
+              {(record.hotTag === "true" || raw.hotTag === true) && <Tag color="volcano" style={{ fontSize: 12, margin: 0 }}>🔥 热销款</Tag>}
+              {raw.isAdProduct && <Tag color="blue" style={{ fontSize: 12, margin: 0 }}>广告</Tag>}
+              {tags.map((t, i) => <Tag key={`yt${i}`} color="red" style={{ fontSize: 12, margin: 0 }}>{t}</Tag>)}
+              {statusTags.map((t, i) => <Tag key={`ys${i}`} color="volcano" style={{ fontSize: 12, margin: 0 }}>{t}</Tag>)}
               {(y?.punishList || []).slice(0, 2).map((p: any, i: number) => (
-                <Tag key={`pn${i}`} color="red" style={{ fontSize: 10, margin: 0 }}>处罚:{p.reason || p.type}</Tag>
+                <Tag key={`pn${i}`} color="red" style={{ fontSize: 12, margin: 0 }}>处罚:{p.reason || p.type}</Tag>
               ))}
             </div>
 
             {/* 云舵卡区块 */}
             {(y || gp) && (
-              <div style={{ marginTop: 6, padding: 6, background: "#fafafa", borderRadius: 4, border: "1px solid #f0f0f0" }}>
-                {buyerLine && (
-                  <div style={{ marginBottom: 3 }}>
-                    <span style={{ color: "#888" }}>买手：</span>
-                    <Tag color="orange" style={{ fontSize: 10, margin: 0 }}>{buyerLine}</Tag>
-                  </div>
-                )}
+              <div style={{ marginTop: 5, padding: "5px 8px", background: "#fafafa", borderRadius: 6, border: "1px solid #f0f0f0", fontSize: 13, lineHeight: 1.55 }}>
+                {buyerLine && <div><span style={{ color: "#888" }}>买手：</span><Tag color="orange" style={{ fontSize: 12, margin: 0 }}>{buyerLine}</Tag></div>}
                 {y?.category && (
-                  <div style={{ marginBottom: 3, display: "flex", alignItems: "flex-start", gap: 4 }}>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
                     <span style={{ color: "#888", flexShrink: 0 }}>类目：</span>
-                    <span style={{ flex: 1, color: "#555", lineHeight: 1.4 }}>{y.category}</span>
-                    <a style={{ fontSize: 10, color: "#1677ff", flexShrink: 0 }} onClick={(e) => { e.stopPropagation(); navigator.clipboard?.writeText(y.category); message.success("已复制"); }}>复制</a>
+                    <Tooltip title={y.category}><span style={{ flex: 1, color: "#555", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{y.category}</span></Tooltip>
+                    <a style={{ fontSize: 12, color: "#1677ff", flexShrink: 0 }} onClick={(e) => { e.stopPropagation(); navigator.clipboard?.writeText(y.category); message.success("已复制"); }}>复制</a>
                   </div>
                 )}
                 {sites.length > 0 && (
-                  <div style={{ marginBottom: 3 }}>
-                    <span style={{ color: "#888" }}>销售：</span>
-                    <span style={{ color: "#1677ff" }}>{sites.slice(0, 3).map(siteName).join("，")}</span>
-                    {sites.length > 3 && <Tag color="blue" style={{ fontSize: 10, marginLeft: 4 }}>共 {sites.length} 站</Tag>}
-                  </div>
+                  <div><span style={{ color: "#888" }}>销售：</span><span style={{ color: "#1677ff" }}>{sites.slice(0, 3).map(siteName).join("，")}</span>{sites.length > 3 && <Tag color="blue" style={{ fontSize: 12, marginLeft: 4 }}>共 {sites.length} 站</Tag>}</div>
                 )}
                 {offSites.length > 0 && (
-                  <div style={{ marginBottom: 3 }}>
-                    <span style={{ color: "#888" }}>下架：</span>
-                    <span style={{ color: "#999" }}>{offSites.slice(0, 3).map(siteName).join("，")}{offSites.length > 3 ? `…` : ""}</span>
-                  </div>
+                  <div><span style={{ color: "#888" }}>下架：</span><span style={{ color: "#999" }}>{offSites.slice(0, 3).map(siteName).join("，")}{offSites.length > 3 ? `…` : ""}</span></div>
                 )}
                 {gp && (
-                  <div style={{ marginTop: 4, paddingTop: 4, borderTop: "1px dashed #e8e8e8", display: "flex", justifyContent: "flex-end" }}>
-                    <a
-                      style={{ fontSize: 11, color: "#1677ff" }}
-                      onClick={(e) => { e.stopPropagation(); openGpDetail(record); }}
-                    >
-                      动销详情 →
-                    </a>
+                  <div style={{ textAlign: "right" }}>
+                    <a style={{ fontSize: 13, color: "#1677ff" }} onClick={(e) => { e.stopPropagation(); openGpDetail(record); }}>动销详情 →</a>
                   </div>
                 )}
               </div>
@@ -1060,251 +1931,1236 @@ export default function ProductList() {
       },
     },
     {
-      title: "SKC ID",
-      dataIndex: "skcId",
-      key: "skcId",
-      width: 120,
-      render: (text: string) => <span style={{ fontSize: 12, fontFamily: "monospace" }}>{text || "-"}</span>,
-    },
-    {
       title: "SKU/规格",
       key: "skuInfo",
       width: 150,
-      render: (_: any, record: ProductItem) => (
-        <div style={{ fontSize: 12 }}>
-          <div style={{ fontFamily: "monospace" }}>{record.skuId || "-"}</div>
-          {record.skuName && <div style={{ color: "#666" }}>{record.skuName}</div>}
-          {record.extCode && <div style={{ color: "#999" }}>货号：{record.extCode}</div>}
-        </div>
-      ),
+      render: (_: any, record: any) => {
+        if (record._isTotal) return <span style={{ fontWeight: 600, color: "#333" }}>合计</span>;
+        if (record._skuId) {
+          return (
+            <div style={{ fontSize: 14, lineHeight: 1.55 }}>
+              <div style={{ fontFamily: "monospace" }}>{record._skuId}</div>
+              {record._skuSpec && <div style={{ color: "#666" }}>{record._skuSpec}</div>}
+              {record._skuExtCode && <div style={{ color: "#999" }}>货号：{record._skuExtCode}</div>}
+            </div>
+          );
+        }
+        return (
+          <div style={{ fontSize: 14, lineHeight: 1.55 }}>
+            <div style={{ fontFamily: "monospace" }}>{record.skuId || "-"}</div>
+            {record.skuName && <div style={{ color: "#666" }}>{record.skuName}</div>}
+            {record.extCode && <div style={{ color: "#999" }}>货号：{record.extCode}</div>}
+          </div>
+        );
+      },
     },
     {
       title: "申报价格",
-      dataIndex: "price",
       key: "price",
-      width: 90,
-      render: (text: any) => <span style={{ color: "#fa541c", fontWeight: 500 }}>{formatTextValue(text)}</span>,
+      width: 110,
+      align: "right",
+      render: (_: any, record: any) => {
+        if (record._isTotal) return <span style={{ color: "#999" }}>-</span>;
+        const p = record._skuPrice ?? record.price;
+        return <span style={{ fontSize: 14, color: "#fa541c", fontWeight: 500 }}>¥{formatTextValue(p)}</span>;
+      },
     },
     {
       title: "今日销量",
-      dataIndex: "todaySales",
       key: "todaySales",
-      width: 85,
-      sorter: (a, b) => (a.todaySales || 0) - (b.todaySales || 0),
-      render: (val: number) => <span style={numColor(val || 0)}>{val || 0}</span>,
+      width: 95,
+      align: "right",
+      sorter: (a: any, b: any) => (a._skuTodaySales || 0) - (b._skuTodaySales || 0),
+      render: (_: any, r: any) => {
+        const v = r._skuTodaySales || 0;
+        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: "#fa541c" } : numColor(v)) }}>{v}</span>;
+      },
     },
     {
       title: "7天销量",
-      dataIndex: "last7DaysSales",
       key: "last7DaysSales",
-      width: 85,
-      sorter: (a, b) => (a.last7DaysSales || 0) - (b.last7DaysSales || 0),
-      render: (val: number) => <span style={numColor(val || 0)}>{val || 0}</span>,
+      width: 95,
+      align: "right",
+      sorter: (a: any, b: any) => (a._sku7dSales || 0) - (b._sku7dSales || 0),
+      render: (_: any, r: any) => {
+        const v = r._sku7dSales || 0;
+        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: "#fa541c" } : numColor(v)) }}>{v}</span>;
+      },
     },
     {
       title: "30天销量",
-      dataIndex: "last30DaysSales",
       key: "last30DaysSales",
-      width: 90,
-      sorter: (a, b) => (a.last30DaysSales || 0) - (b.last30DaysSales || 0),
+      width: 100,
+      align: "right",
+      sorter: (a: any, b: any) => (a._sku30dSales || 0) - (b._sku30dSales || 0),
       defaultSortOrder: "descend",
-      render: (val: number) => <span style={numColor(val || 0)}>{val || 0}</span>,
+      render: (_: any, r: any) => {
+        const v = r._sku30dSales || 0;
+        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: "#fa541c" } : numColor(v)) }}>{v}</span>;
+      },
     },
     {
       title: "总销量",
       dataIndex: "totalSales",
       key: "totalSales",
-      width: 85,
+      width: 95,
+      align: "right",
+      onCell: productCellSpanMiddle,
       sorter: (a, b) => (a.totalSales || 0) - (b.totalSales || 0),
-      render: (val: number) => <span style={numColor(val || 0, "#1890ff")}>{val || 0}</span>,
+      render: (val: number) => <span style={{ fontSize: 14, ...numColor(val || 0, "#1890ff") }}>{val || 0}</span>,
     },
     {
       title: "仓内可用库存",
-      dataIndex: "warehouseStock",
       key: "warehouseStock",
       width: 120,
+      align: "right",
+      onCell: productCellSpanMiddle,
       sorter: (a, b) => (a.warehouseStock || 0) - (b.warehouseStock || 0),
-      render: (val: number) => <span style={{ color: (val || 0) > 0 ? "#1890ff" : "#ff4d4f", fontWeight: 500 }}>{val || 0}</span>,
+      render: (_: any, r: any) => {
+        const v = r.warehouseStock || 0;
+        return <span style={{ fontSize: 14, color: v > 0 ? "#1890ff" : "#ff4d4f", fontWeight: 500 }}>{v}</span>;
+      },
     },
     {
-      title: "暂不可用库存",
-      dataIndex: "unavailableStock",
-      key: "unavailableStock",
-      width: 120,
-      sorter: (a, b) => (a.unavailableStock || 0) - (b.unavailableStock || 0),
-      render: (val: number) => <span style={{ color: (val || 0) > 0 ? "#fa8c16" : "#999", fontWeight: (val || 0) > 0 ? 500 : 400 }}>{val || 0}</span>,
+      title: "仓内预占用库存",
+      key: "occupy",
+      width: 130,
+      align: "right",
+      render: (_: any, r: any) => {
+        const v = r._skuOccupy || 0;
+        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: v > 0 ? "#13c2c2" : "#999" } : { color: v > 0 ? "#13c2c2" : "#999" }) }}>{v}</span>;
+      },
     },
     {
-      title: "预占用库存",
-      dataIndex: "occupyStock",
-      key: "occupyStock",
-      width: 115,
-      sorter: (a, b) => (a.occupyStock || 0) - (b.occupyStock || 0),
-      render: (val: number) => <span style={{ color: (val || 0) > 0 ? "#13c2c2" : "#999", fontWeight: (val || 0) > 0 ? 500 : 400 }}>{val || 0}</span>,
+      title: "仓内暂不可用库存",
+      key: "unavail",
+      width: 140,
+      align: "right",
+      render: (_: any, r: any) => {
+        const v = r._skuUnavail || 0;
+        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: v > 0 ? "#fa8c16" : "#999" } : { color: v > 0 ? "#fa8c16" : "#999" }) }}>{v}</span>;
+      },
+    },
+    {
+      title: "已发货库存",
+      key: "inTransit",
+      width: 110,
+      align: "right",
+      render: (_: any, r: any) => {
+        const v = r._skuInTransit || 0;
+        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: v > 0 ? "#1890ff" : "#999" } : { color: v > 0 ? "#1890ff" : "#999" }) }}>{v}</span>;
+      },
     },
     {
       title: "缺货",
-      dataIndex: "lackQuantity",
       key: "lackQuantity",
-      width: 75,
-      render: (val: number) => <span style={{ color: (val || 0) > 0 ? "#ff4d4f" : "#999", fontWeight: (val || 0) > 0 ? 500 : 400 }}>{val || 0}</span>,
-    },
-    {
-      title: "7日加购",
-      dataIndex: "sevenDaysAddCartNum",
-      key: "sevenDaysAddCartNum",
       width: 85,
-      sorter: (a, b) => (a.sevenDaysAddCartNum || 0) - (b.sevenDaysAddCartNum || 0),
-      render: (val: number) => (
-        <span style={{ color: (val || 0) > 0 ? "#722ed1" : "#999", fontWeight: (val || 0) > 0 ? 500 : 400 }}>
-          {val || 0}
-        </span>
-      ),
+      align: "right",
+      render: (_: any, r: any) => {
+        const v = r._skuLack || 0;
+        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: v > 0 ? "#ff4d4f" : "#999" } : { color: v > 0 ? "#ff4d4f" : "#999", fontWeight: v > 0 ? 500 : 400 }) }}>{v}</span>;
+      },
     },
     {
       title: "建议备货",
       key: "advice",
-      width: 90,
-      render: (_: any, r: ProductItem) => {
-        const v = r.salesRaw?.skuQuantityTotalInfo?.adviceQuantity;
-        return <span style={{ color: v > 0 ? "#fa541c" : "#999", fontWeight: v > 0 ? 500 : 400 }}>{v || "-"}</span>;
-      },
-    },
-    {
-      title: "高价限流",
-      key: "highPriceFlowLimit",
-      width: 150,
-      filters: [
-        { text: "限流中", value: "on" },
-        { text: "正常", value: "off" },
-      ],
-      onFilter: (value, record) => (value === "on" ? !!record.highPriceFlowLimit : !record.highPriceFlowLimit),
-      render: (_: any, r: ProductItem) => {
-        if (!r.highPriceFlowLimit) return <span style={{ color: "#999" }}>-</span>;
-        const info = r.highPriceFlowInfo || {};
-        const fmt = (v: any) => {
-          if (v == null || v === "") return null;
-          const n = Number(v);
-          if (!Number.isFinite(n)) return String(v);
-          // Temu 价格通常以分为单位
-          return (n > 1000 ? n / 100 : n).toFixed(2);
-        };
-        const current = fmt(info.currentPrice ?? info.supplierPrice ?? info.price ?? info.salePrice);
-        const suggest = fmt(info.suggestPrice ?? info.targetPrice ?? info.expectPrice ?? info.reducePrice ?? info.lowPrice);
-        const tip = (
-          <div style={{ fontSize: 12, lineHeight: 1.6 }}>
-            {Object.entries(info).slice(0, 14).map(([k, v]) => (
-              <div key={k}>{k}: {typeof v === "object" ? JSON.stringify(v) : String(v)}</div>
-            ))}
-          </div>
-        );
-        return (
-          <Tooltip title={tip}>
-            <Space direction="vertical" size={0}>
-              <Tag color="red" style={{ marginRight: 0 }}>限流</Tag>
-              {(current || suggest) && (
-                <span style={{ fontSize: 11, color: "#666" }}>
-                  {current && <span style={{ color: "#ff4d4f" }}>¥{current}</span>}
-                  {current && suggest && " → "}
-                  {suggest && <span style={{ color: "#52c41a" }}>¥{suggest}</span>}
-                </span>
-              )}
-            </Space>
-          </Tooltip>
-        );
-      },
-    },
-    {
-      title: "供货状态",
-      dataIndex: "supplyStatus",
-      key: "supplyStatus",
-      width: 110,
-      render: (status: string) => {
-        if (!status) return "-";
-        const colorMap: Record<string, string> = {
-          "正常供货": "green",
-          "暂时无法供货": "orange",
-          "永久停止供货": "red",
-        };
-        return <Tag color={colorMap[status] || "default"}>{status}</Tag>;
-      },
-    },
-    {
-      title: "状态",
-      key: "status",
       width: 100,
-      render: (_: string, record: ProductItem) => {
-        const status = record.status || normalizeStatusText(record.removeStatus);
-        const color: any = status === "在售" ? "success" : status.includes("下架") ? "error" : "default";
-        return renderStatusTag(status || "待同步", color);
+      align: "right",
+      render: (_: any, r: any) => {
+        const v = r._skuAdvice || 0;
+        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: v > 0 ? "#fa541c" : "#999" } : { color: v > 0 ? "#fa541c" : "#999", fontWeight: v > 0 ? 500 : 400 }) }}>{v || "-"}</span>;
       },
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: 110,
+      fixed: "right",
+      onCell: productCellSpanMiddle,
+      render: (_: any, record: ProductItem) => (
+        <Space direction="vertical" size={2}>
+          <Button
+            type="link"
+            size="small"
+            style={{ padding: 0, height: "auto", fontWeight: 600, fontSize: 14 }}
+            onClick={(event) => {
+              event.stopPropagation();
+              openCompetitorAnalysis(record);
+            }}
+          >
+            竞品分析
+          </Button>
+          <Button
+            type="link"
+            size="small"
+            style={{ padding: 0, height: "auto", fontWeight: 600, fontSize: 14 }}
+            onClick={(event) => {
+              event.stopPropagation();
+              setSelectedProduct(record);
+              setDrawerTab("overview");
+            }}
+          >
+            销售趋势
+          </Button>
+          <Button
+            type="link"
+            size="small"
+            style={{ padding: 0, height: "auto", fontWeight: 600, fontSize: 14 }}
+            onClick={(event) => {
+              event.stopPropagation();
+              setSelectedProduct(record);
+              setDrawerTab("flux");
+            }}
+          >
+            流量分析
+          </Button>
+        </Space>
+      ),
     },
   ];
+
+  // ============ 列配置（显示/隐藏 + 排序） ============
+  const COLUMN_STORAGE_KEY = "product-list-column-config";
+  const allColumnKeys = columns.map((c: any) => c.key as string).filter(Boolean);
+
+  // 列分组定义
+  const columnGroups: Array<{ label: string; keys: string[] }> = [
+    { label: "商品信息", keys: ["imageUrl", "title"] },
+    { label: "SKU信息", keys: ["skuInfo"] },
+    { label: "申报价格", keys: ["price"] },
+    { label: "销售数据", keys: ["todaySales", "last7DaysSales", "last30DaysSales", "totalSales"] },
+    { label: "缺货数量", keys: ["lackQuantity"] },
+    { label: "库存数据", keys: ["warehouseStock", "occupy", "unavail", "inTransit"] },
+    { label: "备货建议", keys: ["advice"] },
+    { label: "其他", keys: ["actions"] },
+  ];
+
+  const [columnConfig, setColumnConfig] = useState<{ order: string[]; hidden: string[] }>(() => {
+    try {
+      const saved = localStorage.getItem(COLUMN_STORAGE_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return { order: allColumnKeys, hidden: [] };
+  });
+  const [colSettingsOpen, setColSettingsOpen] = useState(false);
+  // 临时编辑状态（确认后才生效）
+  const [tempHidden, setTempHidden] = useState<string[]>([]);
+  const [tempOrder, setTempOrder] = useState<string[]>([]);
+
+  // 持久化
+  useEffect(() => {
+    localStorage.setItem(COLUMN_STORAGE_KEY, JSON.stringify(columnConfig));
+  }, [columnConfig]);
+
+  // 打开时初始化临时状态
+  const openColSettings = () => {
+    setTempHidden([...columnConfig.hidden]);
+    const order = [...columnConfig.order];
+    for (const k of allColumnKeys) { if (!order.includes(k)) order.push(k); }
+    setTempOrder(order);
+    setColSettingsOpen(true);
+  };
+
+  // 根据配置过滤 + 排序列
+  const configuredColumns = useMemo(() => {
+    const colMap = new Map(columns.map((c: any) => [c.key, c]));
+    const knownKeys = new Set(columnConfig.order);
+    const mergedOrder = [...columnConfig.order, ...allColumnKeys.filter((k) => !knownKeys.has(k))];
+    return mergedOrder
+      .filter((key) => !columnConfig.hidden.includes(key) && colMap.has(key))
+      .map((key) => colMap.get(key)!);
+  }, [columns, columnConfig, allColumnKeys]);
+
+  const tempToggle = (key: string) => {
+    setTempHidden((prev) => prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]);
+  };
+
+  const tempToggleGroup = (keys: string[]) => {
+    const allVisible = keys.every((k) => !tempHidden.includes(k));
+    if (allVisible) {
+      setTempHidden((prev) => [...prev, ...keys]);
+    } else {
+      setTempHidden((prev) => prev.filter((k) => !keys.includes(k)));
+    }
+  };
+
+  const tempMove = (key: string, dir: -1 | 1) => {
+    setTempOrder((prev) => {
+      const arr = [...prev];
+      const idx = arr.indexOf(key);
+      if (idx < 0) return prev;
+      const newIdx = idx + dir;
+      if (newIdx < 0 || newIdx >= arr.length) return prev;
+      [arr[idx], arr[newIdx]] = [arr[newIdx], arr[idx]];
+      return arr;
+    });
+  };
+
+  const confirmColSettings = () => {
+    setColumnConfig({ order: tempOrder, hidden: tempHidden });
+    setColSettingsOpen(false);
+  };
+
+  const resetColSettings = () => {
+    setTempOrder([...allColumnKeys]);
+    setTempHidden([]);
+  };
+
+  const visibleCount = allColumnKeys.filter((k) => !tempHidden.includes(k)).length;
+  const allSelected = tempHidden.length === 0;
+
+  const colMap = new Map(columns.map((c: any) => [c.key, c]));
+
+  // 拖拽排序
+  const dragRef = useRef<{ key: string; groupLabel: string } | null>(null);
+  const [dragOverKey, setDragOverKey] = useState<string | null>(null);
+
+  const handleDragStart = (key: string, groupLabel: string) => {
+    dragRef.current = { key, groupLabel };
+  };
+
+  const handleDragOver = (e: React.DragEvent, key: string) => {
+    e.preventDefault();
+    setDragOverKey(key);
+  };
+
+  const handleDrop = (e: React.DragEvent, targetKey: string, targetGroupLabel: string) => {
+    e.preventDefault();
+    setDragOverKey(null);
+    const src = dragRef.current;
+    if (!src || src.key === targetKey || src.groupLabel !== targetGroupLabel) return;
+    setTempOrder((prev) => {
+      const arr = [...prev];
+      const srcIdx = arr.indexOf(src.key);
+      const tgtIdx = arr.indexOf(targetKey);
+      if (srcIdx < 0 || tgtIdx < 0) return prev;
+      // 移除源，插入到目标位置
+      arr.splice(srcIdx, 1);
+      const insertIdx = arr.indexOf(targetKey);
+      arr.splice(insertIdx, 0, src.key);
+      return arr;
+    });
+  };
+
+  const handleDragEnd = () => {
+    dragRef.current = null;
+    setDragOverKey(null);
+  };
 
   // ============ Drawer 渲染 ============
   const renderDrawer = () => {
     if (!selectedProduct) return null;
     const record = selectedProduct;
     const raw: any = record.salesRaw || {};
-    const sku: any = record.salesRawSku || {};
     const qty: any = raw.skuQuantityTotalInfo || {};
     const inv: any = qty.inventoryNumInfo || raw.inventoryNumInfo || {};
-    const trend = record.trendDaily || [];
+    const trend = Array.isArray(record.trendDaily) ? record.trendDaily : [];
+    const fluxSites = Array.isArray(record.fluxSites) ? record.fluxSites : [];
+    const activeFluxSite = fluxSites.find((site) => site.siteKey === activeFluxSiteKey) || fluxSites[0] || null;
+    const fluxRangeOptions = sortFluxRangeLabels(activeFluxSite?.availableRanges || []);
+    const selectedFluxRange = fluxRangeOptions.includes(activeFluxRangeLabel)
+      ? activeFluxRangeLabel
+      : (activeFluxSite?.primaryRangeLabel || fluxRangeOptions[0] || "");
+    const currentFluxSummary = selectedFluxRange
+      ? activeFluxSite?.summaryByRange?.[selectedFluxRange] || activeFluxSite?.summary || null
+      : activeFluxSite?.summary || null;
+    const currentFluxItems = selectedFluxRange
+      ? activeFluxSite?.itemsByRange?.[selectedFluxRange] || activeFluxSite?.items || []
+      : activeFluxSite?.items || [];
+    const isGpFallback = currentFluxSummary?.dataOrigin === "gp";
+    const detailVisitorValue = currentFluxSummary?.detailVisitorNum || currentFluxSummary?.detailVisitNum || 0;
+    const rangeComparisonData = activeFluxSite
+      ? sortFluxRangeLabels(Object.keys(activeFluxSite.summaryByRange || {})).map((label) => {
+          const summary = activeFluxSite.summaryByRange[label];
+          return {
+            label,
+            fullLabel: `${activeFluxSite.siteLabel} · ${label}`,
+            曝光: summary?.exposeNum || 0,
+            点击: summary?.clickNum || 0,
+            详情访客: summary?.detailVisitorNum || summary?.detailVisitNum || 0,
+            支付买家: summary?.buyerNum || 0,
+            支付件数: summary?.payGoodsNum || 0,
+            曝光点击率: summary?.exposeClickRate || 0,
+            点击支付转化率: summary?.clickPayRate || 0,
+          };
+        })
+      : [];
+
+    const sourceBreakdownData = currentFluxSummary
+      ? [
+          {
+            来源: "搜索",
+            曝光: currentFluxSummary.searchExposeNum,
+            点击: currentFluxSummary.searchClickNum,
+            支付件数: currentFluxSummary.searchPayGoodsNum,
+            点击率: toPercentValue(undefined, currentFluxSummary.searchClickNum, currentFluxSummary.searchExposeNum),
+            支付转化率: toPercentValue(undefined, currentFluxSummary.searchPayGoodsNum, currentFluxSummary.searchClickNum),
+          },
+          {
+            来源: "推荐",
+            曝光: currentFluxSummary.recommendExposeNum,
+            点击: currentFluxSummary.recommendClickNum,
+            支付件数: currentFluxSummary.recommendPayGoodsNum,
+            点击率: toPercentValue(undefined, currentFluxSummary.recommendClickNum, currentFluxSummary.recommendExposeNum),
+            支付转化率: toPercentValue(undefined, currentFluxSummary.recommendPayGoodsNum, currentFluxSummary.recommendClickNum),
+          },
+          {
+            来源: "其他",
+            曝光: Math.max(0, currentFluxSummary.exposeNum - currentFluxSummary.searchExposeNum - currentFluxSummary.recommendExposeNum),
+            点击: Math.max(0, currentFluxSummary.clickNum - currentFluxSummary.searchClickNum - currentFluxSummary.recommendClickNum),
+            支付件数: Math.max(0, currentFluxSummary.payGoodsNum - currentFluxSummary.searchPayGoodsNum - currentFluxSummary.recommendPayGoodsNum),
+            点击率: toPercentValue(
+              undefined,
+              Math.max(0, currentFluxSummary.clickNum - currentFluxSummary.searchClickNum - currentFluxSummary.recommendClickNum),
+              Math.max(0, currentFluxSummary.exposeNum - currentFluxSummary.searchExposeNum - currentFluxSummary.recommendExposeNum),
+            ),
+            支付转化率: toPercentValue(
+              undefined,
+              Math.max(0, currentFluxSummary.payGoodsNum - currentFluxSummary.searchPayGoodsNum - currentFluxSummary.recommendPayGoodsNum),
+              Math.max(0, currentFluxSummary.clickNum - currentFluxSummary.searchClickNum - currentFluxSummary.recommendClickNum),
+            ),
+          },
+        ]
+      : [];
+    const sourceDistributionData = sourceBreakdownData.map((item) => ({
+      name: item.来源,
+      value: item.曝光,
+      share: toPercentValue(undefined, item.曝光, currentFluxSummary?.exposeNum),
+      color:
+        item.来源 === "搜索"
+          ? PRODUCT_TRAFFIC_COLORS.search
+          : item.来源 === "推荐"
+            ? PRODUCT_TRAFFIC_COLORS.recommend
+            : PRODUCT_TRAFFIC_COLORS.other,
+    }));
+    const efficiencyComparisonData = rangeComparisonData.map((item) => ({
+      label: item.label,
+      fullLabel: item.fullLabel,
+      曝光点击率: item.曝光点击率,
+      点击支付转化率: item.点击支付转化率,
+    }));
+
+    // 日级流量趋势数据（从 flux_history 日快照构建，商品级真实数据）
+    let dailyTrendData: any[] = [];
+    {
+      const idSet = new Set(
+        [record.skcId, record.spuId, record.goodsId, record.skuId]
+          .map((v) => String(v || "").trim()).filter(Boolean),
+      );
+      const titleSet = new Set(
+        [record.title].map((v) => String(v || "").replace(/\s+/g, "").trim().toLowerCase()).filter(Boolean),
+      );
+      // 方法1: 从 flux_history 日快照获取历史数据
+      const historyRows: any[] = [];
+      for (const snapshot of fluxHistoryData) {
+        if (!snapshot?.date || !Array.isArray(snapshot.items)) continue;
+        for (const item of snapshot.items) {
+          const itemGoodsId = String(item.goodsId || "").trim();
+          const itemName = String(item.goodsName || "").replace(/\s+/g, "").trim().toLowerCase();
+          if ((itemGoodsId && idSet.has(itemGoodsId)) || (itemName && titleSet.has(itemName))) {
+            historyRows.push({
+              date: String(snapshot.date).slice(5),
+              fullDate: snapshot.date,
+              曝光: item.exposeNum || 0,
+              点击: item.clickNum || 0,
+              详情访客: item.detailVisitNum || 0,
+              支付买家: item.buyerNum || 0,
+              支付件数: item.payGoodsNum || 0,
+              搜索曝光: item.searchExposeNum || 0,
+              推荐曝光: item.recommendExposeNum || 0,
+              _fromHistory: true,
+            });
+          }
+        }
+      }
+      // 方法2: 用"今日"和"昨日"range 补充（它们本身就是单日数据）
+      const today = new Date().toISOString().slice(0, 10);
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+      const existingDates = new Set(historyRows.map((r) => r.fullDate));
+      const singleDayRanges = [
+        { range: "今日", date: today },
+        { range: "昨日", date: yesterday },
+      ];
+      for (const { range, date } of singleDayRanges) {
+        if (existingDates.has(date)) continue;
+        const rangeItems = activeFluxSite?.itemsByRange?.[range];
+        if (!Array.isArray(rangeItems)) continue;
+        const matched = rangeItems.filter((item: any) => matchesFluxRecord(item, idSet));
+        if (matched.length === 0) continue;
+        const agg = matched.reduce((acc: any, item: any) => ({
+          曝光: acc.曝光 + toNumberValue(item.exposeNum),
+          点击: acc.点击 + toNumberValue(item.clickNum),
+          详情访客: acc.详情访客 + toNumberValue(item.detailVisitNum || item.detailVisitorNum),
+          支付买家: acc.支付买家 + toNumberValue(item.buyerNum),
+          支付件数: acc.支付件数 + toNumberValue(item.payGoodsNum),
+          搜索曝光: acc.搜索曝光 + toNumberValue(item.searchExposeNum),
+          推荐曝光: acc.推荐曝光 + toNumberValue(item.recommendExposeNum),
+        }), { 曝光: 0, 点击: 0, 详情访客: 0, 支付买家: 0, 支付件数: 0, 搜索曝光: 0, 推荐曝光: 0 });
+        historyRows.push({ ...agg, date: date.slice(5), fullDate: date, _fromHistory: true });
+      }
+      historyRows.sort((a, b) => String(a.fullDate).localeCompare(String(b.fullDate)));
+      // 根据选中的 range 过滤对应天数
+      if (historyRows.length > 0) {
+        const now = new Date();
+        const rangeDaysMap: Record<string, number> = {
+          "今日": 1, "昨日": 1, "近7日": 7, "近30日": 30, "本周": 7, "本月": 31,
+        };
+        const days = rangeDaysMap[selectedFluxRange] || historyRows.length;
+        if (selectedFluxRange === "昨日") {
+          dailyTrendData = historyRows.filter((r) => r.fullDate === yesterday);
+        } else if (selectedFluxRange === "今日") {
+          dailyTrendData = historyRows.filter((r) => r.fullDate === today);
+        } else {
+          const cutoff = new Date(now.getTime() - days * 86400000).toISOString().slice(0, 10);
+          dailyTrendData = historyRows.filter((r) => r.fullDate >= cutoff);
+        }
+        // 如果过滤后不足2个点，用全部历史让图表有意义
+        if (dailyTrendData.length < 2) dailyTrendData = historyRows;
+      }
+    }
+
+    const funnelSteps = currentFluxSummary
+      ? [
+          { label: "曝光", value: currentFluxSummary.exposeNum },
+          { label: "点击", value: currentFluxSummary.clickNum },
+          { label: "详情访客", value: currentFluxSummary.detailVisitorNum || currentFluxSummary.detailVisitNum },
+          { label: "加购人数", value: currentFluxSummary.addToCartUserNum },
+          { label: "支付买家", value: currentFluxSummary.buyerNum },
+        ]
+      : [];
+
+    const diagnosis = (() => {
+      if (!currentFluxSummary) {
+        return {
+          title: "当前还没有可用的流量快照",
+          desc: "先运行商品流量采集，后面这里会自动展开站点、周期和来源拆解。",
+        };
+      }
+      if (isGpFallback) {
+        return {
+          title: "当前展示的是已采集的动销趋势与地区销量",
+          desc: "这件商品已经命中动销快照，不需要现场抓取也能直接看销量走势和地区分布；等完整商品流量采集补齐后，这里会自动升级成曝光、点击、加购和支付漏斗。",
+        };
+      }
+      if (currentFluxSummary.exposeNum <= 0) {
+        return {
+          title: "当前还没有可用的流量快照",
+          desc: "先运行商品流量采集，后面这里会自动展开站点、周期和来源拆解。",
+        };
+      }
+      if (currentFluxSummary.exposeClickRate < 2) {
+        return {
+          title: "曝光有基础，但点击承接偏弱",
+          desc: "建议继续强化主图前景识别、首屏卖点和标题前 12 字，让曝光更有效转成点击。",
+        };
+      }
+      if (currentFluxSummary.clickPayRate < 5) {
+        return {
+          title: "点击已经起来了，转化还可以再往前推",
+          desc: "重点检查详情图、价格带和核心卖点表达，先把进店后的支付转化率提上去。",
+        };
+      }
+      return {
+        title: "当前流量承接已经形成基础",
+        desc: "可以继续放大有效站点和来源，把点击和支付节奏稳定住。",
+      };
+    })();
+    const executionSignals = currentFluxSummary
+      ? [
+          { title: "详情承接率", value: formatTrafficPercent(toPercentValue(undefined, detailVisitorValue, currentFluxSummary.clickNum)), helper: "点击后进入详情页的比例", color: PRODUCT_TRAFFIC_COLORS.detail },
+          { title: "收藏率", value: formatTrafficPercent(toPercentValue(undefined, currentFluxSummary.collectUserNum, detailVisitorValue || currentFluxSummary.clickNum)), helper: "详情访客里有多少愿意留下兴趣", color: PRODUCT_TRAFFIC_COLORS.collect },
+          { title: "加购率", value: formatTrafficPercent(toPercentValue(undefined, currentFluxSummary.addToCartUserNum, detailVisitorValue || currentFluxSummary.clickNum)), helper: "详情页到购物车的承接效率", color: PRODUCT_TRAFFIC_COLORS.cart },
+          { title: "订单买家比", value: formatTrafficPercent(toPercentValue(undefined, currentFluxSummary.payOrderNum, currentFluxSummary.buyerNum)), helper: "每个买家贡献的支付订单数", color: PRODUCT_TRAFFIC_COLORS.order },
+        ]
+      : [];
+    const secondaryTrafficCards = currentFluxSummary
+      ? [
+          { label: "收藏人数", value: formatTrafficNumber(currentFluxSummary.collectUserNum), helper: "收藏沉淀", accent: PRODUCT_TRAFFIC_COLORS.collect },
+          { label: "支付订单", value: formatTrafficNumber(currentFluxSummary.payOrderNum), helper: "成交单量", accent: PRODUCT_TRAFFIC_COLORS.order },
+          { label: "搜索曝光", value: formatTrafficNumber(currentFluxSummary.searchExposeNum), helper: "搜索入口", accent: PRODUCT_TRAFFIC_COLORS.search },
+          { label: "搜索点击", value: formatTrafficNumber(currentFluxSummary.searchClickNum), helper: "搜索承接", accent: PRODUCT_TRAFFIC_COLORS.search },
+          { label: "推荐曝光", value: formatTrafficNumber(currentFluxSummary.recommendExposeNum), helper: "推荐入口", accent: PRODUCT_TRAFFIC_COLORS.recommend },
+          { label: "推荐点击", value: formatTrafficNumber(currentFluxSummary.recommendClickNum), helper: "推荐承接", accent: PRODUCT_TRAFFIC_COLORS.recommend },
+          { label: "趋势曝光", value: formatTrafficNumber(currentFluxSummary.trendExposeNum), helper: "趋势通道", accent: "#f59e0b" },
+          { label: "趋势支付订单", value: formatTrafficNumber(currentFluxSummary.trendPayOrderNum), helper: "趋势成交", accent: "#0f766e" },
+        ]
+      : [];
+    const sourceContributionData = currentFluxSummary
+      ? sourceBreakdownData.map((item) => ({
+          ...item,
+          曝光占比: toPercentValue(undefined, item.曝光, currentFluxSummary.exposeNum),
+          支付贡献占比: toPercentValue(undefined, item.支付件数, currentFluxSummary.payGoodsNum),
+          千次曝光成交: item.曝光 > 0 ? (item.支付件数 / item.曝光) * 1000 : 0,
+          建议:
+            item.点击率 >= 5 && item.支付转化率 >= 10
+              ? "继续放量"
+              : item.点击率 < 3
+                ? "先补主图和标题"
+                : item.支付转化率 < 5
+                  ? "先补详情和价格"
+                  : "维持观察",
+        }))
+      : [];
+    const trafficHealthScore = currentFluxSummary
+      ? Math.max(
+          0,
+          Math.min(
+            100,
+            Math.round(
+              Math.min(100, currentFluxSummary.exposeClickRate * 8) * 0.28
+              + Math.min(100, currentFluxSummary.clickPayRate * 6) * 0.32
+              + Math.min(100, toPercentValue(undefined, detailVisitorValue, currentFluxSummary.clickNum) * 1.4) * 0.18
+              + Math.min(100, toPercentValue(undefined, currentFluxSummary.addToCartUserNum, detailVisitorValue || currentFluxSummary.clickNum) * 2.2) * 0.12
+              + Math.min(
+                100,
+                100 - Math.max(...sourceDistributionData.map((item) => item.share || 0), 0) * 0.7,
+              ) * 0.1,
+            ),
+          ),
+        )
+      : 0;
+    const trafficHealthTone =
+      trafficHealthScore >= 80
+        ? { text: "健康", color: "#16a34a", tag: "当前这波流量可以继续放大" }
+        : trafficHealthScore >= 60
+          ? { text: "稳定", color: "#f59e0b", tag: "主链路已经成型，继续补效率" }
+          : { text: "待优化", color: "#e11d48", tag: "先解决点击或转化短板" };
+    const strongestSource = sourceContributionData
+      .slice()
+      .sort((left, right) => (right.支付件数 || 0) - (left.支付件数 || 0))[0];
+    const opportunityHighlights = currentFluxSummary
+      ? [
+          {
+            title: "当前主阵地",
+            value: strongestSource?.来源 || "暂无",
+            helper: strongestSource ? `支付贡献 ${formatTrafficPercent(strongestSource.支付贡献占比)}` : "先完成来源采集",
+            accent: strongestSource?.来源 === "搜索" ? PRODUCT_TRAFFIC_COLORS.search : strongestSource?.来源 === "推荐" ? PRODUCT_TRAFFIC_COLORS.recommend : PRODUCT_TRAFFIC_COLORS.other,
+          },
+          {
+            title: "当前短板",
+            value: currentFluxSummary.exposeClickRate < 3 ? "点击承接" : currentFluxSummary.clickPayRate < 5 ? "支付转化" : "站点放量",
+            helper: currentFluxSummary.exposeClickRate < 3 ? "先优化主图、标题前 12 字和价格锚点" : currentFluxSummary.clickPayRate < 5 ? "先补详情图、评价和卖点承接" : "可以扩大有效来源和站点预算",
+            accent: currentFluxSummary.exposeClickRate < 3 ? "#e11d48" : currentFluxSummary.clickPayRate < 5 ? "#f97316" : "#2563eb",
+          },
+          {
+            title: "下一步动作",
+            value:
+              currentFluxSummary.recommendExposeNum > currentFluxSummary.searchExposeNum
+                ? "补搜索承接"
+                : currentFluxSummary.searchExposeNum > currentFluxSummary.recommendExposeNum
+                  ? "放大推荐转化"
+                  : "同步双入口",
+            helper:
+              currentFluxSummary.recommendExposeNum > currentFluxSummary.searchExposeNum
+                ? "标题关键词和主图首屏优先再加强一档"
+                : currentFluxSummary.searchExposeNum > currentFluxSummary.recommendExposeNum
+                  ? "继续补场景图和买点文案，让推荐流量吃满"
+                  : "全球和站点流量结构比较均衡，继续观察增量",
+            accent: "#7c3aed",
+          },
+        ]
+      : [];
+    const actionChecklist = currentFluxSummary
+      ? [
+          {
+            title: "标题动作",
+            desc:
+              currentFluxSummary.searchClickNum <= 0 || currentFluxSummary.exposeClickRate < 3
+                ? "把核心品类词前置到标题前 12 字，配合主图重新强化点击承接。"
+                : "标题承接已经有基础，继续扩展同义词和高意图词。 ",
+          },
+          {
+            title: "图片动作",
+            desc:
+              currentFluxSummary.clickPayRate < 5
+                ? "优先补细节图、尺寸图和场景图，把点击后的支付转化率抬起来。"
+                : "主图和详情图承接基本合格，可以继续做精细化版本测试。",
+          },
+          {
+            title: "站点动作",
+            desc:
+              strongestSource?.来源 === "推荐"
+                ? "当前推荐流量是主阵地，建议继续做高点击图和高停留详情。"
+                : strongestSource?.来源 === "搜索"
+                  ? "当前搜索流量更强，建议继续扩词并稳定关键词承接。"
+                  : "其他来源占比偏高，建议先把搜索和推荐这两条主链拉稳。",
+          },
+        ]
+      : [];
 
     const renderMetric = (label: string, value: any, accent?: boolean) => (
       <div style={{ padding: "8px 12px", background: "var(--color-bg-1, #fafafa)", borderRadius: 8 }}>
-        <div style={{ fontSize: 11, color: "var(--color-text-sec)" }}>{label}</div>
+        <div style={{ fontSize: 13, color: "var(--color-text-sec)" }}>{label}</div>
         <div style={{ fontSize: 16, fontWeight: 700, color: accent ? "var(--color-brand)" : "var(--color-text)" }}>
           {formatTextValue(value)}
         </div>
       </div>
     );
 
+    const renderTrafficCard = (label: string, value: React.ReactNode, helper?: string, accent?: string) => (
+      <Card
+        size="small"
+        bodyStyle={{ padding: 14 }}
+        style={{ borderRadius: 16, borderColor: "rgba(255,138,31,0.12)", boxShadow: "0 10px 30px rgba(15,23,42,0.04)" }}
+      >
+        <div style={{ display: "grid", gap: 6 }}>
+          <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>{label}</div>
+          <div style={{ fontSize: 28, fontWeight: 800, lineHeight: 1, color: accent || "var(--color-text)" }}>{value}</div>
+          {helper ? <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>{helper}</div> : null}
+        </div>
+      </Card>
+    );
+
     const overviewTab = (
       <div style={{ display: "grid", gap: 16 }}>
         {trend.length > 0 ? (
-          <div className="app-surface" style={{ padding: 12, borderRadius: 12 }}>
-            <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8, color: "var(--color-brand)" }}>
-              销售趋势 · 共 {trend.length} 天
+          <div className="app-surface" style={{ padding: 16, borderRadius: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 8 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>销售趋势</div>
+                <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>最近 {trend.length} 天销量变化</div>
+              </div>
+              <Tag color="orange">销售表现</Tag>
             </div>
-            <ResponsiveContainer width="100%" height={220}>
-              <AreaChart data={trend} margin={{ top: 8, right: 16, left: -8, bottom: 0 }}>
+            <ResponsiveContainer width="100%" height={240}>
+              <AreaChart data={trend} margin={{ top: 10, right: 16, left: -8, bottom: 0 }}>
                 <defs>
-                  <linearGradient id="trendFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#e55b00" stopOpacity={0.4} />
-                    <stop offset="100%" stopColor="#e55b00" stopOpacity={0} />
+                  <linearGradient id="salesTrendFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#ff8a1f" stopOpacity={0.38} />
+                    <stop offset="100%" stopColor="#ff8a1f" stopOpacity={0.02} />
                   </linearGradient>
                 </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
-                <XAxis dataKey="date" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
-                <YAxis tick={{ fontSize: 10 }} allowDecimals={false} />
-                <ReTooltip />
-                <Area type="monotone" dataKey="salesNumber" stroke="#e55b00" strokeWidth={2} fill="url(#trendFill)" />
+                <CartesianGrid strokeDasharray="3 3" stroke={PRODUCT_TRAFFIC_COLORS.grid} />
+                <XAxis dataKey="date" tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} interval="preserveStartEnd" />
+                <YAxis tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} allowDecimals={false} />
+                <ReTooltip formatter={(value: any) => [formatTrafficNumber(value), "销量"]} />
+                <Area type="monotone" dataKey="salesNumber" stroke="#ff8a1f" strokeWidth={2.5} fill="url(#salesTrendFill)" />
               </AreaChart>
             </ResponsiveContainer>
           </div>
         ) : (
-          <Alert type="info" showIcon message="暂无销售趋势数据" description="如需查看销售趋势曲线，请重新采集销售数据。" />
+          <Alert type="info" showIcon message="暂无销售趋势数据" description="重新采集销售数据后，这里会展示最近销售趋势。" />
         )}
-
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8 }}>
-          {renderMetric("今日销量", qty.todaySaleVolume ?? record.todaySales, true)}
-          {renderMetric("7日销量", qty.lastSevenDaysSaleVolume ?? record.last7DaysSales, true)}
-          {renderMetric("30日销量", qty.lastThirtyDaysSaleVolume ?? record.last30DaysSales, true)}
-          {renderMetric("总销量", qty.totalSaleVolume ?? record.totalSales)}
-          {renderMetric("仓库库存", inv.warehouseInventoryNum ?? record.warehouseStock, true)}
-          {renderMetric("缺货", qty.lackQuantity ?? record.lackQuantity)}
-          {renderMetric("建议备货", qty.adviceQuantity)}
-          {renderMetric("可售天数", qty.availableSaleDays ?? record.availableSaleDays)}
-          {renderMetric("申报价", record.price)}
-          {renderMetric("买手", record.buyerName)}
-          {renderMetric("ASF评分", record.asfScore)}
-          {renderMetric("评论数", record.commentNum)}
-        </div>
       </div>
     );
 
-    // ----- SKU 明细 Tab：核心列 + 更多 -----
+    const fluxTab = activeFluxSite && currentFluxSummary ? (
+      <div style={{ display: "grid", gap: 18 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <Segmented
+            value={activeFluxSite.siteKey}
+            onChange={(value) => setActiveFluxSiteKey(value as FluxSiteKey)}
+            options={fluxSites.map((site) => ({ label: site.siteLabel, value: site.siteKey }))}
+          />
+          <Segmented
+            value={selectedFluxRange}
+            onChange={(value) => setActiveFluxRangeLabel(String(value))}
+            options={fluxRangeOptions.map((label) => ({ label, value: label }))}
+          />
+        </div>
+
+        <div
+          style={{
+            padding: 18,
+            borderRadius: 18,
+            border: "1px solid rgba(76, 110, 245, 0.12)",
+            background: "linear-gradient(135deg, rgba(232,240,255,0.95) 0%, rgba(255,255,255,1) 48%, rgba(255,243,232,0.92) 100%)",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+            <div style={{ display: "grid", gap: 8, maxWidth: 680 }}>
+              <div style={{ fontSize: 22, fontWeight: 800 }}>流量驾驶舱</div>
+              <div style={{ fontSize: 16, fontWeight: 600 }}>{diagnosis.title}</div>
+              <div style={{ fontSize: 13, color: "var(--color-text-sec)", lineHeight: 1.7 }}>{diagnosis.desc}</div>
+            </div>
+            <div style={{ display: "grid", gap: 8, minWidth: 220 }}>
+              <Tag color="blue">{activeFluxSite.siteLabel} · {selectedFluxRange}</Tag>
+              {currentFluxSummary.dataDate ? <Tag>统计日期：{currentFluxSummary.dataDate}</Tag> : null}
+              {activeFluxSite.syncedAt ? <Tag>采集时间：{activeFluxSite.syncedAt}</Tag> : null}
+              {currentFluxSummary.growDataText ? <Tag color="gold">{currentFluxSummary.growDataText}</Tag> : null}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.25fr) minmax(300px, 0.75fr)", gap: 16 }}>
+          <div
+            style={{
+              padding: 20,
+              borderRadius: 20,
+              border: "1px solid rgba(255,138,31,0.12)",
+              background: "linear-gradient(135deg, rgba(255,250,245,1) 0%, rgba(255,255,255,1) 46%, rgba(241,248,255,0.95) 100%)",
+              boxShadow: "0 14px 36px rgba(15,23,42,0.05)",
+              display: "grid",
+              gap: 14,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
+              <div style={{ display: "grid", gap: 8, maxWidth: 560 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "var(--color-brand)" }}>运营判断</div>
+                <div style={{ fontSize: 24, fontWeight: 800, lineHeight: 1.25 }}>{trafficHealthTone.tag}</div>
+                <div style={{ fontSize: 13, color: "var(--color-text-sec)", lineHeight: 1.8 }}>{diagnosis.desc}</div>
+              </div>
+              <Tag color={trafficHealthScore >= 80 ? "success" : trafficHealthScore >= 60 ? "gold" : "error"} style={{ paddingInline: 12, paddingBlock: 4, borderRadius: 999 }}>
+                流量健康度 {trafficHealthScore}
+              </Tag>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12 }}>
+              {opportunityHighlights.map((item) => (
+                <div
+                  key={item.title}
+                  style={{
+                    padding: 14,
+                    borderRadius: 18,
+                    background: "#fff",
+                    border: "1px solid rgba(15,23,42,0.06)",
+                    boxShadow: "0 8px 24px rgba(15,23,42,0.04)",
+                  }}
+                >
+                  <div style={{ fontSize: 12, color: "var(--color-text-sec)", marginBottom: 8 }}>{item.title}</div>
+                  <div style={{ fontSize: 24, fontWeight: 800, color: item.accent, marginBottom: 8 }}>{item.value}</div>
+                  <div style={{ fontSize: 12, color: "var(--color-text-sec)", lineHeight: 1.7 }}>{item.helper}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <Card
+            size="small"
+            bodyStyle={{ padding: 18 }}
+            style={{
+              borderRadius: 20,
+              borderColor: "rgba(37,99,235,0.12)",
+              boxShadow: "0 14px 32px rgba(15,23,42,0.05)",
+            }}
+          >
+            <div style={{ display: "grid", gap: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 800 }}>流量体检</div>
+                  <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>把点击承接、转化效率和来源结构压成一个综合判断</div>
+                </div>
+                <Tag color={trafficHealthScore >= 80 ? "success" : trafficHealthScore >= 60 ? "gold" : "error"}>{trafficHealthTone.text}</Tag>
+              </div>
+              <div style={{ display: "grid", justifyContent: "center" }}>
+                <Progress
+                  type="dashboard"
+                  percent={trafficHealthScore}
+                  strokeColor={trafficHealthTone.color}
+                  trailColor="rgba(15,23,42,0.08)"
+                  size={160}
+                  format={(percent) => (
+                    <div style={{ display: "grid", gap: 2, justifyItems: "center" }}>
+                      <span style={{ fontSize: 28, fontWeight: 800, color: "var(--color-text)" }}>{percent}</span>
+                      <span style={{ fontSize: 12, color: "var(--color-text-sec)" }}>健康分</span>
+                    </div>
+                  )}
+                />
+              </div>
+              <div style={{ display: "grid", gap: 10 }}>
+                {actionChecklist.map((item) => (
+                  <div key={item.title} style={{ padding: 12, borderRadius: 14, background: "var(--color-bg-1, #fafafa)", border: "1px solid rgba(15,23,42,0.05)" }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>{item.title}</div>
+                    <div style={{ fontSize: 12, color: "var(--color-text-sec)", lineHeight: 1.7 }}>{item.desc}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </Card>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12 }}>
+          {renderTrafficCard("曝光", formatTrafficNumber(currentFluxSummary.exposeNum), "入口规模", "#ff8a1f")}
+          {renderTrafficCard("点击", formatTrafficNumber(currentFluxSummary.clickNum), "首屏承接", "#0f766e")}
+          {renderTrafficCard("详情访客", formatTrafficNumber(currentFluxSummary.detailVisitorNum || currentFluxSummary.detailVisitNum), "进入详情页", "#2563eb")}
+          {renderTrafficCard("加购人数", formatTrafficNumber(currentFluxSummary.addToCartUserNum), "有意向人群", "#9333ea")}
+          {renderTrafficCard("支付买家", formatTrafficNumber(currentFluxSummary.buyerNum), "成交人数", "#16a34a")}
+          {renderTrafficCard("支付件数", formatTrafficNumber(currentFluxSummary.payGoodsNum), "成交件数", "#16a34a")}
+          {renderTrafficCard("曝光点击率", formatTrafficPercent(currentFluxSummary.exposeClickRate), "点击承接效率", "#4e79a7")}
+          {renderTrafficCard("点击支付转化率", formatTrafficPercent(currentFluxSummary.clickPayRate), "进店转化效率", "#e11d48")}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12 }}>
+          {secondaryTrafficCards.map((card) => renderTrafficCard(card.label, card.value, card.helper, card.accent))}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12 }}>
+          {executionSignals.map((signal) => (
+            <div
+              key={signal.title}
+              style={{
+                padding: 14,
+                borderRadius: 18,
+                border: "1px solid rgba(15,23,42,0.06)",
+                background: "#fff",
+                boxShadow: "0 10px 24px rgba(15,23,42,0.05)",
+              }}
+            >
+              <div style={{ fontSize: 12, color: "var(--color-text-sec)", marginBottom: 6 }}>{signal.title}</div>
+              <div style={{ fontSize: 24, fontWeight: 800, color: signal.color }}>{signal.value}</div>
+              <div style={{ marginTop: 6, fontSize: 12, color: "var(--color-text-sec)", lineHeight: 1.6 }}>{signal.helper}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.35fr) minmax(0, 1fr)", gap: 16 }}>
+          <Card size="small" bodyStyle={{ padding: 16 }} style={{ borderRadius: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 10 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>流量趋势</div>
+                <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>{dailyTrendData.length > 0 ? (dailyTrendData[0]?._fromHistory ? "按日期维度的曝光、点击与支付变化（日快照）" : "按日期维度的访客数与支付买家数变化") : "不同统计周期下的流量规模变化"}</div>
+              </div>
+              <Tag color="orange">{activeFluxSite.siteLabel}{dailyTrendData.length > 0 ? (dailyTrendData[0]?._fromHistory ? " · 日快照" : ` · ${selectedFluxRange}`) : ""}</Tag>
+            </div>
+            {dailyTrendData.length > 0 && dailyTrendData[0]?._fromHistory ? (
+              <ResponsiveContainer width="100%" height={320}>
+                <AreaChart data={dailyTrendData} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="productFluxExposeFillH" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={PRODUCT_TRAFFIC_COLORS.expose} stopOpacity={0.35} />
+                      <stop offset="100%" stopColor={PRODUCT_TRAFFIC_COLORS.expose} stopOpacity={0.03} />
+                    </linearGradient>
+                    <linearGradient id="productFluxClickFillH" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={PRODUCT_TRAFFIC_COLORS.detail} stopOpacity={0.2} />
+                      <stop offset="100%" stopColor={PRODUCT_TRAFFIC_COLORS.detail} stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={PRODUCT_TRAFFIC_COLORS.grid} />
+                  <XAxis dataKey="date" tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} interval="preserveStartEnd" />
+                  <YAxis tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} allowDecimals={false} />
+                  <ReTooltip formatter={(value: any) => formatTrafficNumber(value)} />
+                  <Legend />
+                  <Area type="monotone" dataKey="曝光" stroke={PRODUCT_TRAFFIC_COLORS.expose} fill="url(#productFluxExposeFillH)" strokeWidth={2.5} />
+                  <Area type="monotone" dataKey="点击" stroke={PRODUCT_TRAFFIC_COLORS.detail} fill="url(#productFluxClickFillH)" strokeWidth={2} />
+                  <Line type="monotone" dataKey="支付买家" stroke={PRODUCT_TRAFFIC_COLORS.clickPayRate} strokeWidth={2.5} dot={{ r: 3 }} />
+                  <Line type="monotone" dataKey="支付件数" stroke="#e11d48" strokeWidth={2.5} dot={{ r: 3 }} />
+                </AreaChart>
+              </ResponsiveContainer>
+            ) : dailyTrendData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={320}>
+                <AreaChart data={dailyTrendData} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="productFluxVisitorFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={PRODUCT_TRAFFIC_COLORS.expose} stopOpacity={0.35} />
+                      <stop offset="100%" stopColor={PRODUCT_TRAFFIC_COLORS.expose} stopOpacity={0.03} />
+                    </linearGradient>
+                    <linearGradient id="productFluxBuyerFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={PRODUCT_TRAFFIC_COLORS.clickPayRate} stopOpacity={0.2} />
+                      <stop offset="100%" stopColor={PRODUCT_TRAFFIC_COLORS.clickPayRate} stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={PRODUCT_TRAFFIC_COLORS.grid} />
+                  <XAxis dataKey="date" tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} interval="preserveStartEnd" />
+                  <YAxis tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} allowDecimals={false} />
+                  <ReTooltip formatter={(value: any) => formatTrafficNumber(value)} />
+                  <Legend />
+                  <Area type="monotone" dataKey="访客数" stroke={PRODUCT_TRAFFIC_COLORS.expose} fill="url(#productFluxVisitorFill)" strokeWidth={2.5} />
+                  <Area type="monotone" dataKey="支付买家数" stroke={PRODUCT_TRAFFIC_COLORS.clickPayRate} fill="url(#productFluxBuyerFill)" strokeWidth={2} />
+                </AreaChart>
+              </ResponsiveContainer>
+            ) : rangeComparisonData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={320}>
+                <AreaChart data={rangeComparisonData} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="productFluxExposeFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={PRODUCT_TRAFFIC_COLORS.expose} stopOpacity={0.35} />
+                      <stop offset="100%" stopColor={PRODUCT_TRAFFIC_COLORS.expose} stopOpacity={0.03} />
+                    </linearGradient>
+                    <linearGradient id="productFluxClickFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={PRODUCT_TRAFFIC_COLORS.detail} stopOpacity={0.2} />
+                      <stop offset="100%" stopColor={PRODUCT_TRAFFIC_COLORS.detail} stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={PRODUCT_TRAFFIC_COLORS.grid} />
+                  <XAxis dataKey="label" tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} />
+                  <YAxis tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} allowDecimals={false} />
+                  <ReTooltip formatter={(value: any) => formatTrafficNumber(value)} />
+                  <Legend />
+                  <Area type="monotone" dataKey="曝光" stroke={PRODUCT_TRAFFIC_COLORS.expose} fill="url(#productFluxExposeFill)" strokeWidth={2.5} />
+                  <Area type="monotone" dataKey="点击" stroke={PRODUCT_TRAFFIC_COLORS.detail} fill="url(#productFluxClickFill)" strokeWidth={2} />
+                  <Line type="monotone" dataKey="支付买家" stroke={PRODUCT_TRAFFIC_COLORS.clickPayRate} strokeWidth={2.5} dot={{ r: 3 }} />
+                  <Line type="monotone" dataKey="支付件数" stroke="#e11d48" strokeWidth={2.5} dot={{ r: 3 }} />
+                </AreaChart>
+              </ResponsiveContainer>
+            ) : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无流量趋势数据" />
+            )}
+          </Card>
+
+          <Card size="small" bodyStyle={{ padding: 16 }} style={{ borderRadius: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 10 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>来源占比</div>
+                <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>搜索、推荐和其他来源在曝光端的份额</div>
+              </div>
+              <Tag>{selectedFluxRange}</Tag>
+            </div>
+            {sourceDistributionData.length > 0 ? (
+              <div style={{ display: "grid", gridTemplateColumns: "minmax(220px, 0.9fr) minmax(0, 1fr)", gap: 12, alignItems: "center" }}>
+                <ResponsiveContainer width="100%" height={280}>
+                  <PieChart>
+                    <Pie data={sourceDistributionData} dataKey="value" nameKey="name" innerRadius={58} outerRadius={94} paddingAngle={2}>
+                      {sourceDistributionData.map((entry) => (
+                        <Cell key={entry.name} fill={entry.color} />
+                      ))}
+                    </Pie>
+                    <ReTooltip formatter={(value: any) => formatTrafficNumber(value)} />
+                    <Legend />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div style={{ display: "grid", gap: 10 }}>
+                  {sourceDistributionData.map((item) => (
+                    <div key={item.name} style={{ padding: 12, borderRadius: 14, background: "var(--color-bg-1, #fafafa)", border: "1px solid rgba(15,23,42,0.05)" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <span style={{ width: 10, height: 10, borderRadius: "50%", background: item.color, display: "inline-block" }} />
+                          <span style={{ fontWeight: 700 }}>{item.name}</span>
+                        </div>
+                        <span style={{ fontSize: 13, color: "var(--color-text-sec)" }}>{formatTrafficPercent(item.share)}</span>
+                      </div>
+                      <div style={{ marginTop: 8, fontSize: 22, fontWeight: 800 }}>{formatTrafficNumber(item.value)}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前范围没有来源拆解数据" />
+            )}
+          </Card>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 16 }}>
+          <Card size="small" bodyStyle={{ padding: 16 }} style={{ borderRadius: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 10 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>效率趋势</div>
+                <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>{dailyTrendData.length > 0 ? "按日期维度的支付转化率变化" : "不同统计周期下的点击效率与支付转化率"}</div>
+              </div>
+              <Tag color="purple">{activeFluxSite.siteLabel}</Tag>
+            </div>
+            {dailyTrendData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={300}>
+                <LineChart data={dailyTrendData} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={PRODUCT_TRAFFIC_COLORS.grid} />
+                  <XAxis dataKey="date" tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} interval="preserveStartEnd" />
+                  <YAxis tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} domain={[0, "auto"]} />
+                  <ReTooltip formatter={(value: any) => formatTrafficPercent(value)} />
+                  <Legend />
+                  <Line type="monotone" dataKey="转化率" stroke={PRODUCT_TRAFFIC_COLORS.clickPayRate} strokeWidth={2.5} dot={{ r: 3 }} />
+                </LineChart>
+              </ResponsiveContainer>
+            ) : efficiencyComparisonData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={300}>
+                <LineChart data={efficiencyComparisonData} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={PRODUCT_TRAFFIC_COLORS.grid} />
+                  <XAxis dataKey="label" tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} />
+                  <YAxis tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} domain={[0, 100]} />
+                  <ReTooltip formatter={(value: any) => formatTrafficPercent(value)} />
+                  <Legend />
+                  <Line type="monotone" dataKey="曝光点击率" stroke={PRODUCT_TRAFFIC_COLORS.clickRate} strokeWidth={2.5} dot={{ r: 3 }} />
+                  <Line type="monotone" dataKey="点击支付转化率" stroke={PRODUCT_TRAFFIC_COLORS.clickPayRate} strokeWidth={2.5} dot={{ r: 3 }} />
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无效率趋势数据" />
+            )}
+          </Card>
+
+          <Card size="small" bodyStyle={{ padding: 16 }} style={{ borderRadius: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 10 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>来源效率</div>
+                <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>各来源点击与支付件数的效率对比</div>
+              </div>
+              <Tag>{selectedFluxRange}</Tag>
+            </div>
+            {sourceBreakdownData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={300}>
+                <BarChart data={sourceBreakdownData} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={PRODUCT_TRAFFIC_COLORS.grid} />
+                  <XAxis dataKey="来源" tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} />
+                  <YAxis tick={{ fontSize: 12, fill: PRODUCT_TRAFFIC_COLORS.axis }} allowDecimals={false} />
+                  <ReTooltip formatter={(value: any) => formatTrafficNumber(value)} />
+                  <Legend />
+                  <Bar dataKey="点击" fill={PRODUCT_TRAFFIC_COLORS.detail} radius={[8, 8, 0, 0]} />
+                  <Bar dataKey="支付件数" fill={PRODUCT_TRAFFIC_COLORS.clickPayRate} radius={[8, 8, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前范围没有来源效率数据" />
+            )}
+          </Card>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.05fr) minmax(0, 0.95fr)", gap: 16 }}>
+          <Card size="small" bodyStyle={{ padding: 16 }} style={{ borderRadius: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 12 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>流量漏斗</div>
+                <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>从曝光到支付买家的承接过程</div>
+              </div>
+              <Tag color="cyan">商品级流量</Tag>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 10 }}>
+              {funnelSteps.map((step, index) => {
+                const prev = index === 0 ? step.value : funnelSteps[index - 1].value || 0;
+                const stepRate = index === 0 || prev <= 0 ? 100 : (step.value / prev) * 100;
+                return (
+                  <div
+                    key={step.label}
+                    style={{
+                      padding: 12,
+                      borderRadius: 16,
+                      border: "1px solid rgba(15,23,42,0.06)",
+                      background: "#fff",
+                      boxShadow: "0 8px 24px rgba(15,23,42,0.04)",
+                    }}
+                  >
+                    <div style={{ fontSize: 12, color: "var(--color-text-sec)", marginBottom: 6 }}>{step.label}</div>
+                    <div style={{ fontSize: 24, fontWeight: 800, color: "var(--color-text)" }}>{formatTrafficNumber(step.value)}</div>
+                    <div style={{ marginTop: 6, fontSize: 12, color: "var(--color-text-sec)" }}>环节保留：{formatTrafficPercent(stepRate)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+
+          <div style={{ display: "grid", gap: 12 }}>
+            {sourceBreakdownData.map((item, index) => (
+              <Card key={item.来源} size="small" bodyStyle={{ padding: 14 }} style={{ borderRadius: 16 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 10 }}>
+                  <div style={{ fontSize: 15, fontWeight: 700 }}>{item.来源}</div>
+                  <Tag color={index === 0 ? "orange" : index === 1 ? "blue" : "default"}>{selectedFluxRange}</Tag>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
+                  {renderMetric("曝光", formatTrafficNumber(item.曝光), true)}
+                  {renderMetric("点击", formatTrafficNumber(item.点击))}
+                  {renderMetric("支付件数", formatTrafficNumber(item.支付件数))}
+                  {renderMetric("点击率", formatTrafficPercent(item.点击率))}
+                  {renderMetric("支付转化率", formatTrafficPercent(item.支付转化率))}
+                </div>
+              </Card>
+            ))}
+          </div>
+        </div>
+
+        <Card size="small" bodyStyle={{ padding: 16 }} style={{ borderRadius: 18 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 10 }}>
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 700 }}>流量明细</div>
+              <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>当前站点与周期下命中的原始商品流量记录</div>
+            </div>
+            <Tag>{currentFluxItems.length} 条记录</Tag>
+          </div>
+          <Table
+            size="small"
+            rowKey={(item: any, index) => `${item.goodsId || item.skcId || item.productId || index}`}
+            dataSource={currentFluxItems}
+            pagination={currentFluxItems.length > 8 ? { pageSize: 8 } : false}
+            scroll={{ x: 1020 }}
+            columns={[
+              { title: "商品ID", dataIndex: "goodsId", width: 140, render: (value) => <span style={{ fontFamily: "Consolas, monospace", fontSize: 13 }}>{formatTextValue(value)}</span> },
+              { title: "曝光", dataIndex: "exposeNum", width: 90, align: "right", render: formatTrafficNumber },
+              { title: "点击", dataIndex: "clickNum", width: 90, align: "right", render: formatTrafficNumber },
+              { title: "详情访客", width: 100, align: "right", render: (_: any, item: any) => formatTrafficNumber(item?.detailVisitorNum || item?.detailVisitNum) },
+              { title: "收藏人数", dataIndex: "collectUserNum", width: 100, align: "right", render: formatTrafficNumber },
+              { title: "加购人数", dataIndex: "addToCartUserNum", width: 100, align: "right", render: formatTrafficNumber },
+              { title: "支付买家", dataIndex: "buyerNum", width: 100, align: "right", render: formatTrafficNumber },
+              { title: "支付订单", dataIndex: "payOrderNum", width: 100, align: "right", render: formatTrafficNumber },
+              { title: "支付件数", dataIndex: "payGoodsNum", width: 100, align: "right", render: formatTrafficNumber },
+              { title: "点击支付转化率", width: 130, align: "right", render: (_: any, item: any) => formatTrafficPercent(toPercentValue(item?.clickPayRate, item?.buyerNum, item?.clickNum)) },
+            ]}
+          />
+        </Card>
+
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.2fr) minmax(320px, 0.8fr)", gap: 16 }}>
+          <Card size="small" bodyStyle={{ padding: 16 }} style={{ borderRadius: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 10 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>来源转化矩阵</div>
+                <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>把每个来源的流量规模、点击效率和成交贡献放在一张表里看清楚</div>
+              </div>
+              <Tag color="geekblue">{selectedFluxRange}</Tag>
+            </div>
+            <Table
+              size="small"
+              rowKey={(item: any) => item.来源}
+              dataSource={sourceContributionData}
+              pagination={false}
+              columns={[
+                { title: "来源", dataIndex: "来源", width: 90 },
+                { title: "曝光", dataIndex: "曝光", width: 90, align: "right", render: formatTrafficNumber },
+                { title: "曝光占比", dataIndex: "曝光占比", width: 100, align: "right", render: formatTrafficPercent },
+                { title: "点击", dataIndex: "点击", width: 90, align: "right", render: formatTrafficNumber },
+                { title: "点击率", dataIndex: "点击率", width: 100, align: "right", render: formatTrafficPercent },
+                { title: "支付件数", dataIndex: "支付件数", width: 100, align: "right", render: formatTrafficNumber },
+                { title: "支付贡献", dataIndex: "支付贡献占比", width: 100, align: "right", render: formatTrafficPercent },
+                { title: "千次曝光成交", dataIndex: "千次曝光成交", width: 120, align: "right", render: (value: number) => formatTrafficNumber(value) },
+                {
+                  title: "建议",
+                  dataIndex: "建议",
+                  width: 120,
+                  render: (value: string) => (
+                    <Tag color={value === "继续放量" ? "success" : value === "维持观察" ? "default" : "orange"}>{value}</Tag>
+                  ),
+                },
+              ]}
+            />
+          </Card>
+
+          <Card size="small" bodyStyle={{ padding: 16 }} style={{ borderRadius: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 10 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>运营动作建议</div>
+                <div style={{ fontSize: 12, color: "var(--color-text-sec)" }}>按现在这波流量，优先先做这些动作</div>
+              </div>
+              <Tag color="purple">{activeFluxSite.siteLabel}</Tag>
+            </div>
+            <div style={{ display: "grid", gap: 10 }}>
+              {actionChecklist.map((item, index) => (
+                <div
+                  key={`${item.title}-${index}`}
+                  style={{
+                    padding: 14,
+                    borderRadius: 16,
+                    background: "linear-gradient(135deg, rgba(255,250,245,1) 0%, rgba(255,255,255,1) 100%)",
+                    border: "1px solid rgba(255,138,31,0.1)",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                    <span
+                      style={{
+                        width: 24,
+                        height: 24,
+                        borderRadius: "50%",
+                        background: "rgba(255,138,31,0.12)",
+                        color: "var(--color-brand)",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        fontSize: 12,
+                        fontWeight: 700,
+                      }}
+                    >
+                      {index + 1}
+                    </span>
+                    <span style={{ fontWeight: 700 }}>{item.title}</span>
+                  </div>
+                  <div style={{ fontSize: 12, color: "var(--color-text-sec)", lineHeight: 1.8 }}>{item.desc}</div>
+                </div>
+              ))}
+            </div>
+          </Card>
+        </div>
+      </div>
+    ) : (
+      <Alert
+        type="info"
+        showIcon
+        message="暂无已采集的流量分析数据"
+        description="先运行流量采集，再打开这里查看全球、美国和欧区的流量驾驶舱。"
+      />
+    );
+
     const skuList = Array.isArray(raw.skuQuantityDetailList) ? raw.skuQuantityDetailList : [];
     const skuTab = skuList.length > 0 ? (
       <Table
@@ -1314,7 +3170,7 @@ export default function ProductList() {
         pagination={false}
         scroll={{ x: 900 }}
         columns={[
-          { title: "SKU ID", dataIndex: "productSkuId", width: 120, render: (v) => <span style={{ fontFamily: "Consolas, monospace", fontSize: 11 }}>{formatTextValue(v)}</span> },
+          { title: "SKU ID", dataIndex: "productSkuId", width: 120, render: (v) => <span style={{ fontFamily: "Consolas, monospace", fontSize: 13 }}>{formatTextValue(v)}</span> },
           { title: "规格", dataIndex: "className", width: 120 },
           { title: "货号", dataIndex: "skuExtCode", width: 120 },
           { title: "今日", width: 70, align: "right", render: (_: any, s: any) => s.todaySaleVolume ?? 0 },
@@ -1331,7 +3187,7 @@ export default function ProductList() {
         {record.skuSummaries.map((s) => (
           <div key={`${s.productSkuId}-${s.extCode}`} style={{ display: "flex", gap: 8, alignItems: "center", padding: 8, background: "var(--color-bg-1, #fafafa)", borderRadius: 8 }}>
             {s.thumbUrl ? <Image src={s.thumbUrl} width={36} height={36} preview={false} fallback={EMPTY_IMAGE_FALLBACK} /> : <Tag>无图</Tag>}
-            <div style={{ display: "grid", gap: 2, fontSize: 11 }}>
+            <div style={{ display: "grid", gap: 4, fontSize: 13 }}>
               <div style={{ fontFamily: "Consolas, monospace" }}>{s.productSkuId || "-"}</div>
               <div style={{ color: "var(--color-text-sec)" }}>{s.specText || s.specName || "-"}</div>
               <div style={{ color: "var(--color-text-sec)" }}>{s.extCode || "-"}</div>
@@ -1499,11 +3355,11 @@ export default function ProductList() {
         title={(
           <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
             {record.imageUrl ? (
-              <Image src={record.imageUrl} width={48} height={48} preview={{ mask: "查看大图" }} fallback={EMPTY_IMAGE_FALLBACK} />
+              <Image src={record.imageUrl} width={60} height={60} preview={{ mask: "查看大图" }} fallback={EMPTY_IMAGE_FALLBACK} />
             ) : null}
             <div style={{ display: "grid", gap: 2, minWidth: 0 }}>
               <div style={{ fontSize: 14, fontWeight: 700 }}>{record.title || "未命名商品"}</div>
-              <div style={{ fontSize: 11, color: "var(--color-text-sec)", fontFamily: "Consolas, monospace" }}>
+              <div style={{ fontSize: 13, color: "var(--color-text-sec)", fontFamily: "Consolas, monospace" }}>
                 SKC {formatTextValue(record.skcId)} · 货号 {formatTextValue(record.extCode || record.sku)}
               </div>
             </div>
@@ -1511,20 +3367,14 @@ export default function ProductList() {
         )}
         destroyOnClose
       >
-        <Tabs
-          activeKey={drawerTab}
-          onChange={setDrawerTab}
-          items={[
-            { key: "overview", label: "概览", children: overviewTab },
-            { key: "all", label: "全部字段", children: allFieldsTab },
-          ]}
-        />
+        {drawerTab === "flux" ? fluxTab : overviewTab}
       </Drawer>
     );
   };
 
   const emptyState = !loading && products.length === 0;
   const filteredEmptyState = !loading && products.length > 0 && filteredProducts.length === 0;
+
 
   // 顶部 4 个核心指标 + 可点击筛选标签
   const saleOutCount = salesSummary?.saleOutSkcNum || 0;
@@ -1628,6 +3478,7 @@ export default function ProductList() {
             </Col>
           </Row>
 
+
           {/* 工具栏 - SalesManagement 风格 */}
           <Card size="small" style={{ marginBottom: 16 }}>
             <Space wrap>
@@ -1648,17 +3499,12 @@ export default function ProductList() {
                 options={[
                   { label: `全部 ${products.length}`, value: "all" },
                   { label: `在售 ${onSaleCount}`, value: "在售" },
-                  { label: "已下架", value: "已下架" },
-                  { label: "未发布", value: "未发布" },
-                  { label: "售罄", value: "saleOut" },
-                  { label: "即将售罄", value: "soonSaleOut" },
-                  { label: "缺货", value: "shortage" },
-                  { label: "建议备货", value: "advice" },
                 ]}
               />
               <Button type="primary" icon={<SyncOutlined spin={loading} />} loading={loading} onClick={loadProducts}>
                 刷新数据
               </Button>
+              <Button icon={<SettingOutlined />} onClick={openColSettings}>列设置</Button>
               <span style={{ color: "#999", fontSize: 13 }}>
                 共 {products.length} 条 · 已接销售 {salesAttachedCount}
               </span>
@@ -1685,84 +3531,119 @@ export default function ProductList() {
               />
             ) : (
               <Table
-                rowKey={(record, index) => record.skcId || record.goodsId || record.spuId || `${record.title}-${index}`}
-                dataSource={filteredProducts}
-                columns={columns}
+                className="product-list-table"
+                rowKey={(record: any, index) => record._flatKey || `row-${index}`}
+                dataSource={flatRows}
+                columns={configuredColumns as any}
                 size="small"
                 loading={loading}
-                expandable={{
-                  expandedRowRender: (record) => {
-                    const raw: any = record.salesRaw || {};
-                    const skuList: any[] = Array.isArray(raw.skuQuantityDetailList) ? raw.skuQuantityDetailList : [];
-                    if (skuList.length > 0) {
-                      return (
-                        <Table
-                          size="small"
-                          rowKey={(s: any, i) => `${s.productSkuId || i}`}
-                          dataSource={skuList}
-                          pagination={false}
-                          scroll={{ x: 1100 }}
-                          columns={[
-                            { title: "SKU ID", dataIndex: "productSkuId", width: 120, render: (v) => <span style={{ fontFamily: "monospace", fontSize: 11 }}>{formatTextValue(v)}</span> },
-                            { title: "规格", dataIndex: "className", width: 120 },
-                            { title: "货号", dataIndex: "skuExtCode", width: 120 },
-                            { title: "今日", width: 70, align: "right", render: (_: any, s: any) => s.todaySaleVolume ?? 0 },
-                            { title: "7天", width: 70, align: "right", render: (_: any, s: any) => s.lastSevenDaysSaleVolume ?? 0 },
-                            { title: "30天", width: 70, align: "right", render: (_: any, s: any) => s.lastThirtyDaysSaleVolume ?? 0 },
-                            { title: "缺货", dataIndex: "lackQuantity", width: 70, align: "right" },
-                            { title: "建议", dataIndex: "adviceQuantity", width: 70, align: "right" },
-                            { title: "卖家库存", dataIndex: "sellerWhStock", width: 90, align: "right" },
-                            { title: "申报价", dataIndex: "supplierPrice", width: 90, align: "right" },
-                            { title: "采购配置", dataIndex: "purchaseConfig", width: 100 },
-                            { title: "安全库存天", dataIndex: "safeInventoryDays", width: 100, align: "right" },
-                          ]}
-                        />
-                      );
-                    }
-                    if (record.skuSummaries.length > 0) {
-                      return (
-                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 8, padding: 8 }}>
-                          {record.skuSummaries.map((s) => (
-                            <div key={`${s.productSkuId}-${s.extCode}`} style={{ display: "flex", gap: 8, alignItems: "center", padding: 8, background: "#fafafa", borderRadius: 8 }}>
-                              {s.thumbUrl ? <Image src={s.thumbUrl} width={36} height={36} preview={false} fallback={EMPTY_IMAGE_FALLBACK} /> : <Tag>无图</Tag>}
-                              <div style={{ display: "grid", gap: 2, fontSize: 11 }}>
-                                <div style={{ fontFamily: "monospace" }}>{s.productSkuId || "-"}</div>
-                                <div style={{ color: "#999" }}>{s.specText || s.specName || "-"}</div>
-                                <div style={{ color: "#999" }}>{s.extCode || "-"}</div>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      );
-                    }
-                    return <div style={{ padding: 12, color: "#999" }}>暂无 SKU 明细</div>;
+                onRow={(record: any) => ({
+                  style: {
+                    ...(record._isTotal ? { background: "#fff7e6" } : {}),
                   },
-                  rowExpandable: (record) =>
-                    (Array.isArray(record.salesRaw?.skuQuantityDetailList) && record.salesRaw.skuQuantityDetailList.length > 0)
-                    || record.skuSummaries.length > 0,
-                }}
-                onRow={(record) => ({
-                  onClick: (e) => {
-                    const target = e.target as HTMLElement;
-                    if (target.closest(".ant-table-row-expand-icon")) return;
-                    setSelectedProduct(record);
-                    setDrawerTab("overview");
-                  },
-                  style: { cursor: "pointer" },
                 })}
                 pagination={{
-                  pageSize: 30,
+                  pageSize: 50,
                   showSizeChanger: true,
-                  pageSizeOptions: [20, 30, 50, 100],
-                  showTotal: (total) => `共 ${total} 个商品`,
+                  pageSizeOptions: [30, 50, 100, 200],
+                  showTotal: (total) => `共 ${total} 行（${filteredProducts.length} 个商品）`,
                 }}
-                scroll={{ x: 2000 }}
+                scroll={{ x: 2100 }}
                 locale={{ emptyText: "暂无商品数据" }}
               />
             )}
           </div>
 
           {renderDrawer()}
+
+          {/* 列设置抽屉 */}
+          <Drawer
+            title={null}
+            open={colSettingsOpen}
+            onClose={() => setColSettingsOpen(false)}
+            width={360}
+            styles={{ body: { padding: 0, display: "flex", flexDirection: "column" } }}
+            closable={false}
+          >
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid #f0f0f0", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <span style={{ fontSize: 16, fontWeight: 600 }}>自定义列</span>
+              <Button type="link" size="small" onClick={() => setColSettingsOpen(false)} style={{ fontSize: 18, padding: 0 }}>✕</Button>
+            </div>
+            <div style={{ padding: "8px 20px", borderBottom: "1px solid #f0f0f0", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <span style={{ color: "#999", fontSize: 13 }}>请勾选需要显示的字段，可拖换调整顺序</span>
+              <Button type="link" size="small" onClick={resetColSettings}>重置</Button>
+            </div>
+            <div style={{ padding: "8px 20px", borderBottom: "1px solid #f0f0f0", display: "flex", alignItems: "center", gap: 8 }}>
+              <Checkbox
+                checked={allSelected}
+                indeterminate={!allSelected && tempHidden.length < allColumnKeys.length}
+                onChange={() => {
+                  if (allSelected) setTempHidden([...allColumnKeys]);
+                  else setTempHidden([]);
+                }}
+              />
+              <span style={{ fontWeight: 500 }}>全选</span>
+              <span style={{ color: "#999", marginLeft: "auto", fontSize: 13 }}>{visibleCount}/{allColumnKeys.length}</span>
+            </div>
+            <div style={{ flex: 1, overflow: "auto", padding: "0 0 80px 0" }}>
+              {columnGroups.map((group) => {
+                const groupKeySet = new Set(group.keys.filter((k) => colMap.has(k)));
+                if (groupKeySet.size === 0) return null;
+                // 按 tempOrder 排列组内项目
+                const validKeys = tempOrder.filter((k) => groupKeySet.has(k));
+                // 补充 tempOrder 里没有的
+                for (const k of groupKeySet) { if (!validKeys.includes(k)) validKeys.push(k); }
+                const groupAllVisible = validKeys.every((k) => !tempHidden.includes(k));
+                const groupSomeVisible = validKeys.some((k) => !tempHidden.includes(k));
+                return (
+                  <div key={group.label} style={{ borderBottom: "1px solid #f5f5f5" }}>
+                    <div style={{ padding: "10px 20px", display: "flex", alignItems: "center", gap: 8, background: "#fafafa" }}>
+                      <Checkbox
+                        checked={groupAllVisible}
+                        indeterminate={!groupAllVisible && groupSomeVisible}
+                        onChange={() => tempToggleGroup(validKeys)}
+                      />
+                      <span style={{ fontWeight: 600, fontSize: 14, color: "#1677ff" }}>{group.label}</span>
+                    </div>
+                    {validKeys.map((key) => {
+                      const col = colMap.get(key)!;
+                      const label = typeof col.title === "string" ? col.title : key;
+                      const isHidden = tempHidden.includes(key);
+                      const isDragOver = dragOverKey === key;
+                      return (
+                        <div
+                          key={key}
+                          draggable
+                          onDragStart={() => handleDragStart(key, group.label)}
+                          onDragOver={(e) => handleDragOver(e, key)}
+                          onDrop={(e) => handleDrop(e, key, group.label)}
+                          onDragEnd={handleDragEnd}
+                          style={{
+                            padding: "8px 20px 8px 44px",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 8,
+                            borderTop: isDragOver ? "2px solid #1677ff" : "2px solid transparent",
+                            background: isDragOver ? "#e6f4ff" : "transparent",
+                            transition: "background 0.15s",
+                            cursor: "grab",
+                          }}
+                        >
+                          <Checkbox checked={!isHidden} onChange={() => tempToggle(key)} onClick={(e) => e.stopPropagation()} />
+                          <span style={{ flex: 1, fontSize: 14, color: isHidden ? "#999" : "#333", userSelect: "none" }}>{label}</span>
+                          <span style={{ color: "#bbb", fontSize: 16, cursor: "grab", userSelect: "none" }}>☰</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "12px 20px", borderTop: "1px solid #f0f0f0", background: "#fff", display: "flex", gap: 12, justifyContent: "center" }}>
+              <Button type="primary" onClick={confirmColSettings} style={{ minWidth: 80 }}>确认</Button>
+              <Button onClick={() => setColSettingsOpen(false)} style={{ minWidth: 80 }}>取消</Button>
+            </div>
+          </Drawer>
 
           <Modal
             title={`动销详情 (ID: ${gpDetailRow?.productId || "-"})`}
@@ -1779,17 +3660,26 @@ export default function ProductList() {
               <Typography.Text strong>时间段：</Typography.Text>
               <Segmented
                 value={gpDetailRange}
-                options={[{ label: "30天", value: "30d" }, { label: "近7天", value: "7d" }, { label: "昨天", value: "1d" }]}
+                options={(gpDetailRow?.availableRanges || gpDetailRangeOptions).map((value) => ({
+                  value,
+                  label: value === "30d" ? "30天" : value === "7d" ? "7天" : "昨天",
+                }))}
                 onChange={(val) => {
                   const r = val as "1d" | "7d" | "30d";
-                  if (gpDetailRow) openGpDetail({ gp: { productId: gpDetailRow.productId, productName: gpDetailRow.productName }, title: gpDetailRow.productName, skcId: gpDetailRow.skcId }, r);
+                  setGpDetailRange(r);
+                  const cachedDetail = gpDetailRow?.regionDetailsByRange?.[r] || gpDetailRow?.fallbackDetail || null;
+                  setGpDetailData(
+                    cachedDetail || {
+                      error: gpDetailCacheMissingMessage,
+                    },
+                  );
                 }}
                 disabled={gpDetailLoading}
               />
             </Space>
             {gpDetailLoading ? (
               <div style={{ height: 240, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <Spin tip="按地区查询中..." />
+                <Spin tip="正在读取缓存..." />
               </div>
             ) : gpDetailData && gpDetailData.rows?.length > 0 ? (
               <>

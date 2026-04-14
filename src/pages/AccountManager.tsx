@@ -1,7 +1,5 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import {
-  Row,
-  Col,
   Card,
   Button,
   Modal,
@@ -15,6 +13,9 @@ import {
   notification,
   Typography,
   Divider,
+  Progress,
+  Tooltip,
+  Empty,
 } from "antd";
 import {
   PlusOutlined,
@@ -28,7 +29,14 @@ import {
   ShopOutlined,
   ShoppingOutlined,
   DatabaseOutlined,
+  SyncOutlined,
+  WarningOutlined,
+  ThunderboltOutlined,
+  DashboardOutlined,
+  ExclamationCircleOutlined,
+  SafetyCertificateOutlined,
 } from "@ant-design/icons";
+import { useNavigate } from "react-router-dom";
 import PageHeader from "../components/PageHeader";
 import {
   ACTIVE_ACCOUNT_CHANGED_EVENT,
@@ -40,7 +48,11 @@ import {
 } from "../utils/multiStore";
 import { getStoreValue } from "../utils/storeCompat";
 import { parseProductsData } from "../utils/parseRawApis";
-import { normalizeCollectionDiagnostics } from "../utils/collectionDiagnostics";
+import {
+  normalizeCollectionDiagnostics,
+  type CollectionDiagnostics,
+} from "../utils/collectionDiagnostics";
+import { useCollection, COLLECT_TASKS } from "../contexts/CollectionContext";
 
 const { Text, Title } = Typography;
 
@@ -69,23 +81,45 @@ function maskPhone(phone: string) {
   return phone.slice(0, 3) + "****" + phone.slice(-4);
 }
 
+/** 计算数据新鲜度 */
+function getDataFreshness(syncedAt: string | null): {
+  label: string;
+  color: string;
+  level: "fresh" | "stale" | "expired" | "none";
+} {
+  if (!syncedAt) return { label: "未采集", color: "#d9d9d9", level: "none" };
+  const diff = Date.now() - new Date(syncedAt).getTime();
+  const hours = diff / (1000 * 60 * 60);
+  if (hours < 6) return { label: `${hours < 1 ? "刚刚" : Math.floor(hours) + "小时前"}`, color: "#52c41a", level: "fresh" };
+  if (hours < 24) return { label: `${Math.floor(hours)}小时前`, color: "#faad14", level: "stale" };
+  const days = Math.floor(hours / 24);
+  return { label: `${days}天前`, color: "#ff4d4f", level: "expired" };
+}
+
 interface AccountStats {
   productCount: number;
   collectionTotal: number;
   collectionSuccess: number;
+  collectionError: number;
+  diagnostics: CollectionDiagnostics;
 }
 
 export default function AccountManager() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [loginLoadingId, setLoginLoadingId] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const [accountStats, setAccountStats] = useState<Record<string, AccountStats>>({});
   const [form] = Form.useForm();
+  const navigate = useNavigate();
 
   const api = window.electronAPI?.automation;
   const store = (window as any).electronAPI?.store;
+
+  // 从 CollectionContext 获取实时采集状态
+  const { collecting, successCount, errorCount } = useCollection();
 
   const clearActiveAccount = async () => {
     if (!store) return;
@@ -112,7 +146,7 @@ export default function AccountManager() {
   };
 
   // 加载账号数据概览
-  const loadAccountStats = async () => {
+  const loadAccountStats = async (targetAccountId: string) => {
     if (!store) return;
     try {
       const [rawProducts, rawDiag] = await Promise.all([
@@ -125,10 +159,10 @@ export default function AccountManager() {
         productCount: products.length,
         collectionTotal: diag.summary.totalTasks || 0,
         collectionSuccess: diag.summary.successCount || 0,
+        collectionError: diag.summary.errorCount || 0,
+        diagnostics: diag,
       };
-      if (activeAccountId) {
-        setAccountStats((prev) => ({ ...prev, [activeAccountId]: stats }));
-      }
+      setAccountStats((prev) => ({ ...prev, [targetAccountId]: stats }));
     } catch {
       // ignore
     }
@@ -147,7 +181,6 @@ export default function AccountManager() {
         if (data && Array.isArray(data)) {
           const nextAccounts = data.map((a: Account) => ({
             ...a,
-            // 保留持久化的 online 状态；把残留的 logging_in 兜底为 offline
             status: a.status === "online" ? "online" as const : a.status === "logging_in" ? "offline" as const : (a.status || "offline"),
           }));
           setAccounts(nextAccounts);
@@ -180,14 +213,20 @@ export default function AccountManager() {
 
   useEffect(() => {
     if (store && hydrated) {
-      // store.set 是异步的，必须捕获 rejection 避免 unhandled promise
-      Promise.resolve(store.set(STORAGE_KEY, accounts)).catch((e) => {
+      Promise.resolve(store.set(STORAGE_KEY, accounts)).catch((e: unknown) => {
         console.error("[AccountManager] persist accounts failed:", e);
       });
     }
   }, [accounts, hydrated, store]);
 
-  // 加载活跃账号的数据概览（activeAccountId 变更时重新加载）
+  // 初始化选中账号
+  useEffect(() => {
+    if (hydrated && accounts.length > 0 && !selectedAccountId) {
+      setSelectedAccountId(activeAccountId || accounts[0].id);
+    }
+  }, [hydrated, accounts, activeAccountId, selectedAccountId]);
+
+  // 加载活跃账号的数据概览
   useEffect(() => {
     if (!hydrated || !activeAccountId || !store) return;
     let cancelled = false;
@@ -204,6 +243,8 @@ export default function AccountManager() {
           productCount: products.length,
           collectionTotal: diag.summary.totalTasks || 0,
           collectionSuccess: diag.summary.successCount || 0,
+          collectionError: diag.summary.errorCount || 0,
+          diagnostics: diag,
         };
         setAccountStats((prev) => ({ ...prev, [activeAccountId]: stats }));
       } catch (e) {
@@ -212,6 +253,13 @@ export default function AccountManager() {
     })();
     return () => { cancelled = true; };
   }, [hydrated, activeAccountId, store]);
+
+  // 采集完成后刷新数据
+  useEffect(() => {
+    if (!collecting && activeAccountId && hydrated) {
+      loadAccountStats(activeAccountId);
+    }
+  }, [collecting]);
 
   const handleAdd = async () => {
     try {
@@ -224,6 +272,7 @@ export default function AccountManager() {
         status: "offline",
       };
       setAccounts((prev) => [...prev, newAccount]);
+      setSelectedAccountId(newAccount.id);
       setModalOpen(false);
       form.resetFields();
       message.success("账号添加成功");
@@ -249,7 +298,6 @@ export default function AccountManager() {
     });
     try {
       const result: any = await api.login(account.id, account.phone, account.password);
-      console.log("[handleLogin] login result:", result);
       const loginOk = !!(result && (result.success === true || (typeof result.success === "object" && result.success?.success === true)));
       if (loginOk) {
         const lastLoginAt = new Date().toLocaleString("zh-CN");
@@ -263,7 +311,6 @@ export default function AccountManager() {
           return nextAccounts;
         });
         await setActiveAccountAndSync(store, nextAccounts, account.id);
-        // 防御性：确保登录后状态不被其他副作用回写
         setAccounts((prev) =>
           prev.map((a) =>
             a.id === account.id
@@ -335,6 +382,9 @@ export default function AccountManager() {
     }
     const nextAccounts = accounts.filter((a) => a.id !== id);
     setAccounts(nextAccounts);
+    if (selectedAccountId === id) {
+      setSelectedAccountId(nextAccounts.length > 0 ? nextAccounts[0].id : null);
+    }
     const currentActiveId = await readActiveAccountId(store);
     if (currentActiveId === id) {
       await clearActiveAccount();
@@ -344,6 +394,89 @@ export default function AccountManager() {
     message.success("账号已删除");
   };
 
+  // 排序账号：活跃 > 在线 > 其它
+  const sortedAccounts = useMemo(() =>
+    accounts.slice().sort((a, b) => {
+      if (a.id === activeAccountId) return -1;
+      if (b.id === activeAccountId) return 1;
+      if (a.status === "online" && b.status !== "online") return -1;
+      if (b.status === "online" && a.status !== "online") return 1;
+      return 0;
+    }),
+  [accounts, activeAccountId]);
+
+  const selectedAccount = accounts.find((a) => a.id === selectedAccountId) || null;
+  const selectedStats = selectedAccountId ? accountStats[selectedAccountId] : null;
+  const isSelectedActive = selectedAccountId === activeAccountId;
+
+  // 采集状态统一：活跃账号实时状态 + 持久化诊断合并
+  const collectionDisplay = useMemo(() => {
+    if (!selectedStats) {
+      return { total: COLLECT_TASKS.length, success: 0, error: 0, syncedAt: null, isRealtime: false };
+    }
+    // 如果选中的是活跃账号且正在采集，用实时数据
+    if (isSelectedActive && collecting) {
+      return {
+        total: COLLECT_TASKS.length,
+        success: successCount,
+        error: errorCount,
+        syncedAt: selectedStats.diagnostics.syncedAt,
+        isRealtime: true,
+      };
+    }
+    // 否则用持久化的诊断数据
+    return {
+      total: selectedStats.collectionTotal || COLLECT_TASKS.length,
+      success: selectedStats.collectionSuccess,
+      error: selectedStats.collectionError,
+      syncedAt: selectedStats.diagnostics.syncedAt,
+      isRealtime: false,
+    };
+  }, [selectedStats, isSelectedActive, collecting, successCount, errorCount]);
+
+  const freshness = getDataFreshness(collectionDisplay.syncedAt);
+
+  // 按类别分组统计采集任务状态
+  const taskCategories = useMemo(() => {
+    if (!selectedStats?.diagnostics?.tasks) return [];
+    const tasks = selectedStats.diagnostics.tasks;
+    const categories: Record<string, { label: string; success: number; error: number; total: number }> = {
+      core: { label: "核心数据", success: 0, error: 0, total: 0 },
+      goods: { label: "商品", success: 0, error: 0, total: 0 },
+      sales: { label: "销售/活动", success: 0, error: 0, total: 0 },
+      shipping: { label: "物流", success: 0, error: 0, total: 0 },
+      returns: { label: "退货", success: 0, error: 0, total: 0 },
+      quality: { label: "质量", success: 0, error: 0, total: 0 },
+      pricing: { label: "价格", success: 0, error: 0, total: 0 },
+      flux: { label: "流量", success: 0, error: 0, total: 0 },
+      govern: { label: "合规", success: 0, error: 0, total: 0 },
+      ads: { label: "广告", success: 0, error: 0, total: 0 },
+      other: { label: "其它", success: 0, error: 0, total: 0 },
+    };
+    const classify = (key: string): string => {
+      if (["dashboard", "products", "orders", "sales", "flux"].includes(key)) return "core";
+      if (key.startsWith("goods") || key.startsWith("lifecycle") || key.startsWith("image") || key.startsWith("sample")) return "goods";
+      if (key.startsWith("activity") || key.startsWith("chance") || key.startsWith("marketing")) return "sales";
+      if (key.startsWith("shipping") || key.startsWith("urgent") || key.startsWith("address")) return "shipping";
+      if (key.startsWith("return") || key.startsWith("salesReturn") || key.startsWith("exception")) return "returns";
+      if (key.startsWith("quality") || key.startsWith("checkup") || key.startsWith("afterSales") || key.startsWith("qc")) return "quality";
+      if (key.startsWith("price") || key.startsWith("flow_price") || key.startsWith("retail") || key.startsWith("flowPrice")) return "pricing";
+      if (key.startsWith("flux") || key.startsWith("mall") || key.startsWith("flow") || key.startsWith("retrieval")) return "flux";
+      if (key.startsWith("govern")) return "govern";
+      if (key.startsWith("ads")) return "ads";
+      return "other";
+    };
+    for (const [key, task] of Object.entries(tasks)) {
+      const cat = classify(key);
+      categories[cat].total++;
+      if (task.status === "success") categories[cat].success++;
+      else categories[cat].error++;
+    }
+    return Object.entries(categories)
+      .filter(([, v]) => v.total > 0)
+      .map(([key, v]) => ({ key, ...v }));
+  }, [selectedStats]);
+
   if (!hydrated) {
     return (
       <div style={{ padding: 24 }}>
@@ -352,163 +485,188 @@ export default function AccountManager() {
     );
   }
 
-  const renderAccountCard = (account: Account) => {
+  const onlineCount = accounts.filter((account) => account.status === "online").length;
+  const activeAccount = accounts.find((account) => account.id === activeAccountId) || null;
+
+  // ====== 左侧账号列表项 ======
+  const renderAccountListItem = (account: Account) => {
     const isActive = activeAccountId === account.id;
-    const isLoggingIn = loginLoadingId === account.id;
+    const isSelected = selectedAccountId === account.id;
     const status = statusConfig[account.status] || statusConfig.offline;
-    const stats = accountStats[account.id];
 
     return (
-      <Col xs={24} md={12} xl={8} key={account.id}>
-        <Card
-          hoverable
-          style={{
-            borderRadius: 16,
-            border: isActive ? `2px solid ${TEMU_ORANGE}` : "1px solid #f0f0f0",
-            boxShadow: isActive
-              ? `0 4px 20px rgba(255, 106, 0, 0.15)`
-              : "0 2px 12px rgba(0,0,0,0.04)",
-            position: "relative",
-            overflow: "hidden",
-          }}
-          styles={{ body: { padding: "20px 24px 16px" } }}
-        >
-          {/* 活跃标签 */}
-          {isActive && (
-            <div
-              style={{
-                position: "absolute",
-                top: 0,
-                right: 0,
-                background: `linear-gradient(135deg, ${TEMU_ORANGE}, #ff8534)`,
-                color: "#fff",
-                fontSize: 11,
-                padding: "2px 16px 2px 12px",
-                borderRadius: "0 0 0 12px",
-                fontWeight: 600,
-              }}
-            >
-              <CheckCircleOutlined style={{ marginRight: 4 }} />
-              当前数据
-            </div>
-          )}
-
-          {/* 头部：店铺名 + 状态 */}
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
-            <div
-              style={{
-                width: 44,
-                height: 44,
-                borderRadius: 12,
-                background: isActive
-                  ? `linear-gradient(135deg, ${TEMU_ORANGE}, #ff8534)`
-                  : "#f5f5f5",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                flexShrink: 0,
-              }}
-            >
-              <ShopOutlined style={{ fontSize: 20, color: isActive ? "#fff" : "#bbb" }} />
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <Title level={5} style={{ margin: 0, fontSize: 16 }} ellipsis>
+      <div
+        key={account.id}
+        onClick={() => setSelectedAccountId(account.id)}
+        style={{
+          padding: "14px 16px",
+          cursor: "pointer",
+          borderRadius: 12,
+          marginBottom: 6,
+          background: isSelected ? "#fff7f0" : "transparent",
+          border: isSelected ? `1.5px solid ${TEMU_ORANGE}` : "1.5px solid transparent",
+          transition: "all 0.2s",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div
+            style={{
+              width: 38,
+              height: 38,
+              borderRadius: 10,
+              background: isActive
+                ? `linear-gradient(135deg, ${TEMU_ORANGE}, #ff8534)`
+                : "#f5f5f5",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              flexShrink: 0,
+            }}
+          >
+            <ShopOutlined style={{ fontSize: 17, color: isActive ? "#fff" : "#bbb" }} />
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <Text strong ellipsis style={{ fontSize: 14, maxWidth: 120 }}>
                 {account.name || "未命名店铺"}
-              </Title>
-              <Space size={6} style={{ marginTop: 2 }}>
-                <span
-                  style={{
-                    display: "inline-block",
-                    width: 7,
-                    height: 7,
-                    borderRadius: "50%",
-                    background: status.dot,
-                  }}
-                />
-                <Text type="secondary" style={{ fontSize: 12 }}>{status.text}</Text>
-              </Space>
-            </div>
-          </div>
-
-          {/* 信息行 */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <PhoneOutlined style={{ color: "#bbb", fontSize: 13 }} />
-              <Text style={{ fontSize: 13 }}>{maskPhone(account.phone)}</Text>
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <ClockCircleOutlined style={{ color: "#bbb", fontSize: 13 }} />
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                {account.lastLoginAt || "尚未登录"}
               </Text>
+              {isActive && (
+                <Tag
+                  color="orange"
+                  style={{ fontSize: 10, lineHeight: "16px", padding: "0 4px", borderRadius: 4, margin: 0 }}
+                >
+                  当前
+                </Tag>
+              )}
             </div>
+            <Space size={4} style={{ marginTop: 2 }}>
+              <span
+                style={{
+                  display: "inline-block",
+                  width: 6,
+                  height: 6,
+                  borderRadius: "50%",
+                  background: status.dot,
+                }}
+              />
+              <Text type="secondary" style={{ fontSize: 11 }}>{status.text}</Text>
+            </Space>
           </div>
+        </div>
+      </div>
+    );
+  };
 
-          {/* 数据概览（仅活跃账号） */}
-          {isActive && stats && (stats.productCount > 0 || stats.collectionTotal > 0) && (
-            <>
-              <Divider style={{ margin: "10px 0" }} />
+  // ====== 右侧详情面板 ======
+  const renderDetailPanel = () => {
+    if (!selectedAccount) {
+      return (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", minHeight: 400 }}>
+          <Empty description="请选择一个账号查看详情" />
+        </div>
+      );
+    }
+
+    const status = statusConfig[selectedAccount.status] || statusConfig.offline;
+    const isLoggingIn = loginLoadingId === selectedAccount.id;
+    const completedCount = collectionDisplay.success + collectionDisplay.error;
+    const progressPercent = collectionDisplay.total > 0 ? Math.round((completedCount / collectionDisplay.total) * 100) : 0;
+
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        {/* 账号信息头部 */}
+        <Card
+          style={{ borderRadius: 16, border: "none", boxShadow: "0 2px 12px rgba(0,0,0,0.04)" }}
+          styles={{ body: { padding: "24px 28px" } }}
+        >
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
               <div
                 style={{
+                  width: 56,
+                  height: 56,
+                  borderRadius: 14,
+                  background: isSelectedActive
+                    ? `linear-gradient(135deg, ${TEMU_ORANGE}, #ff8534)`
+                    : "#f5f5f5",
                   display: "flex",
-                  justifyContent: "space-around",
-                  textAlign: "center",
-                  marginBottom: 6,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flexShrink: 0,
                 }}
               >
-                <div>
-                  <ShoppingOutlined style={{ color: TEMU_ORANGE, fontSize: 16 }} />
-                  <div style={{ fontSize: 18, fontWeight: 700, color: "#1a1a2e", lineHeight: 1.3 }}>
-                    {stats.productCount}
-                  </div>
-                  <Text type="secondary" style={{ fontSize: 11 }}>商品</Text>
-                </div>
-                <div>
-                  <DatabaseOutlined style={{ color: "#1890ff", fontSize: 16 }} />
-                  <div style={{ fontSize: 18, fontWeight: 700, color: "#1a1a2e", lineHeight: 1.3 }}>
-                    {stats.collectionSuccess}/{stats.collectionTotal}
-                  </div>
-                  <Text type="secondary" style={{ fontSize: 11 }}>采集</Text>
-                </div>
+                <ShopOutlined style={{ fontSize: 26, color: isSelectedActive ? "#fff" : "#bbb" }} />
               </div>
-            </>
-          )}
-
-          {/* 操作按钮 */}
-          <Divider style={{ margin: "10px 0" }} />
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-            <Space size={8} wrap>
-              {!isActive ? (
-                <Button
-                  size="small"
-                  icon={<EyeOutlined />}
-                  onClick={() => handleActivateAccount(account.id)}
-                  style={{ borderRadius: 8 }}
-                >
-                  切换数据
-                </Button>
-              ) : null}
-
-              {account.status === "online" ? (
-                isActive ? (
-                  <Button
-                    size="small"
-                    icon={<LogoutOutlined />}
-                    onClick={() => handleLogout(account.id)}
-                    style={{ borderRadius: 8 }}
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <Title level={4} style={{ margin: 0 }}>
+                    {selectedAccount.name || "未命名店铺"}
+                  </Title>
+                  <Tag
+                    color={status.color as string}
+                    style={{ borderRadius: 999, margin: 0 }}
                   >
-                    断开
-                  </Button>
-                ) : null
+                    <span
+                      style={{
+                        display: "inline-block",
+                        width: 6,
+                        height: 6,
+                        borderRadius: "50%",
+                        background: status.dot,
+                        marginRight: 4,
+                      }}
+                    />
+                    {status.text}
+                  </Tag>
+                  {isSelectedActive && (
+                    <Tag color="orange" style={{ borderRadius: 999, margin: 0 }}>
+                      <CheckCircleOutlined style={{ marginRight: 4 }} />
+                      当前数据视图
+                    </Tag>
+                  )}
+                </div>
+                <Space size={16} style={{ marginTop: 8 }}>
+                  <Space size={4}>
+                    <PhoneOutlined style={{ color: "#bbb", fontSize: 13 }} />
+                    <Text type="secondary">{maskPhone(selectedAccount.phone)}</Text>
+                  </Space>
+                  <Space size={4}>
+                    <ClockCircleOutlined style={{ color: "#bbb", fontSize: 13 }} />
+                    <Text type="secondary">
+                      登录：{selectedAccount.lastLoginAt || "尚未登录"}
+                    </Text>
+                  </Space>
+                </Space>
+              </div>
+            </div>
+
+            {/* 操作按钮区 */}
+            <Space size={8} wrap>
+              {!isSelectedActive && (
+                <Button
+                  icon={<EyeOutlined />}
+                  onClick={() => handleActivateAccount(selectedAccount.id)}
+                  style={{ borderRadius: 10 }}
+                >
+                  切换数据视图
+                </Button>
+              )}
+              {selectedAccount.status === "online" ? (
+                <Button
+                  icon={<LogoutOutlined />}
+                  onClick={() => handleLogout(selectedAccount.id)}
+                  style={{ borderRadius: 10 }}
+                >
+                  断开连接
+                </Button>
               ) : (
                 <Button
                   type="primary"
-                  size="small"
                   icon={<LoginOutlined />}
                   loading={isLoggingIn}
-                  onClick={() => handleLogin(account)}
+                  onClick={() => handleLogin(selectedAccount)}
                   style={{
-                    borderRadius: 8,
+                    borderRadius: 10,
                     background: `linear-gradient(135deg, ${TEMU_ORANGE}, #ff8534)`,
                     border: "none",
                   }}
@@ -516,27 +674,282 @@ export default function AccountManager() {
                   登录
                 </Button>
               )}
+              <Popconfirm
+                title="确定删除此账号？"
+                description="删除后该账号的采集数据仍会保留"
+                onConfirm={() => handleDelete(selectedAccount.id)}
+              >
+                <Button danger icon={<DeleteOutlined />} style={{ borderRadius: 10 }}>
+                  删除
+                </Button>
+              </Popconfirm>
             </Space>
-
-            {/* 右侧：删除 */}
-            <Popconfirm
-              title="确定删除此账号？"
-              description="删除后该账号的采集数据仍会保留"
-              onConfirm={() => handleDelete(account.id)}
-            >
-              <Button size="small" danger icon={<DeleteOutlined />} style={{ borderRadius: 8 }}>
-                删除
-              </Button>
-            </Popconfirm>
           </div>
         </Card>
-      </Col>
+
+        {/* 数据概览 4 卡片 */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+          {/* 商品数 */}
+          <Card
+            size="small"
+            style={{ borderRadius: 12, border: "none", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}
+            styles={{ body: { padding: "16px 20px" } }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{
+                width: 36, height: 36, borderRadius: 10,
+                background: "#fff7f0",
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}>
+                <ShoppingOutlined style={{ color: TEMU_ORANGE, fontSize: 17 }} />
+              </div>
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>商品数</Text>
+                <div style={{ fontSize: 22, fontWeight: 700, color: "#1a1a2e", lineHeight: 1.2 }}>
+                  {selectedStats?.productCount ?? "—"}
+                </div>
+              </div>
+            </div>
+          </Card>
+
+          {/* 采集任务 — 统一数据源 */}
+          <Card
+            size="small"
+            style={{ borderRadius: 12, border: "none", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}
+            styles={{ body: { padding: "16px 20px" } }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{
+                width: 36, height: 36, borderRadius: 10,
+                background: "#f0f5ff",
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}>
+                <DatabaseOutlined style={{ color: "#1890ff", fontSize: 17 }} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  采集{collectionDisplay.isRealtime ? "（进行中）" : ""}
+                </Text>
+                <div style={{ fontSize: 22, fontWeight: 700, color: "#1a1a2e", lineHeight: 1.2 }}>
+                  {collectionDisplay.success}
+                  <Text type="secondary" style={{ fontSize: 13, fontWeight: 400 }}>
+                    /{collectionDisplay.total}
+                  </Text>
+                </div>
+              </div>
+            </div>
+          </Card>
+
+          {/* 失败任务 */}
+          <Card
+            size="small"
+            style={{ borderRadius: 12, border: "none", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}
+            styles={{ body: { padding: "16px 20px" } }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{
+                width: 36, height: 36, borderRadius: 10,
+                background: collectionDisplay.error > 0 ? "#fff2f0" : "#f6ffed",
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}>
+                {collectionDisplay.error > 0
+                  ? <ExclamationCircleOutlined style={{ color: "#ff4d4f", fontSize: 17 }} />
+                  : <SafetyCertificateOutlined style={{ color: "#52c41a", fontSize: 17 }} />
+                }
+              </div>
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {collectionDisplay.error > 0 ? "失败任务" : "健康状态"}
+                </Text>
+                <div style={{
+                  fontSize: 22, fontWeight: 700, lineHeight: 1.2,
+                  color: collectionDisplay.error > 0 ? "#ff4d4f" : "#52c41a",
+                }}>
+                  {collectionDisplay.error > 0 ? collectionDisplay.error : "正常"}
+                </div>
+              </div>
+            </div>
+          </Card>
+
+          {/* 数据新鲜度 */}
+          <Card
+            size="small"
+            style={{ borderRadius: 12, border: "none", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}
+            styles={{ body: { padding: "16px 20px" } }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{
+                width: 36, height: 36, borderRadius: 10,
+                background: freshness.level === "fresh" ? "#f6ffed"
+                  : freshness.level === "stale" ? "#fffbe6"
+                  : freshness.level === "expired" ? "#fff2f0" : "#f5f5f5",
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}>
+                <ClockCircleOutlined style={{ color: freshness.color, fontSize: 17 }} />
+              </div>
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>数据更新</Text>
+                <div style={{ fontSize: freshness.level === "none" ? 14 : 22, fontWeight: 700, color: freshness.color, lineHeight: 1.2 }}>
+                  {freshness.label}
+                </div>
+              </div>
+            </div>
+          </Card>
+        </div>
+
+        {/* 采集进度 + 分类健康度 */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          {/* 采集总览 */}
+          <Card
+            title={
+              <Space>
+                <SyncOutlined />
+                <span>采集总览</span>
+                {collectionDisplay.isRealtime && (
+                  <Tag color="processing" style={{ borderRadius: 999, fontSize: 11 }}>实时</Tag>
+                )}
+              </Space>
+            }
+            size="small"
+            style={{ borderRadius: 14, border: "none", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}
+            styles={{ header: { borderBottom: "1px solid #f5f5f5" } }}
+          >
+            <div style={{ padding: "8px 0" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  完成进度
+                </Text>
+                <Text strong style={{ fontSize: 12 }}>
+                  {completedCount}/{collectionDisplay.total}
+                </Text>
+              </div>
+              <Progress
+                percent={progressPercent}
+                strokeColor={collectionDisplay.error > 0 ? { "0%": TEMU_ORANGE, "100%": "#ff4d4f" } : TEMU_ORANGE}
+                size="small"
+                status={collectionDisplay.isRealtime ? "active" : undefined}
+              />
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 12 }}>
+                <Space size={4}>
+                  <CheckCircleOutlined style={{ color: "#52c41a", fontSize: 13 }} />
+                  <Text style={{ fontSize: 12, color: "#52c41a" }}>{collectionDisplay.success} 成功</Text>
+                </Space>
+                <Space size={4}>
+                  <ExclamationCircleOutlined style={{ color: collectionDisplay.error > 0 ? "#ff4d4f" : "#d9d9d9", fontSize: 13 }} />
+                  <Text style={{ fontSize: 12, color: collectionDisplay.error > 0 ? "#ff4d4f" : "#8c8c8c" }}>
+                    {collectionDisplay.error} 失败
+                  </Text>
+                </Space>
+              </div>
+              {collectionDisplay.syncedAt && (
+                <div style={{ marginTop: 12, padding: "8px 12px", background: "#fafafa", borderRadius: 8 }}>
+                  <Text type="secondary" style={{ fontSize: 11 }}>
+                    上次采集时间：{collectionDisplay.syncedAt}
+                  </Text>
+                </div>
+              )}
+            </div>
+          </Card>
+
+          {/* 分类健康度 */}
+          <Card
+            title={
+              <Space>
+                <ThunderboltOutlined />
+                <span>数据健康度</span>
+              </Space>
+            }
+            size="small"
+            style={{ borderRadius: 14, border: "none", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}
+            styles={{ header: { borderBottom: "1px solid #f5f5f5" } }}
+          >
+            {taskCategories.length === 0 ? (
+              <div style={{ padding: "20px 0", textAlign: "center" }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>暂无采集数据</Text>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "8px 0" }}>
+                {taskCategories.map((cat) => (
+                  <div key={cat.key} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <Text style={{ fontSize: 12, width: 64, flexShrink: 0 }}>{cat.label}</Text>
+                    <div style={{ flex: 1 }}>
+                      <Progress
+                        percent={Math.round((cat.success / cat.total) * 100)}
+                        size="small"
+                        strokeColor={cat.error > 0 ? "#faad14" : "#52c41a"}
+                        showInfo={false}
+                        style={{ marginBottom: 0 }}
+                      />
+                    </div>
+                    <Text
+                      style={{
+                        fontSize: 11,
+                        color: cat.error > 0 ? "#faad14" : "#52c41a",
+                        width: 36,
+                        textAlign: "right",
+                        flexShrink: 0,
+                      }}
+                    >
+                      {cat.success}/{cat.total}
+                    </Text>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+        </div>
+
+        {/* 快捷操作 */}
+        <Card
+          title={
+            <Space>
+              <ThunderboltOutlined />
+              <span>快捷操作</span>
+            </Space>
+          }
+          size="small"
+          style={{ borderRadius: 14, border: "none", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}
+          styles={{ header: { borderBottom: "1px solid #f5f5f5" } }}
+        >
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", padding: "8px 0" }}>
+            <Button
+              icon={<SyncOutlined />}
+              onClick={() => navigate("/collect")}
+              style={{ borderRadius: 10 }}
+              disabled={selectedAccount.status !== "online"}
+            >
+              一键采集
+            </Button>
+            <Button
+              icon={<DashboardOutlined />}
+              onClick={() => navigate("/shop")}
+              style={{ borderRadius: 10 }}
+            >
+              查看店铺概览
+            </Button>
+            <Button
+              icon={<ShoppingOutlined />}
+              onClick={() => navigate("/products")}
+              style={{ borderRadius: 10 }}
+            >
+              查看商品
+            </Button>
+            {freshness.level === "expired" && (
+              <Tooltip title="数据已超过24小时未更新，建议重新采集">
+                <Tag
+                  color="error"
+                  icon={<WarningOutlined />}
+                  style={{ borderRadius: 8, display: "flex", alignItems: "center", height: 32 }}
+                >
+                  数据过期，建议重新采集
+                </Tag>
+              </Tooltip>
+            )}
+          </div>
+        </Card>
+      </div>
     );
   };
-
-  const activeAccount = accounts.find((account) => account.id === activeAccountId) || null;
-  const onlineCount = accounts.filter((account) => account.status === "online").length;
-  const activeStats = activeAccountId ? accountStats[activeAccountId] : null;
 
   return (
     <div className="dashboard-shell">
@@ -591,19 +1004,51 @@ export default function AccountManager() {
           </div>
         </Card>
       ) : (
-        <Row gutter={[16, 16]}>
-          {/* 活跃账号排前面 */}
-          {accounts
-            .slice()
-            .sort((a, b) => {
-              if (a.id === activeAccountId) return -1;
-              if (b.id === activeAccountId) return 1;
-              if (a.status === "online" && b.status !== "online") return -1;
-              if (b.status === "online" && a.status !== "online") return 1;
-              return 0;
-            })
-            .map(renderAccountCard)}
-        </Row>
+        <div style={{ display: "flex", gap: 16, minHeight: 500 }}>
+          {/* 左侧账号列表 */}
+          <div
+            style={{
+              width: 240,
+              flexShrink: 0,
+              background: "#fff",
+              borderRadius: 16,
+              padding: "12px 10px",
+              boxShadow: "0 2px 12px rgba(0,0,0,0.04)",
+              overflowY: "auto",
+              maxHeight: "calc(100vh - 260px)",
+            }}
+          >
+            <Text
+              type="secondary"
+              style={{ fontSize: 11, padding: "4px 8px", display: "block", marginBottom: 4 }}
+            >
+              全部账号 ({accounts.length})
+            </Text>
+            {sortedAccounts.map(renderAccountListItem)}
+            <Divider style={{ margin: "8px 0" }} />
+            <div
+              onClick={() => setModalOpen(true)}
+              style={{
+                padding: "10px 16px",
+                cursor: "pointer",
+                borderRadius: 10,
+                textAlign: "center",
+                border: "1px dashed #e0e0e0",
+                color: "#8c8c8c",
+                fontSize: 13,
+                transition: "all 0.2s",
+              }}
+            >
+              <PlusOutlined style={{ marginRight: 4 }} />
+              添加账号
+            </div>
+          </div>
+
+          {/* 右侧详情面板 */}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {renderDetailPanel()}
+          </div>
+        </div>
       )}
 
       <Modal

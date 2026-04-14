@@ -6,6 +6,7 @@
 type RawApiEntry = {
   path?: string;
   data?: any;
+  rangeLabel?: string;
 };
 
 function getRawApis(data: any): RawApiEntry[] {
@@ -556,10 +557,135 @@ function normalizeFluxSummary(summaryRaw: any) {
   };
 }
 
+const FLUX_RANGE_PRIORITY = ["今日", "近7日", "近30日", "本周", "本月", "昨日"];
+
+function normalizeFluxRangeLabel(label: any) {
+  const text = toStringValue(label);
+  return text || "今日";
+}
+
+function getFluxRangePriority(label: string) {
+  const index = FLUX_RANGE_PRIORITY.indexOf(label);
+  return index >= 0 ? index : FLUX_RANGE_PRIORITY.length + 1;
+}
+
+function getFluxItemIdentityKeys(source: any) {
+  return Array.from(new Set([
+    toStringValue(source?.goodsId) ? `goods:${toStringValue(source?.goodsId)}` : "",
+    toStringValue(pickFirst(source?.productSkcId, source?.skcId, source?.goodsSkcId)) ? `skc:${toStringValue(pickFirst(source?.productSkcId, source?.skcId, source?.goodsSkcId))}` : "",
+    toStringValue(pickFirst(source?.productSkuId, source?.skuId)) ? `sku:${toStringValue(pickFirst(source?.productSkuId, source?.skuId))}` : "",
+    toStringValue(pickFirst(source?.productSpuId, source?.spuId, source?.productId)) ? `spu:${toStringValue(pickFirst(source?.productSpuId, source?.spuId, source?.productId))}` : "",
+    toStringValue(pickFirst(source?.goodsName, source?.productName, source?.title)) ? `title:${toStringValue(pickFirst(source?.goodsName, source?.productName, source?.title)).toLowerCase()}` : "",
+  ].filter(Boolean)));
+}
+
+function pickLatestFluxDetailRecord(detailResult: any) {
+  const records = toArray(detailResult?.list);
+  if (records.length === 0) return detailResult || null;
+  return [...records].sort((left: any, right: any) =>
+    toStringValue(right?.statDate).localeCompare(toStringValue(left?.statDate))
+  )[0];
+}
+
+function mergeFluxItemDetail(item: any, detailResult: any, trendResult: any) {
+  const latestDetail = pickLatestFluxDetailRecord(detailResult);
+  return {
+    ...item,
+    dataDate: toStringValue(pickFirst(latestDetail?.statDate, trendResult?.pt)),
+    updateTime: toStringValue(pickFirst(detailResult?.updateAt, detailResult?.updateTime)),
+    detailVisitorNum: toNumberValue(pickFirst(latestDetail?.goodsDetailVisitorNum, item.detailVisitorNum)),
+    collectUserNum: toNumberValue(pickFirst(latestDetail?.collectUserNum, item.collectUserNum)),
+    payOrderNum: toNumberValue(pickFirst(latestDetail?.payOrderNum, item.payOrderNum)),
+    payGoodsNum: toNumberValue(pickFirst(latestDetail?.payGoodsNum, item.payGoodsNum)),
+    buyerNum: toNumberValue(pickFirst(latestDetail?.buyerNum, item.buyerNum)),
+    searchExposeNum: toNumberValue(pickFirst(latestDetail?.searchExposeNum, item.searchExposeNum)),
+    searchClickNum: toNumberValue(pickFirst(latestDetail?.searchClickNum, item.searchClickNum)),
+    searchPayGoodsNum: toNumberValue(latestDetail?.searchPayGoodsNum),
+    recommendExposeNum: toNumberValue(pickFirst(latestDetail?.recommendExposeNum, item.recommendExposeNum)),
+    recommendClickNum: toNumberValue(pickFirst(latestDetail?.recommendClickNum, item.recommendClickNum)),
+    recommendPayGoodsNum: toNumberValue(latestDetail?.recommendPayGoodsNum),
+    trendExposeNum: toNumberValue(trendResult?.goodsExposeNum),
+    trendExposeNumChange: pickFirst(trendResult?.goodsExposeNumLinkRelative, trendResult?.goodsExposeNumChange, null),
+    trendPayOrderNum: toNumberValue(trendResult?.payOrderNum),
+    trendPayOrderNumChange: pickFirst(trendResult?.payOrderNumLinkRelative, trendResult?.payOrderNumChange, null),
+    rawFluxDetail: detailResult || null,
+    rawFluxTrend: trendResult || null,
+  };
+}
+
+function buildFluxDetailLookup(apis: any[]) {
+  const detailByIdentity = new Map<string, any>();
+  const trendByIdentity = new Map<string, any>();
+
+  apis.forEach((api) => {
+    const path = toStringValue(api?.path);
+    const identityKeys = getFluxItemIdentityKeys(api?.fluxIdentity || {});
+    if (identityKeys.length === 0) return;
+    const result = pickFirst(api?.data?.result, api?.data);
+    if (!result) return;
+
+    const targetMap = path.includes("goods/detail")
+      ? detailByIdentity
+      : path.includes("goods/trend")
+        ? trendByIdentity
+        : null;
+    if (!targetMap) return;
+
+    identityKeys.forEach((key) => targetMap.set(key, result));
+  });
+
+  return { detailByIdentity, trendByIdentity };
+}
+
+function buildFluxRangeDataset(apis: any[], syncedAt = "") {
+  const { detailByIdentity, trendByIdentity } = buildFluxDetailLookup(apis);
+  const mallSummary = normalizeFluxSummary(findApi(apis, "mall/summary"));
+  const fluxResults = findAllApis(apis, "goods/list");
+  const items = fluxResults.flatMap((result) =>
+    normalizeFluxItems(
+      toArray(pickFirst(result?.list, result?.pageItems, result?.items)),
+    ),
+  ).map((item) => {
+    const identityKeys = getFluxItemIdentityKeys(item);
+    const detailResult = identityKeys.map((key) => detailByIdentity.get(key)).find(Boolean);
+    const trendResult = identityKeys.map((key) => trendByIdentity.get(key)).find(Boolean);
+    return mergeFluxItemDetail(item, detailResult, trendResult);
+  });
+
+  return {
+    summary: mallSummary,
+    items,
+    syncedAt,
+  };
+}
+
+function pickFluxPrimaryRangeLabel(
+  summaryByRange: Record<string, any>,
+  itemsByRange: Record<string, any[]>,
+  preferredLabel = "",
+) {
+  const preferred = normalizeFluxRangeLabel(preferredLabel);
+  const labels = Array.from(new Set([
+    ...Object.keys(summaryByRange || {}),
+    ...Object.keys(itemsByRange || {}),
+  ])).sort((left, right) => getFluxRangePriority(left) - getFluxRangePriority(right));
+
+  if (preferred && (summaryByRange?.[preferred] || itemsByRange?.[preferred]?.length)) {
+    return preferred;
+  }
+
+  return labels.find((label) => Array.isArray(itemsByRange?.[label]) && itemsByRange[label].length > 0)
+    || labels.find((label) => Boolean(summaryByRange?.[label]))
+    || preferred
+    || "今日";
+}
+
 function normalizeFluxItems(items: any[]): any[] {
   return items.map((item: any, index: number) => ({
     key: toStringValue(pickFirst(item.key, item.goodsId, `${index}`)),
     goodsId: toStringValue(item.goodsId),
+    skcId: toStringValue(pickFirst(item.productSkcId, item.skcId, item.goodsSkcId)),
+    skuId: toStringValue(pickFirst(item.productSkuId, item.skuId)),
     goodsName: toStringValue(pickFirst(item.goodsName, item.productName, item.title)),
     imageUrl: toStringValue(pickFirst(item.goodsImageUrl, item.imageUrl, item.mainImageUrl)),
     spuId: toStringValue(pickFirst(item.productSpuId, item.spuId, item.productId)),
@@ -575,10 +701,18 @@ function normalizeFluxItems(items: any[]): any[] {
     payGoodsNum: toNumberValue(item.payGoodsNum),
     payOrderNum: toNumberValue(item.payOrderNum),
     buyerNum: toNumberValue(item.buyerNum),
+    dataDate: toStringValue(item.dataDate),
+    updateTime: toStringValue(item.updateTime),
     searchExposeNum: toNumberValue(item.searchExposeNum),
     searchClickNum: toNumberValue(item.searchClickNum),
+    searchPayGoodsNum: toNumberValue(item.searchPayGoodsNum),
     recommendExposeNum: toNumberValue(item.recommendExposeNum),
     recommendClickNum: toNumberValue(item.recommendClickNum),
+    recommendPayGoodsNum: toNumberValue(item.recommendPayGoodsNum),
+    trendExposeNum: toNumberValue(item.trendExposeNum),
+    trendExposeNumChange: pickFirst(item.trendExposeNumChange, null),
+    trendPayOrderNum: toNumberValue(item.trendPayOrderNum),
+    trendPayOrderNumChange: pickFirst(item.trendPayOrderNumChange, null),
     clickPayRate: toNumberValue(pickFirst(item.clickPayConversionRate, item.clickPayRate)),
     exposeClickRate: toNumberValue(pickFirst(item.exposeClickConversionRate, item.exposeClickRate)),
     growDataText: toStringValue(item.growDataText),
@@ -848,25 +982,187 @@ export function parseSalesData(raw: any): any {
 // ============ Flux 流量分析 ============
 export function parseFluxData(raw: any): any {
   if (raw?.summary !== undefined && raw?.items !== undefined && !raw?.apis) {
+    const summaryByRange = Object.entries(raw?.summaryByRange || {}).reduce<Record<string, any>>((accumulator, [label, value]) => {
+      accumulator[normalizeFluxRangeLabel(label)] = normalizeFluxSummary(value);
+      return accumulator;
+    }, {});
+    const itemsByRange = Object.entries(raw?.itemsByRange || {}).reduce<Record<string, any[]>>((accumulator, [label, value]) => {
+      accumulator[normalizeFluxRangeLabel(label)] = normalizeFluxItems(toArray(value));
+      return accumulator;
+    }, {});
+    const availableRanges = Array.from(new Set([
+      ...Object.keys(summaryByRange),
+      ...Object.keys(itemsByRange),
+      ...toArray(raw?.availableRanges).map((label: any) => normalizeFluxRangeLabel(label)),
+    ])).sort((left, right) => getFluxRangePriority(left) - getFluxRangePriority(right));
+    const primaryRangeLabel = pickFluxPrimaryRangeLabel(summaryByRange, itemsByRange, raw?.primaryRangeLabel);
+
     return {
-      summary: normalizeFluxSummary(raw.summary),
-      items: normalizeFluxItems(toArray(raw.items)),
+      summary: summaryByRange[primaryRangeLabel] || normalizeFluxSummary(raw.summary),
+      items: itemsByRange[primaryRangeLabel] || normalizeFluxItems(toArray(raw.items)),
       syncedAt: raw.syncedAt,
+      summaryByRange,
+      itemsByRange,
+      availableRanges,
+      primaryRangeLabel,
     };
   }
 
   if (!isRawApiFormat(raw)) return { summary: null, items: [] };
   const apis = getRawApis(raw);
+  const apisByRange = apis.reduce<Record<string, any[]>>((accumulator, api) => {
+    const rangeLabel = normalizeFluxRangeLabel(api?.rangeLabel);
+    if (!accumulator[rangeLabel]) accumulator[rangeLabel] = [];
+    accumulator[rangeLabel].push(api);
+    return accumulator;
+  }, {});
 
-  const mallSummary = normalizeFluxSummary(findApi(apis, "mall/summary"));
-  const fluxResults = findAllApis(apis, "goods/list");
-  const items = fluxResults.flatMap((result) =>
-    normalizeFluxItems(
-      toArray(pickFirst(result?.list, result?.pageItems, result?.items)),
-    ),
-  );
+  const availableRanges = Object.keys(apisByRange).sort((left, right) => getFluxRangePriority(left) - getFluxRangePriority(right));
+  const summaryByRange = availableRanges.reduce<Record<string, any>>((accumulator, label) => {
+    accumulator[label] = buildFluxRangeDataset(apisByRange[label] || [], raw.syncedAt).summary;
+    return accumulator;
+  }, {});
+  const itemsByRange = availableRanges.reduce<Record<string, any[]>>((accumulator, label) => {
+    accumulator[label] = buildFluxRangeDataset(apisByRange[label] || [], raw.syncedAt).items;
+    return accumulator;
+  }, {});
+  const primaryRangeLabel = pickFluxPrimaryRangeLabel(summaryByRange, itemsByRange, raw?.meta?.rangeLabel);
 
-  return { summary: mallSummary, items, syncedAt: raw.syncedAt };
+  return {
+    summary: summaryByRange[primaryRangeLabel] || null,
+    items: itemsByRange[primaryRangeLabel] || [],
+    syncedAt: raw.syncedAt,
+    summaryByRange,
+    itemsByRange,
+    availableRanges,
+    primaryRangeLabel,
+  };
+}
+
+// ============ 商品数据 — 每日流量提取 ============
+/**
+ * 从 temu_raw_goodsData 原始 API 数据中提取每日流量趋势。
+ * goods-analysis 页面可能捕获多种 API，此函数尝试多种匹配策略：
+ * 1. 包含 trendList / dailyList 的 goods/list 或 goods/trend 类 API
+ * 2. 包含日期字段 (day/date/statDate) 的数组数据
+ * 返回: { dailyItems: [{ date, goodsId, goodsName, exposeNum, clickNum, ... }], products: [...] }
+ */
+export function parseGoodsAnalysisDailyData(raw: any): { dailyItems: any[]; products: any[] } {
+  const empty = { dailyItems: [], products: [] };
+  if (!raw) return empty;
+  if (!isRawApiFormat(raw)) return empty;
+
+  const apis = getRawApis(raw);
+  const dailyItems: any[] = [];
+  const productsMap = new Map<string, any>();
+
+  // 策略1: 查找 goods/list / goods/trend 类 API (flow analysis)
+  const flowApis = apis.filter((api) => {
+    const p = api?.path || "";
+    return p.includes("goods/list") || p.includes("goods/trend") || p.includes("goods/daily")
+      || p.includes("goodsAnalysis") || p.includes("goods_analysis")
+      || p.includes("skc/flow") || p.includes("skc/trend");
+  });
+
+  for (const api of flowApis) {
+    const payload = unwrapApiPayload(api);
+    if (!payload) continue;
+
+    // 查找包含日期的列表数据
+    const lists = [
+      payload.trendList, payload.dailyList, payload.dateList,
+      payload.list, payload.pageItems, payload.items, payload.dataList,
+    ].filter(Array.isArray);
+
+    for (const list of lists) {
+      for (const item of list) {
+        const date = item.day || item.date || item.statDate || item.dateStr || "";
+        if (!date) continue;
+
+        // 如果 item 中嵌套了 goodsList，展开
+        if (Array.isArray(item.goodsList || item.productList || item.list)) {
+          const inner = item.goodsList || item.productList || item.list;
+          for (const g of inner) {
+            const goodsId = String(g.goodsId || g.productSkcId || g.skcId || g.spuId || "");
+            if (!goodsId) continue;
+            dailyItems.push(normalizeGoodsDailyItem(date, g));
+            if (!productsMap.has(goodsId)) {
+              productsMap.set(goodsId, { goodsId, goodsName: g.goodsName || g.productName || "", imageUrl: g.goodsImageUrl || g.imageUrl || "" });
+            }
+          }
+        } else {
+          // item 本身就是某商品的某天数据
+          const goodsId = String(item.goodsId || item.productSkcId || item.skcId || item.spuId || "");
+          if (goodsId) {
+            dailyItems.push(normalizeGoodsDailyItem(date, item));
+            if (!productsMap.has(goodsId)) {
+              productsMap.set(goodsId, { goodsId, goodsName: item.goodsName || item.productName || "", imageUrl: item.goodsImageUrl || item.imageUrl || "" });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 策略2: 如果策略1没找到，遍历所有 API 寻找日期+流量字段
+  if (dailyItems.length === 0) {
+    for (const api of apis) {
+      const payload = unwrapApiPayload(api);
+      if (!payload) continue;
+      const candidates = [payload, ...(Array.isArray(payload) ? payload : [])];
+      for (const candidate of candidates) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const lists = Object.values(candidate).filter(Array.isArray) as any[][];
+        for (const list of lists) {
+          if (list.length === 0) continue;
+          const sample = list[0];
+          if (!sample || typeof sample !== "object") continue;
+          const hasDate = sample.day || sample.date || sample.statDate || sample.dateStr;
+          const hasFlow = sample.exposeNum !== undefined || sample.clickNum !== undefined
+            || sample.visitNum !== undefined || sample.buyerNum !== undefined;
+          if (hasDate && hasFlow) {
+            for (const item of list) {
+              const date = item.day || item.date || item.statDate || item.dateStr || "";
+              const goodsId = String(item.goodsId || item.productSkcId || item.skcId || item.spuId || "");
+              if (date && goodsId) {
+                dailyItems.push(normalizeGoodsDailyItem(date, item));
+                if (!productsMap.has(goodsId)) {
+                  productsMap.set(goodsId, { goodsId, goodsName: item.goodsName || item.productName || "", imageUrl: item.goodsImageUrl || item.imageUrl || "" });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  dailyItems.sort((a, b) => a.date.localeCompare(b.date));
+
+  return { dailyItems, products: Array.from(productsMap.values()) };
+}
+
+function normalizeGoodsDailyItem(date: string, item: any) {
+  return {
+    date: String(date),
+    goodsId: String(item.goodsId || item.productSkcId || item.skcId || item.spuId || ""),
+    goodsName: String(item.goodsName || item.productName || ""),
+    exposeNum: toNumberValue(item.exposeNum),
+    clickNum: toNumberValue(item.clickNum),
+    detailVisitNum: toNumberValue(pickFirst(item.goodsDetailVisitNum, item.detailVisitNum, item.visitNum)),
+    detailVisitorNum: toNumberValue(pickFirst(item.goodsDetailVisitorNum, item.detailVisitorNum, item.visitorNum)),
+    addToCartUserNum: toNumberValue(item.addToCartUserNum),
+    collectUserNum: toNumberValue(item.collectUserNum),
+    buyerNum: toNumberValue(item.buyerNum),
+    payGoodsNum: toNumberValue(item.payGoodsNum),
+    payOrderNum: toNumberValue(item.payOrderNum),
+    searchExposeNum: toNumberValue(item.searchExposeNum),
+    searchClickNum: toNumberValue(item.searchClickNum),
+    recommendExposeNum: toNumberValue(item.recommendExposeNum),
+    recommendClickNum: toNumberValue(item.recommendClickNum),
+    clickPayRate: toNumberValue(pickFirst(item.clickPayConversionRate, item.clickPayRate)),
+    exposeClickRate: toNumberValue(pickFirst(item.exposeClickConversionRate, item.exposeClickRate)),
+  };
 }
 
 // ============ 统一解析入口 ============

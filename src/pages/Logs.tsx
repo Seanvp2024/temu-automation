@@ -29,13 +29,13 @@ type LevelFilter = "all" | "log" | "info" | "warn" | "error";
 function levelLabel(level: FrontendLogEntry["level"] | LevelFilter) {
   switch (level) {
     case "log":
-      return "日志";
+      return "记录";
     case "info":
       return "信息";
     case "warn":
-      return "警告";
+      return "提醒";
     case "error":
-      return "错误";
+      return "异常";
     default:
       return "全部";
   }
@@ -59,22 +59,22 @@ function sourceLabel(source: FrontendLogEntry["source"]) {
     case "window-error":
       return "页面异常";
     case "unhandledrejection":
-      return "Promise异常";
+      return "请求异常";
     default:
-      return "Console";
+      return "应用记录";
   }
 }
 
 function explainMessage(log: FrontendLogEntry) {
   const rawMessage = log.message || "";
   if (rawMessage.includes("[antd: Spin]") && rawMessage.includes("tip")) {
-    return "这是 Ant Design 的加载提示用法警告，不一定代表业务失败。";
+    return "这是界面加载提示的用法提醒，通常不会影响主要功能。";
   }
   if (log.source === "unhandledrejection") {
-    return "有 Promise 异常没有被捕获，建议顺着调用链继续排查。";
+    return "这条记录表示某次请求或异步处理没有顺利完成，建议先看同一时间段的操作。";
   }
   if (log.source === "window-error") {
-    return "这是页面运行时异常，通常会直接影响当前功能。";
+    return "这条记录表示页面运行过程中出现异常，可能会影响当前功能。";
   }
   return "";
 }
@@ -114,12 +114,8 @@ export default function Logs() {
 
   const filteredLogs = useMemo(() => {
     return logs.filter((log) => {
-      if (levelFilter !== "all" && log.level !== levelFilter) {
-        return false;
-      }
-      if (!searchText.trim()) {
-        return true;
-      }
+      if (levelFilter !== "all" && log.level !== levelFilter) return false;
+      if (!searchText.trim()) return true;
       const keyword = searchText.trim().toLowerCase();
       return (
         log.message.toLowerCase().includes(keyword)
@@ -140,7 +136,7 @@ export default function Logs() {
       key: "timestamp",
       width: 158,
       render: (value: number) => (
-        <Text style={{ fontFamily: "Consolas, monospace", fontSize: 12 }}>
+        <Text style={{ fontFamily: "Consolas, monospace", fontSize: 13 }}>
           {formatTime(value)}
         </Text>
       ),
@@ -174,7 +170,7 @@ export default function Logs() {
       render: (_: unknown, record: FrontendLogEntry) => {
         const explanation = explainMessage(record);
         return explanation ? (
-          <span style={{ fontSize: 12, color: "var(--color-text-sec)" }}>{explanation}</span>
+          <span style={{ fontSize: 13, color: "var(--color-text-sec)" }}>{explanation}</span>
         ) : (
           <span style={{ color: "#bbb" }}>-</span>
         );
@@ -186,28 +182,28 @@ export default function Logs() {
     <div className="dashboard-shell">
       <PageHeader
         compact
-        eyebrow="排查工作台"
+        eyebrow="运行记录"
         title="日志中心"
-        subtitle="前端日志页，把前端异常、Promise 未处理错误和普通调试日志压缩进一个更易扫读的视图。"
+        subtitle="这里集中展示应用运行中的提醒与异常，方便快速回看最近发生了什么。"
         meta={[
-          `${logs.length} 条日志`,
-          errorCount > 0 ? `${errorCount} 条错误` : "当前无错误",
-          warnCount > 0 ? `${warnCount} 条警告` : "警告较少",
+          `${logs.length} 条记录`,
+          errorCount > 0 ? `${errorCount} 条异常` : "当前无异常",
+          warnCount > 0 ? `${warnCount} 条提醒` : "提醒较少",
         ]}
       />
 
       <div className="app-form-grid">
-        <StatCard compact title="错误数" value={errorCount} color="danger" trend="优先看页面异常和 Promise 异常" />
-        <StatCard compact title="警告数" value={warnCount} color="brand" trend="界面用法问题会集中到这里" />
-        <StatCard compact title="最近一条" value={latestTime} color="blue" trend={logs[0]?.source ? `来源：${sourceLabel(logs[0].source)}` : "等待新的前端日志"} />
+        <StatCard compact title="异常数量" value={errorCount} color="danger" trend="优先查看会影响页面使用的问题" />
+        <StatCard compact title="提醒数量" value={warnCount} color="brand" trend="用于查看界面和流程中的温和提醒" />
+        <StatCard compact title="最近一条" value={latestTime} color="blue" trend={logs[0]?.source ? `来源：${sourceLabel(logs[0].source)}` : "等待新的运行记录"} />
       </div>
 
       <Alert
         className="friendly-alert"
         type="info"
         showIcon
-        message="这里只记录渲染层日志"
-        description="默认保留最近 500 条。表格里先展示摘要，展开行后可以看完整内容和中文解释。"
+        message="这里会记录应用运行中的提醒与异常"
+        description="默认保留最近 500 条。列表里先显示摘要，展开后可以查看完整内容和更易理解的说明。"
       />
 
       <div className="app-panel">
@@ -216,17 +212,17 @@ export default function Logs() {
             allowClear
             value={searchText}
             onChange={(event) => setSearchText(event.target.value)}
-            placeholder="搜索日志内容 / 来源 / 级别"
+            placeholder="搜索记录内容 / 来源 / 级别"
           />
           <Segmented<LevelFilter>
             value={levelFilter}
             onChange={(value) => setLevelFilter(value)}
             options={[
               { label: "全部", value: "all" },
-              { label: "日志", value: "log" },
+              { label: "记录", value: "log" },
               { label: "信息", value: "info" },
-              { label: "警告", value: "warn" },
-              { label: "错误", value: "error" },
+              { label: "提醒", value: "warn" },
+              { label: "异常", value: "error" },
             ]}
           />
           <Button icon={<ReloadOutlined />} onClick={() => void loadLogs()} loading={loading}>
@@ -238,10 +234,10 @@ export default function Logs() {
             onClick={async () => {
               await clearFrontendLogs();
               setLogs([]);
-              message.success("前端日志已清空");
+              message.success("运行记录已清空");
             }}
           >
-            清空日志
+            清空
           </Button>
           <div className="app-toolbar__count">共 {filteredLogs.length} 条</div>
         </div>
@@ -263,13 +259,13 @@ export default function Logs() {
               expandedRowRender: (record) => (
                 <Space direction="vertical" size={12} style={{ width: "100%" }}>
                   <div>
-                    <Text strong>完整日志</Text>
+                    <Text strong>完整内容</Text>
                     <div className="app-log-message" style={{ marginTop: 8 }}>{record.message}</div>
                   </div>
                   {explainMessage(record) ? (
                     <div>
-                      <Text strong>中文说明</Text>
-                      <div style={{ marginTop: 8, fontSize: 12, color: "var(--color-text-sec)", lineHeight: 1.7 }}>
+                      <Text strong>说明</Text>
+                      <div style={{ marginTop: 8, fontSize: 13, color: "var(--color-text-sec)", lineHeight: 1.7 }}>
                         {explainMessage(record)}
                       </div>
                     </div>
@@ -279,7 +275,7 @@ export default function Logs() {
             }}
           />
         ) : (
-          <EmptyGuide title="暂无前端日志" description="前端异常和调试日志将自动收集到此处" />
+          <EmptyGuide title="暂无运行记录" description="这里会自动收集最近的页面提醒与异常。" />
         )}
       </div>
     </div>

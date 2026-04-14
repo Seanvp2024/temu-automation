@@ -8,6 +8,13 @@ automation/data/user-data/
 *.db
 *.log
 .env
+.env.local
+.env.*.local
+
+# 临时探测与备份文件
+.codex-backups/
+tmp-grsai-*
+logs/yundu-sniff-*.json
 
 # 测试/调试文件
 scrape_result.json

@@ -39,7 +39,7 @@ export default function StatCard({
   icon,
   color = "brand",
   trend,
-  empty = "采集后显示",
+  empty = "更新后显示",
   suffix,
   footer,
   className = "",
@@ -65,7 +65,7 @@ export default function StatCard({
       {emptyState ? (
         <div className="app-stat-card__empty">{empty}</div>
       ) : (
-        <div className="app-stat-card__meta">{trend || footer || <span className="app-stat-card__placeholder">已同步</span>}</div>
+        <div className="app-stat-card__meta">{trend || footer || <span className="app-stat-card__placeholder">已更新</span>}</div>
       )}
     </div>
   );

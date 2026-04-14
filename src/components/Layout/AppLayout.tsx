@@ -1,45 +1,37 @@
 import { useEffect, useState } from "react";
-import { Outlet, useNavigate, useLocation } from "react-router-dom";
-import { Layout, Menu, Typography, Tag, Space, Badge, Button, Dropdown, List } from "antd";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { Badge, Button, Dropdown, Layout, List, Menu, Space, Tag } from "antd";
 import {
-  DashboardOutlined,
-  UserOutlined,
-  ShoppingOutlined,
-  ScheduleOutlined,
-  SettingOutlined,
-  RocketOutlined,
-  SyncOutlined,
-  LoadingOutlined,
-  CheckCircleOutlined,
-  PlusCircleOutlined,
-  PictureOutlined,
-  FileTextOutlined,
-  BellOutlined,
   ArrowRightOutlined,
+  BellOutlined,
+  CheckCircleOutlined,
   CloseCircleOutlined,
-  GlobalOutlined,
+  DashboardOutlined,
+  FileTextOutlined,
+  LoadingOutlined,
+  PictureOutlined,
+  PlusCircleOutlined,
+  RocketOutlined,
+  SettingOutlined,
+  ShoppingOutlined,
+  SyncOutlined,
+  UserOutlined,
 } from "@ant-design/icons";
-import { useCollection, COLLECT_TASKS } from "../../contexts/CollectionContext";
 import { ACTIVE_ACCOUNT_CHANGED_EVENT, readActiveAccountId } from "../../utils/multiStore";
+import { COLLECT_TASKS, useCollection } from "../../contexts/CollectionContext";
 
-const { Sider, Content, Header } = Layout;
-const { Text } = Typography;
+const { Content, Header, Sider } = Layout;
 
 const menuItems = [
   {
     type: "group" as const,
     label: "账号",
-    children: [
-      { key: "/accounts", icon: <UserOutlined />, label: "账号管理" },
-    ],
+    children: [{ key: "/accounts", icon: <UserOutlined />, label: "账号管理" }],
   },
   {
     type: "group" as const,
     label: "数据",
-    children: [
-      { key: "/collect", icon: <SyncOutlined />, label: "数据采集" },
-      { key: "/tasks", icon: <ScheduleOutlined />, label: "任务管理" },
-    ],
+    children: [{ key: "/collect", icon: <SyncOutlined />, label: "数据采集" }],
   },
   {
     type: "group" as const,
@@ -67,17 +59,6 @@ const menuItems = [
   },
 ];
 
-function findMenuLabel(items: any[], pathname: string): string {
-  for (const item of items) {
-    if (Array.isArray(item.children)) {
-      const label = findMenuLabel(item.children, pathname);
-      if (label) return label;
-    }
-    if (item.key === pathname) return item.label;
-  }
-  return "";
-}
-
 export default function AppLayout() {
   const [collapsed, setCollapsed] = useState(false);
   const [activeAccountName, setActiveAccountName] = useState("");
@@ -85,40 +66,22 @@ export default function AppLayout() {
   const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
   const navigate = useNavigate();
   const location = useLocation();
-  const { collecting, progress, successCount, errorCount, elapsed, taskStates } = useCollection();
+  const { collecting, progress, successCount, errorCount, taskStates } = useCollection();
   const completedCount = successCount + errorCount;
 
   const recentErrors = Object.entries(taskStates)
-    .filter(([, s]) => s.status === "error")
+    .filter(([, state]) => state.status === "error")
     .slice(0, 6)
-    .map(([key, s]) => ({ key, message: s.message || "采集失败" }));
+    .map(([key, state]) => ({ key, message: state.message || "采集失败" }));
 
   let selectedKey = location.pathname;
-  if (location.pathname.startsWith("/products/")) selectedKey = "/products";
-  else if (location.pathname === "/dashboard") selectedKey = "/shop";
-
-  const sidebarStatus = collecting
-    ? {
-        label: "采集中",
-        description: `${completedCount}/${COLLECT_TASKS.length} 已完成`,
-        tone: "processing" as const,
-      }
-    : progress === 100
-      ? {
-          label: errorCount > 0 ? "采集完成，部分失败" : "采集完成",
-          description: `${successCount} 成功${errorCount > 0 ? `，${errorCount} 失败` : ""}`,
-          tone: errorCount > 0 ? "warning" as const : "success" as const,
-        }
-      : {
-          label: "等待开始",
-          description: "进入数据采集页后可执行 65 项任务",
-          tone: "default" as const,
-        };
-
-  const formatTime = (s: number) => {
-    const m = Math.floor(s / 60);
-    return m > 0 ? `${m}:${String(s % 60).padStart(2, "0")}` : `${s}s`;
-  };
+  if (location.pathname.startsWith("/products/")) {
+    selectedKey = "/products";
+  } else if (location.pathname === "/dashboard") {
+    selectedKey = "/shop";
+  } else if (location.pathname === "/tasks") {
+    selectedKey = "/collect";
+  }
 
   useEffect(() => {
     const store = window.electronAPI?.store;
@@ -127,21 +90,19 @@ export default function AppLayout() {
     let cancelled = false;
 
     const loadActiveAccount = async () => {
-      const [rawAccounts, activeId] = await Promise.all([
-        store.get("temu_accounts"),
-        readActiveAccountId(store),
-      ]);
+      const [rawAccounts, activeId] = await Promise.all([store.get("temu_accounts"), readActiveAccountId(store)]);
       if (cancelled) return;
 
       const list = Array.isArray(rawAccounts) ? rawAccounts : [];
-      setAccounts(list.map((a: any) => ({ id: a.id, name: a.name || "" })));
+      setAccounts(list.map((account: any) => ({ id: account.id, name: account.name || "" })));
       setActiveAccountId(activeId ?? null);
 
       if (!list.length || !activeId) {
         setActiveAccountName("");
         return;
       }
-      const active = list.find((a: any) => a?.id === activeId);
+
+      const active = list.find((account: any) => account?.id === activeId);
       setActiveAccountName(typeof active?.name === "string" ? active.name : "");
     };
 
@@ -164,14 +125,17 @@ export default function AppLayout() {
 
   const noAccount = accounts.length === 0;
 
-  // 账号切换下拉菜单
   const accountMenuItems = [
-    ...accounts.map((a) => ({
-      key: a.id,
+    ...accounts.map((account) => ({
+      key: account.id,
       label: (
         <Space>
-          {a.id === activeAccountId ? <CheckCircleOutlined style={{ color: "#e55b00" }} /> : <UserOutlined style={{ color: "#bbb" }} />}
-          <span style={{ fontWeight: a.id === activeAccountId ? 600 : 400 }}>{a.name}</span>
+          {account.id === activeAccountId ? (
+            <CheckCircleOutlined style={{ color: "#e55b00" }} />
+          ) : (
+            <UserOutlined style={{ color: "#bbb" }} />
+          )}
+          <span style={{ fontWeight: account.id === activeAccountId ? 600 : 400 }}>{account.name}</span>
         </Space>
       ),
     })),
@@ -180,17 +144,36 @@ export default function AppLayout() {
   ];
 
   const handleAccountMenuClick = async ({ key }: { key: string }) => {
-    if (key === "__manage__") { navigate("/accounts"); return; }
+    if (key === "__manage__") {
+      navigate("/accounts");
+      return;
+    }
+
     const store = window.electronAPI?.store;
     if (!store) return;
     const { setActiveAccountAndSync } = await import("../../utils/multiStore");
     await setActiveAccountAndSync(store, accounts as any[], key);
   };
 
-  // 铃铛通知下拉
   const bellDropdown = (
-    <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 8px 24px rgba(0,0,0,0.12)", minWidth: 280, padding: "12px 0" }}>
-      <div style={{ padding: "0 16px 10px", fontWeight: 700, fontSize: 13, color: "#1a1a2e", borderBottom: "1px solid #f0f0f0" }}>
+    <div
+      style={{
+        background: "#fff",
+        borderRadius: 12,
+        boxShadow: "0 8px 24px rgba(0,0,0,0.12)",
+        minWidth: 280,
+        padding: "12px 0",
+      }}
+    >
+      <div
+        style={{
+          padding: "0 16px 10px",
+          fontWeight: 700,
+          fontSize: 13,
+          color: "#1a1a2e",
+          borderBottom: "1px solid #f0f0f0",
+        }}
+      >
         采集失败记录
       </div>
       {recentErrors.length === 0 ? (
@@ -203,22 +186,26 @@ export default function AppLayout() {
             <List.Item style={{ padding: "8px 16px", borderBottom: "none" }}>
               <Space>
                 <CloseCircleOutlined style={{ color: "#ff4d4f", fontSize: 13 }} />
-                <span style={{ fontSize: 12, color: "#555" }}>{item.key}：{item.message}</span>
+                <span style={{ fontSize: 12, color: "#555" }}>
+                  {item.key}：{item.message}
+                </span>
               </Space>
             </List.Item>
           )}
         />
       )}
       <div style={{ padding: "8px 16px 0", borderTop: "1px solid #f0f0f0" }}>
-        <Button size="small" type="link" style={{ padding: 0 }} onClick={() => navigate("/collect")}>查看全部采集任务</Button>
+        <Button size="small" type="link" style={{ padding: 0 }} onClick={() => navigate("/collect")}>
+          查看全部采集任务
+        </Button>
       </div>
     </div>
   );
 
   return (
     <Layout style={{ minHeight: "100vh" }} className="app-layout-root">
-      {/* Sidebar */}
       <Sider
+        className="app-layout-sider"
         collapsible
         collapsed={collapsed}
         onCollapse={setCollapsed}
@@ -243,21 +230,32 @@ export default function AppLayout() {
               flexShrink: 0,
             }}
           >
-            <div style={{
-              width: 36, height: 36, borderRadius: 10,
-              background: "linear-gradient(135deg, #e55b00, #ff8534)",
-              display: "flex", alignItems: "center", justifyContent: "center",
-              flexShrink: 0,
-            }}>
+            <div
+              style={{
+                width: 36,
+                height: 36,
+                borderRadius: 10,
+                background: "linear-gradient(135deg, #e55b00, #ff8534)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+              }}
+            >
               <RocketOutlined style={{ fontSize: 18, color: "#fff" }} />
             </div>
             {!collapsed && (
-              <span style={{
-                marginLeft: 12, fontSize: 16, fontWeight: 700,
-                background: "linear-gradient(135deg, #e55b00, #ff8534)",
-                WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
-                whiteSpace: "nowrap",
-              }}>
+              <span
+                style={{
+                  marginLeft: 12,
+                  fontSize: 16,
+                  fontWeight: 700,
+                  background: "linear-gradient(135deg, #e55b00, #ff8534)",
+                  WebkitBackgroundClip: "text",
+                  WebkitTextFillColor: "transparent",
+                  whiteSpace: "nowrap",
+                }}
+              >
                 Temu 运营助手
               </span>
             )}
@@ -272,12 +270,10 @@ export default function AppLayout() {
               style={{ border: 0 }}
             />
           </div>
-
         </div>
       </Sider>
 
-      <Layout style={{ background: "linear-gradient(180deg, #f8f9fc 0%, #f4f6fa 100%)" }}>
-        {/* Header */}
+      <Layout className="app-layout-main" style={{ background: "linear-gradient(180deg, #f8f9fc 0%, #f4f6fa 100%)" }}>
         <Header
           className="app-layout-header"
           style={{
@@ -302,19 +298,13 @@ export default function AppLayout() {
               {collecting ? `${completedCount}/${COLLECT_TASKS.length}` : progress === 100 ? "采集完成" : "就绪"}
             </Tag>
 
-            <Dropdown
-              trigger={["click"]}
-              dropdownRender={() => bellDropdown}
-            >
+            <Dropdown trigger={["click"]} dropdownRender={() => bellDropdown}>
               <Badge count={errorCount > 0 ? errorCount : 0} size="small" offset={[-2, 2]}>
                 <Button icon={<BellOutlined />} style={{ borderRadius: 10 }} />
               </Badge>
             </Dropdown>
 
-            <Dropdown
-              menu={{ items: accountMenuItems, onClick: handleAccountMenuClick }}
-              trigger={["click"]}
-            >
+            <Dropdown menu={{ items: accountMenuItems, onClick: handleAccountMenuClick }} trigger={["click"]}>
               <Tag
                 color={activeAccountName ? "blue" : "default"}
                 icon={<UserOutlined />}
@@ -324,25 +314,22 @@ export default function AppLayout() {
               </Tag>
             </Dropdown>
 
-            <Button
-              icon={<SettingOutlined />}
-              onClick={() => navigate("/settings")}
-              style={{ borderRadius: 10 }}
-            />
+            <Button icon={<SettingOutlined />} onClick={() => navigate("/settings")} style={{ borderRadius: 10 }} />
           </Space>
         </Header>
 
-        {/* 首次使用引导条 */}
         {noAccount && (
-          <div style={{
-            background: "linear-gradient(90deg, #fff7f0, #fff)",
-            borderBottom: "1px solid #ffd9b8",
-            padding: "10px 28px",
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-            flexWrap: "wrap",
-          }}>
+          <div
+            style={{
+              background: "linear-gradient(90deg, #fff7f0, #fff)",
+              borderBottom: "1px solid #ffd9b8",
+              padding: "10px 28px",
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
             <RocketOutlined style={{ color: "#e55b00", fontSize: 16 }} />
             <span style={{ fontWeight: 600, color: "#1a1a2e", fontSize: 13 }}>快速开始：</span>
             <Space size={6} wrap>
@@ -363,7 +350,6 @@ export default function AppLayout() {
           </div>
         )}
 
-        {/* Content */}
         <Content
           className="app-layout-content"
           style={{

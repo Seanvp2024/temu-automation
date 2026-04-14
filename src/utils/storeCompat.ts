@@ -6,6 +6,7 @@ import {
 
 type StoreLike = {
   get: (key: string) => Promise<any>;
+  getMany?: (keys: string[]) => Promise<Record<string, any>>;
 } | undefined;
 
 export const STORE_KEY_ALIASES = {
@@ -19,30 +20,74 @@ export const STORE_KEY_ALIASES = {
   qcDetail: ["temu_raw_qcDetail", "temu_qc_detail"],
 } as const;
 
-export async function getStoreValue(store: StoreLike, key: string) {
-  if (!store) return null;
+export async function getStoreValues(store: StoreLike, keys: readonly string[]) {
+  const result = Object.fromEntries(keys.map((key) => [key, null])) as Record<string, any>;
+  if (!store || keys.length === 0) return result;
 
-  if (ACCOUNT_SCOPED_BASE_KEYS.includes(key as typeof ACCOUNT_SCOPED_BASE_KEYS[number])) {
-    const activeAccountId = await store.get(ACTIVE_ACCOUNT_ID_KEY);
-    if (typeof activeAccountId === "string" && activeAccountId.trim()) {
-      const scopedValue = await store.get(buildScopedStoreKey(activeAccountId, key));
-      if (scopedValue !== null && scopedValue !== undefined) {
-        return scopedValue;
+  const uniqueKeys = Array.from(new Set(keys));
+  const scopedKeys = uniqueKeys.filter((key) =>
+    ACCOUNT_SCOPED_BASE_KEYS.includes(key as typeof ACCOUNT_SCOPED_BASE_KEYS[number]),
+  );
+
+  if (store.getMany) {
+    const baseValues = await store.getMany(
+      scopedKeys.length > 0
+        ? [ACTIVE_ACCOUNT_ID_KEY, ...uniqueKeys]
+        : uniqueKeys,
+    );
+    const activeAccountId = typeof baseValues?.[ACTIVE_ACCOUNT_ID_KEY] === "string" && baseValues[ACTIVE_ACCOUNT_ID_KEY].trim()
+      ? baseValues[ACTIVE_ACCOUNT_ID_KEY]
+      : null;
+
+    let scopedValues: Record<string, any> = {};
+    if (activeAccountId && scopedKeys.length > 0) {
+      const requestedScopedKeys = scopedKeys.map((key) => buildScopedStoreKey(activeAccountId, key));
+      scopedValues = await store.getMany(requestedScopedKeys);
+    }
+
+    for (const key of uniqueKeys) {
+      if (activeAccountId && scopedKeys.includes(key)) {
+        const scopedValue = scopedValues?.[buildScopedStoreKey(activeAccountId, key)];
+        result[key] = scopedValue !== null && scopedValue !== undefined ? scopedValue : (baseValues?.[key] ?? null);
+      } else {
+        result[key] = baseValues?.[key] ?? null;
       }
     }
+    return result;
   }
 
-  return await store.get(key);
+  let activeAccountId: string | null = null;
+  if (scopedKeys.length > 0) {
+    const rawActiveAccountId = await store.get(ACTIVE_ACCOUNT_ID_KEY);
+    activeAccountId = typeof rawActiveAccountId === "string" && rawActiveAccountId.trim() ? rawActiveAccountId : null;
+  }
+
+  for (const key of uniqueKeys) {
+    if (activeAccountId && scopedKeys.includes(key)) {
+      const scopedValue = await store.get(buildScopedStoreKey(activeAccountId, key));
+      if (scopedValue !== null && scopedValue !== undefined) {
+        result[key] = scopedValue;
+        continue;
+      }
+    }
+    result[key] = await store.get(key);
+  }
+
+  return result;
+}
+
+export async function getStoreValue(store: StoreLike, key: string) {
+  const values = await getStoreValues(store, [key]);
+  return values[key] ?? null;
 }
 
 export async function getFirstExistingStoreValue(
   store: StoreLike,
   keys: readonly string[],
 ) {
-  if (!store) return null;
-
+  const values = await getStoreValues(store, keys);
   for (const key of keys) {
-    const value = await getStoreValue(store, key);
+    const value = values[key];
     if (value !== null && value !== undefined) {
       return value;
     }

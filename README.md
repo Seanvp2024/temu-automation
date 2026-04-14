@@ -15,7 +15,14 @@ Detailed runtime and architecture notes live in `docs/runtime-architecture.md`.
 
 The Electron path is the only active product path in this repo.
 
-The `src-tauri/` workspace is legacy migration work that is not wired into the current frontend. It is being kept for reference only and should not be used for ongoing feature work unless we explicitly restart a Tauri migration.
+## Takeover snapshot (2026-04-11)
+
+- App version baseline: `0.1.65`
+- Working branch baseline: `master` tracking `origin/master`
+- Pre-existing in-progress work is centered on competitor analysis and Yunqi data integration rather than unrelated fixes.
+- The main feature slice already touches `src/App.tsx`, `src/components/Layout/AppLayout.tsx`, `src/pages/CompetitorAnalysis.tsx`, `electron/preload.cjs`, `electron/main.cjs`, `src/types/electron.d.ts`, `src/utils/multiStore.ts`, `automation/worker.mjs`, `automation/yunqi-db.mjs`, and local `logs/`.
+- Use `docs/runtime-architecture.md` for the current handoff matrix, data paths, and module status.
+- Use `docs/windows-distribution.md` for the current release gate and packaging checklist.
 
 ## Run commands
 
@@ -26,7 +33,6 @@ The `src-tauri/` workspace is legacy migration work that is not wired into the c
 - `npm run dist:win`: build a Windows NSIS installer into `release/`
 - `npm run pack:win`: build a portable unpacked Windows folder into `release/win-unpacked`
 - `npm run electron`: open Electron against an already-running dev server
-- `npm run tauri:legacy`: legacy Tauri command kept for reference only
 
 ## Quick start
 
@@ -48,10 +54,8 @@ For the static update site template, see `docs/static-update-site-template.md`.
 - `src/`: active React UI
 - `automation/worker.mjs`: active automation worker used by Electron
 - `automation/src/`: older TypeScript sidecar experiment, not part of the current runtime path
-- `src-tauri/`: legacy Tauri shell and commands, not the active app shell
 
 ## Maintenance rules
 
-- Build new features against the Electron bridge, not Tauri commands.
-- Treat `src-tauri/` as archived unless there is a deliberate migration plan.
+- Build new features against the Electron bridge.
 - When touching automation behavior, verify the call chain from `src/` to `electron/` to `automation/worker.mjs`.

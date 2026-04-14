@@ -20,7 +20,6 @@ export interface CollectTask {
   category: string;
 }
 
-// 全部65个采集任务（不含 icon，icon 在 UI 层处理）
 export const COLLECT_TASKS: CollectTask[] = [
   { key: "dashboard", label: "仪表盘概览", storeKey: "temu_dashboard", category: "核心数据" },
   { key: "products", label: "商品列表", storeKey: "temu_products", category: "核心数据" },
@@ -31,7 +30,7 @@ export const COLLECT_TASKS: CollectTask[] = [
   { key: "goodsData", label: "商品数据", storeKey: "temu_raw_goodsData", category: "商品数据" },
   { key: "lifecycle", label: "上新生命周期", storeKey: "temu_raw_lifecycle", category: "商品数据" },
   { key: "yunduOverall", label: "已加站点+处罚", storeKey: "temu_raw_yunduOverall", category: "商品数据" },
-  { key: "globalPerformance", label: "全球销量+地区明细", storeKey: "temu_raw_globalPerformance", category: "商品数据" },
+  { key: "globalPerformance", label: "动销详情 / 地区明细", storeKey: "temu_raw_globalPerformance", category: "商品数据" },
   { key: "yunduActivityList", label: "可报活动列表", storeKey: "temu_raw_yunduActivityList", category: "销售管理" },
   { key: "yunduQualityMetrics", label: "供应链质量指标", storeKey: "temu_raw_yunduQualityMetrics", category: "售后质量" },
   { key: "imageTask", label: "商品图片任务", storeKey: "temu_raw_imageTask", category: "商品数据" },
@@ -80,7 +79,7 @@ export const COLLECT_TASKS: CollectTask[] = [
   { key: "governComplaint", label: "投诉处理", storeKey: "temu_raw_governComplaint", category: "合规中心" },
   { key: "governViolationAppeal", label: "违规申诉", storeKey: "temu_raw_governViolationAppeal", category: "合规中心" },
   { key: "governMerchantAppeal", label: "商家申诉", storeKey: "temu_raw_governMerchantAppeal", category: "合规中心" },
-  { key: "governTro", label: "临时限制令", storeKey: "temu_raw_governTro", category: "合规中心" },
+  { key: "governTro", label: "临时限制件", storeKey: "temu_raw_governTro", category: "合规中心" },
   { key: "governEprBilling", label: "EPR计费", storeKey: "temu_raw_governEprBilling", category: "合规中心" },
   { key: "governComplianceReference", label: "合规性参考", storeKey: "temu_raw_governComplianceReference", category: "合规中心" },
   { key: "governCustomsAttribute", label: "清关属性维护", storeKey: "temu_raw_governCustomsAttribute", category: "合规中心" },
@@ -94,7 +93,7 @@ export const COLLECT_TASKS: CollectTask[] = [
   { key: "usRetrieval", label: "美国召回", storeKey: "temu_raw_usRetrieval", category: "其他" },
 ];
 
-export const TASK_CATEGORIES = Array.from(new Set(COLLECT_TASKS.map(t => t.category)));
+export const TASK_CATEGORIES = Array.from(new Set(COLLECT_TASKS.map((task) => task.category)));
 
 export type TaskStatus = "pending" | "running" | "success" | "error";
 
@@ -104,6 +103,57 @@ export interface TaskState {
   count?: number;
   duration?: number;
 }
+
+export const COLLECT_TASKS_BY_KEY = Object.fromEntries(
+  COLLECT_TASKS.map((task) => [task.key, task] as const),
+) as Record<string, CollectTask>;
+
+export const GROUP_CATEGORIES = ["经营与销售", "流量与推广", "质量与合规", "履约与售后", "其他"];
+
+export const COLLECT_GROUPS = [
+  {
+    key: "overview",
+    label: "经营与销售总览",
+    description: "聚合店铺概览、商品、销售和活动经营数据。",
+    category: "经营与销售",
+    taskKeys: ["dashboard", "products", "sales", "salesChart", "activity", "activityLog", "activityUS", "activityEU", "chanceGoods", "marketingActivity", "yunduActivityList"],
+  },
+  {
+    key: "product-data",
+    label: "商品基础与生命周期",
+    description: "补齐商品列表、生命周期、站点和样品等商品基础信息。",
+    category: "经营与销售",
+    taskKeys: ["goodsData", "lifecycle", "yunduOverall", "globalPerformance", "imageTask", "sampleManage"],
+  },
+  {
+    key: "traffic",
+    label: "流量与价格分析",
+    description: "同步商品级、店铺级流量以及价格相关看板。",
+    category: "流量与推广",
+    taskKeys: ["flux", "mallFlux", "mallFluxEU", "mallFluxUS", "fluxEU", "fluxUS", "flowGrow", "flowPrice", "retailPrice", "priceReport", "priceCompete"],
+  },
+  {
+    key: "fulfillment",
+    label: "履约与售后",
+    description: "查看备货、发货、退货和售后质量相关数据。",
+    category: "履约与售后",
+    taskKeys: ["orders", "urgentOrders", "shippingDesk", "shippingList", "addressManage", "delivery", "returnOrders", "returnDetail", "salesReturn", "returnReceipt", "exceptionNotice", "afterSales", "soldout", "performance", "yunduQualityMetrics", "checkup", "qualityDashboard", "qualityDashboardEU", "qcDetail"],
+  },
+  {
+    key: "compliance",
+    label: "合规与治理",
+    description: "补齐资质、投诉、EPR 和类目纠正等合规数据。",
+    category: "质量与合规",
+    taskKeys: ["governDashboard", "governProductQualification", "governQualificationAppeal", "governEprQualification", "governProductPhoto", "governComplianceInfo", "governResponsiblePerson", "governManufacturer", "governComplaint", "governViolationAppeal", "governMerchantAppeal", "governTro", "governEprBilling", "governComplianceReference", "governCustomsAttribute", "governCategoryCorrection", "usRetrieval"],
+  },
+  {
+    key: "ads",
+    label: "广告推广",
+    description: "汇总广告投放首页、商品推广、报表和通知数据。",
+    category: "流量与推广",
+    taskKeys: ["adsHome", "adsProduct", "adsReport", "adsFinance", "adsHelp", "adsNotification"],
+  },
+];
 
 function openCollectionNotification(successCount: number, errorCount: number, elapsed: number) {
   const title = errorCount > 0 ? "采集完成，部分任务失败" : "采集完成";
@@ -161,7 +211,6 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const collectionRunRef = useRef(0);
 
-  // 计时器
   useEffect(() => {
     if (!collecting) {
       if (timerRef.current) clearInterval(timerRef.current);
@@ -225,8 +274,8 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
     };
   }, [collecting]);
 
-  const successCount = Object.values(taskStates).filter(t => t.status === "success").length;
-  const errorCount = Object.values(taskStates).filter(t => t.status === "error").length;
+  const successCount = Object.values(taskStates).filter((task) => task.status === "success").length;
+  const errorCount = Object.values(taskStates).filter((task) => task.status === "error").length;
 
   const startCollectAll = useCallback(async () => {
     if (!api || collecting) return;
@@ -241,7 +290,9 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
     setProgress(0);
 
     const initStates: Record<string, TaskState> = {};
-    COLLECT_TASKS.forEach(t => { initStates[t.key] = { status: "pending", message: "排队中" }; });
+    COLLECT_TASKS.forEach((task) => {
+      initStates[task.key] = { status: "pending", message: "排队中" };
+    });
     setTaskStates(initStates);
 
     const syncedAt = new Date().toLocaleString("zh-CN");
@@ -254,8 +305,8 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
       let completed = 0;
       for (const task of COLLECT_TASKS) {
         if (isCancelled()) return;
-        const r = allResults[task.key];
-        if (r && r.success) {
+        const result = allResults[task.key];
+        if (result && result.success) {
           try {
             const data = await api.readScrapeData(task.key);
             if (isCancelled()) return;
@@ -279,28 +330,94 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
               } else {
                 await setStoreValueForActiveAccount(store, task.storeKey, storeData);
               }
+
+              // 流量日快照：将"今日"数据追加到 temu_flux_history
+              if (task.key === "flux" && storeData && typeof storeData === "object") {
+                try {
+                  const todayItems = storeData.itemsByRange?.["今日"] || storeData.itemsByRange?.["当天"] || [];
+                  if (todayItems.length > 0) {
+                    const today = new Date().toISOString().slice(0, 10);
+                    const snapshotItems = todayItems.map((item: any) => ({
+                      goodsId: item.goodsId || "",
+                      goodsName: item.goodsName || "",
+                      imageUrl: item.imageUrl || "",
+                      exposeNum: item.exposeNum ?? 0,
+                      clickNum: item.clickNum ?? 0,
+                      detailVisitNum: item.detailVisitNum ?? 0,
+                      buyerNum: item.buyerNum ?? 0,
+                      payGoodsNum: item.payGoodsNum ?? 0,
+                      addToCartUserNum: item.addToCartUserNum ?? 0,
+                      collectUserNum: item.collectUserNum ?? 0,
+                      searchExposeNum: item.searchExposeNum ?? 0,
+                      searchClickNum: item.searchClickNum ?? 0,
+                      recommendExposeNum: item.recommendExposeNum ?? 0,
+                      recommendClickNum: item.recommendClickNum ?? 0,
+                      clickPayRate: item.clickPayRate ?? 0,
+                      exposeClickRate: item.exposeClickRate ?? 0,
+                    }));
+                    const existing: any[] = (await store!.get("temu_flux_history")) || [];
+                    const filtered = existing.filter((s: any) => s.date !== today);
+                    filtered.push({ date: today, syncedAt, items: snapshotItems });
+                    filtered.sort((a: any, b: any) => a.date.localeCompare(b.date));
+                    const trimmed = filtered.slice(-60);
+                    await setStoreValueForActiveAccount(store, "temu_flux_history", trimmed);
+                  }
+                } catch (e) {
+                  console.warn("[flux-history] Failed to save daily snapshot:", e);
+                }
+
+                // 保存商品日趋势缓存（从 worker 返回的 __flux_product_daily_cache__）
+                try {
+                  const rawApis = Array.isArray(data?.apis) ? data.apis : [];
+                  const dailyCacheEntry = rawApis.find((a: any) => a.path === "__flux_product_daily_cache__");
+                  if (dailyCacheEntry?.data?.result) {
+                    const newCache = dailyCacheEntry.data.result;
+                    const existing: any = (await store!.get("temu_flux_product_history_cache")) || {};
+                    for (const [gid, gdata] of Object.entries(newCache) as [string, any][]) {
+                      if (!existing[gid]) existing[gid] = { stations: {} };
+                      for (const [site, sdata] of Object.entries(gdata.stations || {}) as [string, any][]) {
+                        existing[gid].stations[site] = sdata;
+                      }
+                    }
+                    await store!.set("temu_flux_product_history_cache", existing);
+                    console.log(`[flux-daily-cache] Saved daily trends for ${Object.keys(newCache).length} products`);
+                  }
+                } catch (e) {
+                  console.warn("[flux-daily-cache] Failed to save:", e);
+                }
+              }
             } else {
               await setStoreValueForActiveAccount(store, task.storeKey, { ...data, syncedAt });
             }
 
-            const displayCount = !PARSED_TASK_KEYS.has(task.key) ? count
-              : task.key === "products" ? (Array.isArray(storeData) ? storeData.length : count)
-              : task.key === "orders" ? (Array.isArray(storeData) ? storeData.length : count)
-              : task.key === "sales" ? (storeData?.items?.length || count)
-              : count;
+            const displayCount = !PARSED_TASK_KEYS.has(task.key)
+              ? count
+              : task.key === "products"
+                ? (Array.isArray(storeData) ? storeData.length : count)
+                : task.key === "orders"
+                  ? (Array.isArray(storeData) ? storeData.length : count)
+                  : task.key === "sales"
+                    ? (storeData?.items?.length || count)
+                    : count;
 
             diagnosticsTasks[task.key] = {
               status: "success",
               storeKey: task.storeKey,
               updatedAt: syncedAt,
               count: displayCount,
-              duration: r.duration,
+              duration: result.duration,
               message: `${displayCount} 条数据`,
             };
 
-            setTaskStates(prev => ({ ...prev, [task.key]: {
-              status: "success", count: displayCount, duration: r.duration, message: `${displayCount} 条数据`
-            }}));
+            setTaskStates((prev) => ({
+              ...prev,
+              [task.key]: {
+                status: "success",
+                count: displayCount,
+                duration: result.duration,
+                message: `${displayCount} 条数据`,
+              },
+            }));
           } catch (error: any) {
             if (isCancelled()) return;
             const detail = error?.message || "读取采集结果失败";
@@ -308,25 +425,35 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
               status: "error",
               storeKey: task.storeKey,
               updatedAt: syncedAt,
-              duration: r.duration,
+              duration: result.duration,
               message: detail.substring(0, 50),
             };
-            setTaskStates(prev => ({ ...prev, [task.key]: {
-              status: "error", duration: r.duration, message: detail.substring(0, 50)
-            }}));
+            setTaskStates((prev) => ({
+              ...prev,
+              [task.key]: {
+                status: "error",
+                duration: result.duration,
+                message: detail.substring(0, 50),
+              },
+            }));
           }
-        } else if (r) {
+        } else if (result) {
           if (isCancelled()) return;
           diagnosticsTasks[task.key] = {
             status: "error",
             storeKey: task.storeKey,
             updatedAt: syncedAt,
-            duration: r.duration,
-            message: r.error?.substring(0, 50) || "未知错误",
+            duration: result.duration,
+            message: result.error?.substring(0, 50) || "未知错误",
           };
-          setTaskStates(prev => ({ ...prev, [task.key]: {
-            status: "error", duration: r.duration, message: r.error?.substring(0, 50) || "未知错误"
-          }}));
+          setTaskStates((prev) => ({
+            ...prev,
+            [task.key]: {
+              status: "error",
+              duration: result.duration,
+              message: result.error?.substring(0, 50) || "未知错误",
+            },
+          }));
         } else {
           if (isCancelled()) return;
           diagnosticsTasks[task.key] = {
@@ -335,11 +462,15 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
             updatedAt: syncedAt,
             message: "未收到采集结果",
           };
-          setTaskStates(prev => ({ ...prev, [task.key]: {
-            status: "error", message: "未收到采集结果"
-          }}));
+          setTaskStates((prev) => ({
+            ...prev,
+            [task.key]: {
+              status: "error",
+              message: "未收到采集结果",
+            },
+          }));
         }
-        completed++;
+        completed += 1;
         setProgress(Math.round((completed / COLLECT_TASKS.length) * 100));
       }
 
@@ -348,22 +479,28 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
       const errorTotal = Object.values(diagnosticsTasks).filter((task) => task.status === "error").length;
       const finalElapsed = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
       openCollectionNotification(successTotal, errorTotal, finalElapsed);
-    } catch (e: any) {
+    } catch (error: any) {
       if (isCancelled()) return;
       notification.error({
         message: "采集失败",
-        description: e.message || "采集过程中出现异常",
+        description: error.message || "采集过程中出现异常",
         duration: 5,
         placement: "bottomRight",
       });
-      COLLECT_TASKS.forEach(t => {
-        diagnosticsTasks[t.key] = {
+      COLLECT_TASKS.forEach((task) => {
+        diagnosticsTasks[task.key] = {
           status: "error",
-          storeKey: t.storeKey,
+          storeKey: task.storeKey,
           updatedAt: syncedAt,
-          message: e.message?.substring(0, 50) || "采集失败",
+          message: error.message?.substring(0, 50) || "采集失败",
         };
-        setTaskStates(prev => ({ ...prev, [t.key]: { status: "error", message: e.message?.substring(0, 50) }}));
+        setTaskStates((prev) => ({
+          ...prev,
+          [task.key]: {
+            status: "error",
+            message: error.message?.substring(0, 50) || "采集失败",
+          },
+        }));
       });
       setProgress(100);
     }
@@ -400,8 +537,8 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
       },
     }));
     try {
-      const res = await api.scrapeDashboard();
-      const raw = (res as any)?.dashboard || res;
+      const result = await api.scrapeDashboard();
+      const raw = (result as any)?.dashboard || result;
       const data = parseDashboardData(raw);
       const syncedAt = new Date().toLocaleString("zh-CN");
       await setStoreValueForActiveAccount(store, "temu_dashboard", { ...data, syncedAt });
@@ -451,9 +588,9 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
           message: "仪表盘数据已同步",
         },
       }));
-      message.success("仪表盘数据同步成功!");
-    } catch (e: any) {
-      const detail = e?.message?.substring(0, 50) || "同步失败";
+      message.success("仪表盘数据同步成功");
+    } catch (error: any) {
+      const detail = error?.message?.substring(0, 50) || "同步失败";
       const updatedAt = new Date().toLocaleString("zh-CN");
       if (store) {
         try {
@@ -486,7 +623,7 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
           message: detail,
         },
       }));
-      message.error("同步失败: " + e.message);
+      message.error(`同步失败: ${error.message}`);
     } finally {
       setSyncingDashboard(false);
     }
@@ -495,11 +632,9 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
   const cancelCollection = useCallback(() => {
     if (!collecting) return;
     collectionRunRef.current += 1;
-    // 关闭 worker 的浏览器来中断采集
     api?.close?.().catch(() => {});
     setCollecting(false);
     setProgress(0);
-    // 把所有 running 状态改为 error
     setTaskStates((prev) => {
       const next = { ...prev };
       for (const key of Object.keys(next)) {
@@ -513,11 +648,20 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
   }, [collecting]);
 
   return (
-    <CollectionContext.Provider value={{
-      collecting, taskStates, progress, elapsed,
-      successCount, errorCount,
-      startCollectAll, cancelCollection, startSyncDashboard, syncingDashboard,
-    }}>
+    <CollectionContext.Provider
+      value={{
+        collecting,
+        taskStates,
+        progress,
+        elapsed,
+        successCount,
+        errorCount,
+        startCollectAll,
+        cancelCollection,
+        startSyncDashboard,
+        syncingDashboard,
+      }}
+    >
       {children}
     </CollectionContext.Provider>
   );

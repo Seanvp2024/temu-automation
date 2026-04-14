@@ -32,6 +32,15 @@ interface AutomationAPI {
   scrapeUSRetrieval: () => Promise<any>;
   scrapeDelivery: () => Promise<any>;
   scrapeGlobalPerformance: (range?: "1d" | "7d" | "30d") => Promise<any>;
+  scrapeFluxProductDetail: (params: {
+    siteLabel?: string;
+    goodsId?: number | string;
+    spuId?: number | string;
+    skcId?: number | string;
+    skuId?: number | string;
+    title?: string;
+    rangeLabel?: string;
+  }) => Promise<any>;
   scrapeSkcRegionDetail: (productId: number | string, range?: "1d" | "7d" | "30d") => Promise<any>;
   yunduListOverall: (params?: { pageNo?: number; pageSize?: number; isLack?: boolean }) => Promise<any>;
   yunduSiteCount: (params?: { skcIds?: number[] }) => Promise<any>;
@@ -108,6 +117,7 @@ interface ImageStudioAPI {
   openExternal: () => Promise<string>;
   analyze: (payload: { files: NativeImagePayload[]; productMode: string }) => Promise<ImageStudioAnalysis>;
   regenerateAnalysis: (payload: { files: NativeImagePayload[]; productMode: string; analysis: ImageStudioAnalysis }) => Promise<Pick<ImageStudioAnalysis, "sellingPoints" | "targetAudience" | "usageScenes">>;
+  translate: (payload: { texts: string[] }) => Promise<{ translations: string[] }>;
   generatePlans: (payload: { analysis: ImageStudioAnalysis; imageTypes: string[]; salesRegion: string; imageSize: string; productMode: string }) => Promise<ImageStudioPlan[]>;
   startGenerate: (payload: { jobId?: string; files: NativeImagePayload[]; plans: ImageStudioPlan[]; productMode: string; salesRegion?: string; runInBackground?: boolean; imageLanguage: string; imageSize: string; productName?: string }) => Promise<ImageStudioGenerateStarted>;
   cancelGenerate: (jobId: string) => Promise<{ cancelled: boolean; jobId: string }>;
@@ -133,13 +143,181 @@ interface AppAPI {
 
 interface StoreAPI {
   get: (key: string) => Promise<any>;
+  getMany: (keys: string[]) => Promise<Record<string, any>>;
   set: (key: string, data: any) => Promise<boolean>;
+  setMany: (entries: Record<string, any>) => Promise<boolean>;
+}
+
+interface YunqiPriceEntry {
+  date?: string;
+  region?: string;
+  price?: number;
+  currency?: string;
+  marketPrice?: number | null;
+}
+
+interface YunqiDailySalesPoint {
+  date?: string;
+  sales?: number;
+}
+
+interface YunqiProductFields {
+  title: string;
+  price: number;
+  priceText: string;
+  imageUrl?: string;
+  imageUrls?: string[];
+  originalPrice?: number;
+  score?: number;
+  rating?: number;
+  reviewCount?: number;
+  salesText?: string;
+  dailySales?: number;
+  weeklySales?: number;
+  monthlySales?: number;
+  totalWeeklySales?: number;
+  totalMonthlySales?: number;
+  weeklySalesPercentage?: number;
+  monthlySalesPercentage?: number;
+  totalSales?: number;
+  dailySalesList?: YunqiDailySalesPoint[];
+  currency?: string;
+  marketPrice?: number | null;
+  usdPrice?: number | null;
+  eurPrice?: number | null;
+  prices?: YunqiPriceEntry[];
+  priceList?: any[];
+  usdGmv?: number;
+  eurGmv?: number;
+  images: string[];
+  videoUrl?: string;
+  goodsId?: string;
+  skuId?: string;
+  category?: string;
+  categoryName?: string;
+  titleEn?: string;
+  titleZh?: string;
+  originalTitle?: string;
+  commentNumTips?: string;
+  mall?: string;
+  mallName?: string;
+  mallId?: string;
+  mallScore?: number | null;
+  mallTotalGoods?: number | null;
+  brand?: string;
+  region?: string;
+  optId?: string | number;
+  optIds?: Array<string | number>;
+  labels?: any[];
+  tags?: any[];
+  customTags?: any[];
+  tagIds?: Array<string | number>;
+  wareHouseType?: number;
+  activityType?: string;
+  createdAt?: string;
+  issuedDate?: string;
+  lastModified?: string;
+  soldOut?: boolean;
+  lastSoldOutAt?: string;
+  sameNum?: number;
+  adRecords?: any[];
+  lastAdTime?: string;
+  adult?: boolean;
+  url?: string;
+  scrapedAt?: string;
+  raw?: Record<string, any>;
+}
+
+interface CompetitorSearchResult extends YunqiProductFields {
+  imageUrl: string;
+  productUrl: string;
+  position: number;
+}
+
+interface CompetitorProductSnapshot extends YunqiProductFields {
+  url: string;
+  scrapedAt: string;
+  matchStatus?: "exact" | "not_matched";
+  requestedGoodsId?: string;
+  candidates?: Array<{ goodsId: string; title: string }>;
+  screenshot?: string;
+  error?: string | null;
+}
+
+interface CompetitorSearchResponse {
+  products: CompetitorSearchResult[];
+  keyword: string;
+  region: string;
+  totalFound: number;
+  scrapedAt: string;
+  screenshot?: string;
+}
+
+interface CompetitorBatchTrackResponse {
+  results: (CompetitorProductSnapshot & { url: string })[];
+  total: number;
+  success: number;
+  scrapedAt: string;
+}
+
+interface CompetitorAutoRegisterResult {
+  success: boolean;
+  email: string;
+  region: string;
+  registeredAt: string;
+  message: string;
+}
+
+interface CompetitorAPI {
+  search: (params: { keyword: string; maxResults?: number; region?: string; wareHouseType?: number }) => Promise<CompetitorSearchResponse>;
+  track: (params: { url?: string; goodsId?: string; wareHouseType?: number; allowNotMatched?: boolean }) => Promise<CompetitorProductSnapshot>;
+  batchTrack: (params: { urls: string[] }) => Promise<CompetitorBatchTrackResponse>;
+  autoRegister: (params?: { region?: string }) => Promise<CompetitorAutoRegisterResult>;
+  setYunqiToken: (token: string) => Promise<{ success: boolean }>;
+  getYunqiToken: () => Promise<{ hasToken?: boolean; token: string | null; tokenPreview?: string | null }>;
+  fetchYunqiToken: () => Promise<{
+    success: boolean;
+    token: string | null;
+    tokenPreview?: string | null;
+    source?: string | null;
+    openedPage?: boolean;
+    waitedForLogin?: boolean;
+    savedAt?: string;
+  }>;
+  setYunqiCredentials: (params: { account: string; password: string }) => Promise<{ success: boolean; account: string }>;
+  getYunqiCredentials: () => Promise<{ hasCredentials: boolean; account: string | null }>;
+  deleteYunqiCredentials: () => Promise<{ success: boolean }>;
+  yunqiAutoLogin: () => Promise<{
+    success: boolean;
+    token: string | null;
+    tokenPreview?: string | null;
+    autoLogin?: boolean;
+    alreadyLoggedIn?: boolean;
+  }>;
+}
+
+interface YunqiDbAPI {
+  import: (params: { filePath: string }) => Promise<{ batchId: string; imported: number; skipped: number; total: number }>;
+  search: (params: {
+    keyword?: string; mallName?: string; mallMode?: string; category?: string;
+    minPrice?: number; maxPrice?: number; minDailySales?: number;
+    sortBy?: string; sortOrder?: string; page?: number; pageSize?: number;
+  }) => Promise<{ items: any[]; total: number; page: number; pageSize: number; totalPages: number }>;
+  stats: () => Promise<any>;
+  top: (params?: { field?: string; limit?: number }) => Promise<any[]>;
+  info: () => Promise<{ dbPath: string; rowCount: number }>;
+  syncOnline: (params: { keywords: string[]; maxPages?: number; wareHouseType?: number | null }) => Promise<{
+    results: { keyword: string; fetched: number; imported: number; skipped: number; batchId: string }[];
+    totalImported: number; totalSkipped: number; syncedAt: string; dbRowCount: number;
+  }>;
 }
 
 interface ElectronAPI {
   getAppPath: () => Promise<string>;
   selectFile: (filters?: any) => Promise<string | null>;
   automation: AutomationAPI;
+  competitor: CompetitorAPI;
+  yunqiDb: YunqiDbAPI;
   imageStudio: ImageStudioAPI;
   app: AppAPI;
   store: StoreAPI;

@@ -61,6 +61,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("automation:scrape-delivery"),
     scrapeGlobalPerformance: (range) =>
       ipcRenderer.invoke("automation:scrape-global-performance", { range: range || "30d" }),
+    scrapeFluxProductDetail: (params) =>
+      ipcRenderer.invoke("automation:scrape-flux-product-detail", params || {}),
     scrapeSkcRegionDetail: (productId, range) =>
       ipcRenderer.invoke("automation:scrape-skc-region-detail", { productId, range: range || "30d" }),
     yunduListOverall: (params) => ipcRenderer.invoke("automation:yundu-list-overall", params || {}),
@@ -88,6 +90,29 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("automation:ping"),
   },
 
+  competitor: {
+    search: (params) => ipcRenderer.invoke("competitor:search", params),
+    track: (params) => ipcRenderer.invoke("competitor:track", params),
+    batchTrack: (params) => ipcRenderer.invoke("competitor:batch-track", params),
+    autoRegister: (params) => ipcRenderer.invoke("competitor:auto-register", params),
+    setYunqiToken: (token) => ipcRenderer.invoke("competitor:set-yunqi-token", token),
+    getYunqiToken: () => ipcRenderer.invoke("competitor:get-yunqi-token"),
+    fetchYunqiToken: () => ipcRenderer.invoke("competitor:fetch-yunqi-token"),
+    setYunqiCredentials: (params) => ipcRenderer.invoke("competitor:set-yunqi-credentials", params),
+    getYunqiCredentials: () => ipcRenderer.invoke("competitor:get-yunqi-credentials"),
+    deleteYunqiCredentials: () => ipcRenderer.invoke("competitor:delete-yunqi-credentials"),
+    yunqiAutoLogin: () => ipcRenderer.invoke("competitor:yunqi-auto-login"),
+  },
+
+  yunqiDb: {
+    import: (params) => ipcRenderer.invoke("yunqi-db:import", params),
+    search: (params) => ipcRenderer.invoke("yunqi-db:search", params),
+    stats: () => ipcRenderer.invoke("yunqi-db:stats"),
+    top: (params) => ipcRenderer.invoke("yunqi-db:top", params),
+    info: () => ipcRenderer.invoke("yunqi-db:info"),
+    syncOnline: (params) => ipcRenderer.invoke("yunqi-db:sync-online", params),
+  },
+
   imageStudio: {
     getStatus: () => ipcRenderer.invoke("image-studio:get-status"),
     ensureRunning: () => ipcRenderer.invoke("image-studio:ensure-running"),
@@ -97,6 +122,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
     openExternal: () => ipcRenderer.invoke("image-studio:open-external"),
     analyze: (payload) => ipcRenderer.invoke("image-studio:analyze", payload),
     regenerateAnalysis: (payload) => ipcRenderer.invoke("image-studio:regenerate-analysis", payload),
+    translate: (payload) => ipcRenderer.invoke("image-studio:translate", payload),
     generatePlans: (payload) => ipcRenderer.invoke("image-studio:generate-plans", payload),
     startGenerate: (payload) => ipcRenderer.invoke("image-studio:start-generate", payload),
     cancelGenerate: (jobId) => ipcRenderer.invoke("image-studio:cancel-generate", jobId),
@@ -138,6 +164,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   store: {
     get: (key) => ipcRenderer.invoke("store:get", key),
+    getMany: (keys) => ipcRenderer.invoke("store:get-many", Array.isArray(keys) ? keys : []),
     set: (key, data) => {
       // 先 JSON roundtrip 清除不可序列化的内容（Buffer、circular ref 等），避免 IPC 结构化克隆失败
       try {
@@ -146,6 +173,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
       } catch (e) {
         console.error("[preload] store:set serialize error for key=" + key, e.message);
         return ipcRenderer.invoke("store:set", key, null);
+      }
+    },
+    setMany: (entries) => {
+      try {
+        const safe = JSON.parse(JSON.stringify(entries && typeof entries === "object" ? entries : {}));
+        return ipcRenderer.invoke("store:set-many", safe);
+      } catch (e) {
+        console.error("[preload] store:setMany serialize error", e.message);
+        return ipcRenderer.invoke("store:set-many", {});
       }
     },
   },

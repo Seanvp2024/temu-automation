@@ -2,6 +2,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const http = require("http");
+const net = require("net");
 const { spawn, spawnSync } = require("child_process");
 
 const repoRoot = path.resolve(__dirname, "..");
@@ -9,6 +10,30 @@ const workerEntry = path.join(repoRoot, "automation", "worker-entry.cjs");
 const distIndex = path.join(repoRoot, "dist", "index.html");
 const imageRuntimeEntry = path.join(repoRoot, "build", "auto-image-gen-runtime", "bootstrap.cjs");
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "temu-smoke-"));
+
+function reservePort(preferredPort = 0) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen({ host: "127.0.0.1", port: preferredPort }, () => {
+      const address = server.address();
+      const port = address && typeof address === "object" ? address.port : preferredPort;
+      server.close((closeError) => {
+        if (closeError) reject(closeError);
+        else resolve(port);
+      });
+    });
+  });
+}
+
+async function findAvailablePort(preferredPort = 0) {
+  try {
+    return await reservePort(preferredPort);
+  } catch {
+    return reservePort(0);
+  }
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -130,7 +155,7 @@ async function withSpawnedProcess(options, verify) {
 }
 
 async function checkWorker() {
-  const port = 19321;
+  const port = await findAvailablePort(19321);
   const smokeToken = "smoke-test-token";
   const appUserData = path.join(tmpRoot, "worker-user-data");
   fs.mkdirSync(appUserData, { recursive: true });
@@ -180,7 +205,7 @@ async function checkWorker() {
 }
 
 async function checkImageRuntime() {
-  const port = 3321;
+  const port = await findAvailablePort(3321);
   await withSpawnedProcess(
     {
       label: "image-runtime",
@@ -226,6 +251,7 @@ function checkReleasePrereqs() {
 }
 
 async function main() {
+  let success = false;
   try {
     assertFileExists(distIndex, "dist index");
     assertFileExists(workerEntry, "worker entry");
@@ -235,10 +261,15 @@ async function main() {
     await checkImageRuntime();
     console.log("");
     console.log("Smoke checks passed.");
+    success = true;
   } finally {
-    try {
-      fs.rmSync(tmpRoot, { recursive: true, force: true });
-    } catch {}
+    if (success) {
+      try {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
+    } else {
+      console.error(`Smoke artifacts directory: ${tmpRoot}`);
+    }
   }
 }
 

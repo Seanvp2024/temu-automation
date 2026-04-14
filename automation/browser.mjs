@@ -51,6 +51,81 @@ async function findVisibleInput(page, selectors = []) {
   return null;
 }
 
+async function readInputMeta(input) {
+  try {
+    return await input.evaluate((node) => {
+      const rect = node.getBoundingClientRect();
+      return {
+        id: node.id || "",
+        name: node.getAttribute("name") || "",
+        type: node.getAttribute("type") || "",
+        placeholder: node.getAttribute("placeholder") || "",
+        autocomplete: node.getAttribute("autocomplete") || "",
+        value: node.value || "",
+        width: Math.round(rect.width || 0),
+        height: Math.round(rect.height || 0),
+      };
+    });
+  } catch {
+    return {
+      id: "",
+      name: "",
+      type: "",
+      placeholder: "",
+      autocomplete: "",
+      value: "",
+      width: 0,
+      height: 0,
+    };
+  }
+}
+
+function isLikelyCountryCodeInput(meta = {}) {
+  const value = String(meta?.value || "").trim();
+  const placeholder = String(meta?.placeholder || "").trim();
+  const id = String(meta?.id || "").trim();
+  const name = String(meta?.name || "").trim();
+  const width = Number(meta?.width) || 0;
+
+  if (id === "usernameId" || name === "usernameId") return false;
+  if (name === "phone" || name === "mobile") return false;
+  if (placeholder.includes("手机") || placeholder.includes("号码")) return false;
+  if (/^\+\d+$/.test(value)) return true;
+  if (!placeholder && !id && !name && width > 0 && width <= 120) return true;
+  return false;
+}
+
+async function findLoginPhoneInput(page) {
+  const selectorGroups = [
+    ['#usernameId', 'input[name="usernameId"]'],
+    ['input[placeholder="手机号码"]', 'input[placeholder*="手机号码"]', 'input[placeholder*="手机号"]', 'input[placeholder*="手机"]', 'input[placeholder*="号码"]'],
+    ['input[name="phone"]', 'input[name="mobile"]', 'input[autocomplete="username"]'],
+    ['input[type="tel"]', 'input[inputmode="numeric"]'],
+  ];
+
+  for (const selectors of selectorGroups) {
+    for (const selector of selectors) {
+      const locator = page.locator(selector);
+      const count = await locator.count().catch(() => 0);
+      for (let index = 0; index < count; index += 1) {
+        const candidate = locator.nth(index);
+        const visible = await candidate.isVisible().catch(() => false);
+        const editable = await candidate.isEditable().catch(() => false);
+        if (!visible || !editable) continue;
+        const meta = await readInputMeta(candidate);
+        if (isLikelyCountryCodeInput(meta)) continue;
+        return { input: candidate, meta, selector, index };
+      }
+    }
+  }
+
+  const fallback = await findVisibleInput(page, ['input:not([type="hidden"]):not([disabled])']);
+  if (!fallback) return null;
+  const meta = await readInputMeta(fallback);
+  if (isLikelyCountryCodeInput(meta)) return null;
+  return { input: fallback, meta, selector: 'input:not([type="hidden"]):not([disabled])', index: 0 };
+}
+
 async function fillInputVerified(input, value, options = {}) {
   const {
     label = "输入框",

@@ -23,6 +23,7 @@ import {
   PlayCircleOutlined,
   ReloadOutlined,
 } from "@ant-design/icons";
+import type { ColumnsType } from "antd/es/table";
 import PageHeader from "../components/PageHeader";
 import StatCard from "../components/StatCard";
 
@@ -30,7 +31,6 @@ const { Dragger } = Upload;
 const { Title, Text } = Typography;
 
 const api = window.electronAPI?.automation;
-
 const SUCCESS_COLOR = "var(--color-success)";
 
 function extractCellTexts(value: any, seen = new WeakSet<object>()): string[] {
@@ -126,18 +126,18 @@ function getResultSuccessDetail(item: any) {
     skuId ? `SKU ID: ${skuId}` : "",
   ].filter(Boolean);
 
-  return parts.join(" · ") || "保存成功";
+  return parts.join(" · ") || "已保存";
 }
 
 function getBatchStatusLabel(status: string, running: boolean, paused: boolean) {
   if (paused) return "已暂停";
   if (status === "paused") return "已暂停";
   if (status === "pausing") return "暂停中";
-  if (running || status === "running") return "进行中";
+  if (running || status === "running") return "处理中";
   if (status === "completed") return "已完成";
   if (status === "failed") return "失败";
   if (status === "interrupted") return "已中断";
-  return "待启动";
+  return "待开始";
 }
 
 function getBatchTagColor(status: string, running: boolean, paused: boolean) {
@@ -160,7 +160,7 @@ function getHistoryStatusColor(status: string) {
 }
 
 function getHistoryStatusText(status: string) {
-  if (status === "running") return "进行中";
+  if (status === "running") return "处理中";
   if (status === "pausing") return "暂停中";
   if (status === "paused") return "已暂停";
   if (status === "completed") return "已完成";
@@ -169,10 +169,49 @@ function getHistoryStatusText(status: string) {
   return status || "未知状态";
 }
 
-function BatchCreate() {
+function normalizeBatchReason(messageText: string) {
+  const text = String(messageText || "").trim();
+  if (!text) return "请稍后重试";
 
+  if (/分类搜索失败/i.test(text)) return "类目暂未匹配成功，请补充更准确的类目信息后重试";
+  if (/timeout|Execution context|page\.goto|worker|ipc/i.test(text)) return "页面响应较慢或连接中断，请重新尝试";
+  if (/登录|authentication|seller-login/i.test(text)) return "登录状态已失效，请重新登录后再试";
+  if (/quota|额度|403/i.test(text)) return "当前图片生成额度不足，请稍后再试";
+  if (/图片|image|upload/i.test(text) && /失败|error/i.test(text)) return "图片处理未完成，请稍后重试";
+  if (/草稿|draft/i.test(text) && /失败|error/i.test(text)) return "草稿保存未完成，请稍后重试";
+
+  return text;
+}
+
+function getUserFacingTaskMessage(progressInfo: any, count: number) {
+  const total = Number(progressInfo?.total || count || 0);
+  const completed = Number(progressInfo?.completed || 0);
+  const currentIndex = total > 0 ? Math.min(completed + 1, total) : 0;
+
+  if (progressInfo?.status === "completed") return "本批商品已处理完成。";
+  if (progressInfo?.status === "failed" || progressInfo?.status === "interrupted") {
+    return normalizeBatchReason(progressInfo?.message || "本批商品已停止处理");
+  }
+  if (progressInfo?.status === "pausing") return "暂停请求已发送，当前商品处理完后会停下。";
+  if (progressInfo?.status === "paused") return "当前批次已暂停，可随时继续。";
+  if (progressInfo?.running || progressInfo?.status === "running") {
+    return currentIndex > 0 && total > 0
+      ? `正在处理第 ${currentIndex} / ${total} 个商品，请稍候。`
+      : "正在准备当前批次，请稍候。";
+  }
+  return "选好表格后就可以开始批量生成商品草稿。";
+}
+
+type PreviewState = {
+  headers: any[];
+  rows: any[][];
+  total: number;
+  detected: Record<string, number>;
+} | null;
+
+function BatchCreate() {
   const [filePath, setFilePath] = useState("");
-  const [preview, setPreview] = useState<any>(null);
+  const [preview, setPreview] = useState<PreviewState>(null);
   const [startRow, setStartRow] = useState(0);
   const [count, setCount] = useState(5);
   const [running, setRunning] = useState(false);
@@ -211,41 +250,6 @@ function BatchCreate() {
     if (typeof task.count === "number" && task.count > 0) setCount(task.count);
   };
 
-  const pollProgress = (taskId?: string, suppressNotice = false) => {
-    stopPolling();
-    progressRef.current = setInterval(async () => {
-      try {
-        const snapshot = taskId ? await api?.getTaskProgress?.(taskId) : await api?.getProgress?.();
-        if (!snapshot) return;
-
-        applyTaskSnapshot(snapshot);
-        syncTaskHistory(snapshot);
-
-        const finished = !snapshot.running
-          && ["completed", "failed", "interrupted"].includes(snapshot.status || "")
-          && (snapshot.taskId || snapshot.completed > 0);
-        if (!finished) return;
-
-        stopPolling();
-        setRunning(false);
-        setPaused(false);
-        void refreshTaskHistory();
-
-        if (suppressNotice || !runningStateRef.current) return;
-
-        const successItems = Array.isArray(snapshot.results) ? snapshot.results.filter((item: any) => item.success).length : 0;
-        const failItems = Array.isArray(snapshot.results) ? snapshot.results.filter((item: any) => !item.success).length : 0;
-        if (snapshot.status === "completed") {
-          message.success(`自动上品完成：成功 ${successItems} 个，失败 ${failItems} 个`);
-        } else {
-          message.error(snapshot.message || "自动上品任务异常结束");
-        }
-      } catch {
-        // ignore polling errors
-      }
-    }, 2200);
-  };
-
   const refreshTaskHistory = async (preserveSelection = true) => {
     try {
       setHistoryLoading(true);
@@ -271,6 +275,41 @@ function BatchCreate() {
     }
   };
 
+  const pollProgress = (taskId?: string, suppressNotice = false) => {
+    stopPolling();
+    progressRef.current = setInterval(async () => {
+      try {
+        const snapshot = taskId ? await api?.getTaskProgress?.(taskId) : await api?.getProgress?.();
+        if (!snapshot) return;
+
+        applyTaskSnapshot(snapshot);
+        syncTaskHistory(snapshot);
+
+        const finished = !snapshot.running
+          && ["completed", "failed", "interrupted"].includes(snapshot.status || "")
+          && (snapshot.taskId || snapshot.completed > 0);
+        if (!finished) return;
+
+        stopPolling();
+        setRunning(false);
+        setPaused(false);
+        void refreshTaskHistory();
+
+        if (suppressNotice || !runningStateRef.current) return;
+
+        const successItems = Array.isArray(snapshot.results) ? snapshot.results.filter((item: any) => item.success).length : 0;
+        const failItems = Array.isArray(snapshot.results) ? snapshot.results.filter((item: any) => !item.success).length : 0;
+        if (snapshot.status === "completed") {
+          message.success(`批量创建完成：成功 ${successItems} 个，失败 ${failItems} 个`);
+        } else {
+          message.error(normalizeBatchReason(snapshot.message || "本批商品未完成处理"));
+        }
+      } catch {
+        // ignore
+      }
+    }, 2200);
+  };
+
   const restoreTaskView = async (taskId: string) => {
     if (!taskId) return;
     try {
@@ -283,9 +322,9 @@ function BatchCreate() {
       } else {
         stopPolling();
       }
-      message.success("已恢复任务视图");
+      message.success("已恢复这批商品的处理记录");
     } catch (error: any) {
-      message.error(error?.message || "恢复任务失败");
+      message.error(error?.message || "恢复记录失败");
     }
   };
 
@@ -293,8 +332,8 @@ function BatchCreate() {
     try {
       const data = await api?.readScrapeData?.(`csv_preview:${nextFilePath}`);
       if (!data?.rows || data.rows.length === 0) {
-        message.info("文件路径已设置，可以直接开始自动上品");
         setPreview(null);
+        message.info("文件已载入，可以直接开始批量创建");
         return;
       }
 
@@ -303,7 +342,7 @@ function BatchCreate() {
         title: ["商品标题（中文）", "商品名称", "title"],
         mainImage: ["商品主图", "商品原图"],
         carousel: ["商品轮播图"],
-        category: ["后台分类", "前台分类（中文）"],
+        category: ["后台分类", "前台分类（中文）", "分类"],
         price: ["美元价格($)", "美元价格", "price"],
       };
 
@@ -339,7 +378,7 @@ function BatchCreate() {
       message.success(`已识别 ${dataRows.length} 个商品`);
     } catch {
       setPreview(null);
-      message.info("文件路径已设置，可以直接开始自动上品");
+      message.info("文件已载入，可以直接开始批量创建");
     }
   };
 
@@ -404,7 +443,7 @@ function BatchCreate() {
         pollProgress(snapshot.taskId, true);
       }
     } catch {
-      // ignore hydration errors
+      // ignore
     }
   };
 
@@ -422,10 +461,10 @@ function BatchCreate() {
       syncTaskHistory(task);
       if (task.running) {
         pollProgress(task.taskId, true);
-        message.success(paused ? "任务已继续" : "暂停请求已发送，当前商品处理完后停止");
+        message.success(paused ? "当前批次已继续处理" : "暂停请求已发送，当前商品处理完后会停下");
       } else {
         stopPolling();
-        message.success("任务已暂停");
+        message.success("当前批次已暂停");
       }
     } catch (error: any) {
       message.error(error?.message || "操作失败");
@@ -471,7 +510,7 @@ function BatchCreate() {
       status: "running",
       total: count,
       completed: 0,
-      current: "准备中...",
+      current: "准备中",
       step: "初始化",
       results: [],
     });
@@ -488,7 +527,7 @@ function BatchCreate() {
             pollProgress(response.task.taskId, true);
           }
         }
-        message.warning(response?.message || "已有自动上品任务在运行");
+        message.warning(response?.message || "当前已有批量创建任务在运行");
         return;
       }
 
@@ -496,13 +535,13 @@ function BatchCreate() {
         applyTaskSnapshot(response.task);
         syncTaskHistory(response.task);
       }
-      message.success("自动上品任务已启动");
+      message.success("批量创建已开始");
       void refreshTaskHistory(false);
       pollProgress(response?.task?.taskId);
     } catch (error: any) {
       setRunning(false);
       setPaused(false);
-      message.error(error?.message || "启动自动上品失败");
+      message.error(error?.message || "启动批量创建失败");
     }
   };
 
@@ -531,6 +570,7 @@ function BatchCreate() {
   );
   const batchStatusLabel = getBatchStatusLabel(progressInfo?.status, running, paused);
   const batchTagColor = getBatchTagColor(progressInfo?.status, running, paused);
+  const batchStatusMessage = getUserFacingTaskMessage(progressInfo, count);
   const currentFileName = filePath ? filePath.split(/[/\\]/).pop() : "未选择文件";
   const successCount = results.filter((item: any) => item.success).length;
   const failCount = results.filter((item: any) => !item.success).length;
@@ -538,9 +578,11 @@ function BatchCreate() {
   const progressPercent = progressTotal > 0 ? Math.round(((progressInfo?.completed || 0) / progressTotal) * 100) : 0;
   const completedCount = progressInfo?.completed || 0;
   const pendingCount = Math.max(progressTotal - completedCount, 0);
-  const previewRows = hasPreview
-    ? preview.rows.map((row: any[], index: number) => {
-      const detected = preview.detected || {};
+  const previewData = preview;
+
+  const previewRows = hasPreview && previewData
+    ? previewData.rows.map((row: any[], index: number) => {
+      const detected = previewData.detected || {};
       const titleText = detected.title >= 0 ? normalizeCellText(row[detected.title]) : "";
       const carouselText = detected.carousel >= 0 ? normalizeCellText(row[detected.carousel]) : "";
       const categoryText = detected.category >= 0 ? normalizeCategoryCellText(row[detected.category]) : "";
@@ -554,6 +596,7 @@ function BatchCreate() {
       };
     })
     : [];
+
   const visibleTaskHistory = taskHistory.slice(0, 3);
   const resultRows = results
     .map((item: any, index: number) => ({
@@ -563,10 +606,11 @@ function BatchCreate() {
       rowMeta: getResultRowMeta(item, index),
     }))
     .sort((left: any, right: any) => Number(left.success) - Number(right.success));
-  const failedReasonSummary = Object.entries(
+
+  const normalizedFailedReasonSummary = Object.entries(
     results.reduce<Record<string, number>>((acc, item: any) => {
       if (item?.success) return acc;
-      const reason = String(item?.message || "未返回错误信息").trim() || "未返回错误信息";
+      const reason = normalizeBatchReason(item?.message || "请稍后重试");
       acc[reason] = (acc[reason] || 0) + 1;
       return acc;
     }, {}),
@@ -574,23 +618,56 @@ function BatchCreate() {
     .sort((left, right) => right[1] - left[1])
     .slice(0, 3);
 
+  const resultColumns: ColumnsType<any> = [
+    {
+      title: "商品",
+      dataIndex: "displayName",
+      key: "displayName",
+      ellipsis: true,
+      render: (value: string, record: any) => (
+        <div>
+          <div style={{ fontWeight: 600, color: "var(--color-text)" }}>{value}</div>
+          <div style={{ fontSize: 13, color: "var(--color-text-sec)", marginTop: 4 }}>{record.rowMeta}</div>
+        </div>
+      ),
+    },
+    {
+      title: "结果",
+      dataIndex: "success",
+      key: "success",
+      width: 100,
+      render: (value: boolean) => (
+        <Tag color={value ? "success" : "error"} icon={value ? <CheckCircleOutlined /> : <CloseCircleOutlined />}>
+          {value ? "成功" : "失败"}
+        </Tag>
+      ),
+    },
+    {
+      title: "说明",
+      dataIndex: "message",
+      key: "message",
+      ellipsis: true,
+      render: (value: string, record: any) => record.success
+        ? <span style={{ color: SUCCESS_COLOR }}>{getResultSuccessDetail(record)}</span>
+        : <span style={{ color: "#ff4d4f" }}>{normalizeBatchReason(value || "请稍后重试")}</span>,
+    },
+  ];
+
   return (
     <Space direction="vertical" size="large" style={{ width: "100%" }}>
       <div className="create-flow-toolbar">
         <div className="create-flow-toolbar__summary">
-          <Text className="create-flow-toolbar__eyebrow">自动化上品流程</Text>
-          <Title level={4} style={{ margin: 0 }}>
-            上传商品表格
-          </Title>
+          <Text className="create-flow-toolbar__eyebrow">批量创建</Text>
+          <Title level={4} style={{ margin: 0 }}>上传商品表格</Title>
           <Text type="secondary" className="create-flow-toolbar__desc">
-            系统会自动识别标题、主图、轮播图、分类和价格列。确认无误后，可以先过滤高风险，再直接开始自动上品。
+            导入 Excel 或 CSV 后，系统会整理关键字段、可选过滤高风险商品，再批量生成 Temu 草稿。
           </Text>
           <Space wrap className="app-table-meta">
             <Tag color={batchTagColor}>{batchStatusLabel}</Tag>
-            {hasFile ? <Tag>{currentFileName}</Tag> : null}
-            {hasFile ? <Tag>{`从第 ${startRow + 1} 行开始`}</Tag> : <Tag>还没选择文件</Tag>}
+            {hasFile ? <Tag>{currentFileName}</Tag> : <Tag>还没有选择文件</Tag>}
+            {hasFile ? <Tag>{`从第 ${startRow + 1} 行开始`}</Tag> : null}
             {preview?.total ? <Tag color="blue">{`共 ${preview.total} 个商品`}</Tag> : null}
-            {hasFile ? <Tag>{`本次执行 ${count} 个`}</Tag> : null}
+            {hasFile ? <Tag>{`本次处理 ${count} 个`}</Tag> : null}
           </Space>
         </div>
 
@@ -601,7 +678,7 @@ function BatchCreate() {
               <InputNumber min={0} value={startRow} onChange={(value) => setStartRow(value || 0)} style={{ width: "100%" }} />
             </div>
             <div className="create-flow-toolbar__input">
-              <span className="create-flow-toolbar__label">上品数量</span>
+              <span className="create-flow-toolbar__label">处理数量</span>
               <InputNumber min={1} max={100} value={count} onChange={(value) => setCount(value || 1)} style={{ width: "100%" }} />
             </div>
           </div>
@@ -619,7 +696,7 @@ function BatchCreate() {
               过滤高风险
             </Button>
             <Button icon={<HistoryOutlined />} loading={historyLoading} onClick={() => void refreshTaskHistory()}>
-              刷新任务
+              刷新记录
             </Button>
             <Button
               type="primary"
@@ -629,7 +706,7 @@ function BatchCreate() {
               onClick={handleBatch}
               className="create-primary-button"
             >
-              {running ? "自动上品进行中..." : `开始自动上品（${count} 个）`}
+              {running ? "处理中..." : `开始批量创建（${count} 个）`}
             </Button>
             {running ? (
               <Button
@@ -638,7 +715,7 @@ function BatchCreate() {
                 className="create-secondary-button"
                 disabled={pausePending}
               >
-                {pausePending ? "暂停中..." : paused ? "继续任务" : "暂停任务"}
+                {pausePending ? "暂停中..." : paused ? "继续处理" : "暂停处理"}
               </Button>
             ) : null}
             {hasFile ? <Button onClick={resetSheetState}>清空文件</Button> : null}
@@ -672,9 +749,9 @@ function BatchCreate() {
                   <InboxOutlined style={{ color: "#fff", fontSize: 28 }} />
                 </div>
                 <div>
-                  <Title level={4} style={{ marginBottom: 8 }}>拖拽商品表格到这里</Title>
+                  <Title level={4} style={{ marginBottom: 8 }}>把商品表格拖到这里</Title>
                   <Text type="secondary" className="studio-dropzone__desc">
-                    支持 Excel / CSV，上传后会自动识别商品标题、图片、分类和价格列。
+                    支持 Excel / CSV。上传后会自动识别标题、图片、分类和价格列。
                   </Text>
                 </div>
                 <div className="studio-dropzone__actions">
@@ -697,15 +774,15 @@ function BatchCreate() {
             <div className="create-flow-hints">
               <div className="create-flow-hint">
                 <Text strong>1. 导入表格</Text>
-                <Text type="secondary">上传 Excel / CSV 后，系统自动识别关键字段。</Text>
+                <Text type="secondary">先导入 Excel 或 CSV，系统会自动识别关键字段。</Text>
               </div>
               <div className="create-flow-hint">
                 <Text strong>2. 过滤风险</Text>
-                <Text type="secondary">可先剔除液体、膏体、带电、IP 等高风险商品。</Text>
+                <Text type="secondary">可先剔除液体、膏体、带电和 IP 等高风险商品。</Text>
               </div>
               <div className="create-flow-hint">
-                <Text strong>3. 自动上品</Text>
-                <Text type="secondary">按数量批量生成 Temu 草稿，并持续回传进度和结果。</Text>
+                <Text strong>3. 批量创建</Text>
+                <Text type="secondary">确认预览无误后，直接批量生成商品草稿。</Text>
               </div>
             </div>
           </Space>
@@ -718,7 +795,7 @@ function BatchCreate() {
             <div>
               <Title level={4} style={{ margin: 0 }}>前 5 行预览</Title>
               <Text type="secondary" style={{ display: "block", marginTop: 6 }}>
-                这里只看自动化上品最关键的字段，确认标题、图片、分类和价格是否正常。
+                这里重点看标题、图片、分类和价格是否正确，确认后再开始处理。
               </Text>
             </div>
             {preview?.total ? <Tag color="blue">{`共 ${preview.total} 行可处理`}</Tag> : null}
@@ -744,14 +821,13 @@ function BatchCreate() {
           <Space direction="vertical" size={18} style={{ width: "100%" }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
               <div>
-                <Title level={4} style={{ margin: 0 }}>任务进度</Title>
+                <Title level={4} style={{ margin: 0 }}>处理进度</Title>
                 <Text type="secondary" style={{ display: "block", marginTop: 6 }}>
-                  {progressInfo?.current || "等待开始"} {progressInfo?.step ? `· ${progressInfo.step}` : ""}
+                  {batchStatusMessage}
                 </Text>
               </div>
               <Space wrap>
                 <Tag color={batchTagColor}>{batchStatusLabel}</Tag>
-                {progressInfo?.taskId ? <Tag>{`任务 ${progressInfo.taskId}`}</Tag> : null}
               </Space>
             </div>
 
@@ -772,7 +848,7 @@ function BatchCreate() {
       ) : null}
 
       {(progressInfo?.status === "failed" || progressInfo?.status === "interrupted") && progressInfo?.message ? (
-        <Alert type="error" showIcon message="任务执行异常" description={progressInfo.message} />
+        <Alert type="error" showIcon message="本批商品未完成处理" description={normalizeBatchReason(progressInfo.message)} />
       ) : null}
 
       {hasResults ? (
@@ -780,7 +856,7 @@ function BatchCreate() {
           <Space direction="vertical" size={18} style={{ width: "100%" }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
               <div>
-                <Title level={4} style={{ margin: 0 }}>执行结果</Title>
+                <Title level={4} style={{ margin: 0 }}>处理结果</Title>
               </div>
               <Space wrap>
                 <Tag color="blue">{`共 ${results.length} 条`}</Tag>
@@ -790,14 +866,14 @@ function BatchCreate() {
               </Space>
             </div>
 
-            {failedReasonSummary.length > 0 ? (
+            {normalizedFailedReasonSummary.length > 0 ? (
               <Alert
                 type="warning"
                 showIcon
-                message="失败原因汇总"
+                message="需要你处理的问题"
                 description={(
                   <div style={{ display: "grid", gap: 6 }}>
-                    {failedReasonSummary.map(([reason, count]) => (
+                    {normalizedFailedReasonSummary.map(([reason, count]) => (
                       <div key={reason} style={{ color: "var(--color-text-sec)" }}>
                         {count} 条：{reason}
                       </div>
@@ -809,40 +885,7 @@ function BatchCreate() {
 
             <Table
               dataSource={resultRows}
-              columns={[
-                {
-                  title: "商品",
-                  dataIndex: "displayName",
-                  key: "displayName",
-                  ellipsis: true,
-                  render: (value: string, record: any) => (
-                    <div>
-                      <div style={{ fontWeight: 600, color: "var(--color-text)" }}>{value}</div>
-                      <div style={{ fontSize: 12, color: "var(--color-text-sec)", marginTop: 4 }}>{record.rowMeta}</div>
-                    </div>
-                  ),
-                },
-                {
-                  title: "结果",
-                  dataIndex: "success",
-                  key: "success",
-                  width: 100,
-                  render: (value: boolean) => (
-                    <Tag color={value ? "success" : "error"} icon={value ? <CheckCircleOutlined /> : <CloseCircleOutlined />}>
-                      {value ? "成功" : "失败"}
-                    </Tag>
-                  ),
-                },
-                {
-                  title: "详情",
-                  dataIndex: "message",
-                  key: "message",
-                  ellipsis: true,
-                  render: (value: string, record: any) => record.success
-                    ? <span style={{ color: SUCCESS_COLOR }}>{getResultSuccessDetail(record)}</span>
-                    : <span style={{ color: "#ff4d4f" }}>{value || "未返回错误信息"}</span>,
-                },
-              ]}
+              columns={resultColumns}
               pagination={{ pageSize: 6, showSizeChanger: false, hideOnSinglePage: true }}
               size="small"
               scroll={{ x: 620 }}
@@ -854,7 +897,7 @@ function BatchCreate() {
       {visibleTaskHistory.length > 0 ? (
         <Card
           style={{ borderRadius: 22, borderColor: "#eceff4" }}
-          title="最近任务"
+          title="最近记录"
           extra={<Button size="small" icon={<ReloadOutlined />} onClick={() => void refreshTaskHistory()} loading={historyLoading}>刷新</Button>}
         >
           <div className="create-history-list">
@@ -875,12 +918,12 @@ function BatchCreate() {
                       </div>
                       {task.message ? (
                         <div className="create-history-item__meta" style={{ color: task.status === "failed" || task.status === "interrupted" ? "#ff4d4f" : "#66758a" }}>
-                          {task.message}
+                          {normalizeBatchReason(task.message)}
                         </div>
                       ) : null}
                     </div>
                     <Button size="small" onClick={() => void restoreTaskView(task.taskId)}>
-                      {task.running ? "继续跟踪" : "恢复"}
+                      {task.running ? "继续查看" : "恢复查看"}
                     </Button>
                   </div>
                 </div>
@@ -894,16 +937,16 @@ function BatchCreate() {
 }
 
 export default function ProductCreate() {
-  const pageDescription = "导入表格后，系统会自动识别字段、可选过滤高风险，再直接执行自动上品。";
+  const pageDescription = "导入表格后，系统会自动整理关键字段，可先过滤高风险商品，再批量生成商品草稿。";
 
   return (
     <div className="dashboard-shell product-create-shell">
       <PageHeader
         compact
-        eyebrow="自动化上品"
+        eyebrow="商品创建"
         title="上品管理"
         subtitle={pageDescription}
-        actions={<Tag color="orange">批量/API 主流程</Tag>}
+        actions={<Tag color="orange">批量创建</Tag>}
       />
 
       <div>

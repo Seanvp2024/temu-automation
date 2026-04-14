@@ -17,11 +17,11 @@ const ShopOverview = lazy(() => import("./pages/ShopOverview"));
 const AccountManager = lazy(() => import("./pages/AccountManager"));
 const ProductList = lazy(() => import("./pages/ProductList.tsx"));
 const ProductDetail = lazy(() => import("./pages/ProductDetail"));
-const TaskManager = lazy(() => import("./pages/TaskManager"));
 const Settings = lazy(() => import("./pages/Settings"));
 const ProductCreate = lazy(() => import("./pages/ProductCreate"));
 const ImageStudio = lazy(() => import("./pages/ImageStudio"));
-const Logs = lazy(() => import("./pages/Logs.tsx"));
+const Logs = lazy(() => import("./pages/Logs"));
+const CompetitorAnalysis = lazy(() => import("./pages/CompetitorAnalysis"));
 
 function RouteLoading() {
   return (
@@ -83,11 +83,13 @@ function App() {
           emitActiveAccountChanged(null);
         }
         await syncScopedDataToGlobalStore(store, null);
+        emitActiveAccountChanged(null);
         return;
       }
 
       if (activeAccountId && accounts.some((account: { id?: string }) => account?.id === activeAccountId)) {
         await syncScopedDataToGlobalStore(store, activeAccountId);
+        emitActiveAccountChanged(activeAccountId);
         return;
       }
 
@@ -96,6 +98,7 @@ function App() {
         emitActiveAccountChanged(null);
       }
       await syncScopedDataToGlobalStore(store, null);
+      emitActiveAccountChanged(null);
     };
 
     restoreActiveAccountData().catch(() => {});
@@ -134,7 +137,8 @@ function App() {
             <Route path="image-studio" element={<ImageStudio />} />
             <Route path="collect" element={<Dashboard />} />
             <Route path="accounts" element={<AccountManager />} />
-            <Route path="tasks" element={<TaskManager />} />
+            <Route path="tasks" element={<Navigate to="/collect" replace />} />
+            <Route path="competitor" element={<CompetitorAnalysis />} />
             <Route path="logs" element={<Logs />} />
             <Route path="settings" element={<Settings />} />
             {/* Legacy routes */}

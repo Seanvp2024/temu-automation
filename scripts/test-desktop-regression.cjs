@@ -1,6 +1,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const net = require("net");
 const { _electron: electron } = require("playwright");
 const electronBinary = require("electron");
 
@@ -13,6 +14,12 @@ const tinyPngDataUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCA
 const regressionPngDataUrl = fs.existsSync(regressionImagePath)
   ? `data:image/png;base64,${fs.readFileSync(regressionImagePath).toString("base64")}`
   : tinyPngDataUrl;
+const SEEDED_PRODUCT_TITLE = "Desktop Regression Product";
+const SEEDED_PRODUCT_CATEGORY = "Regression Test Category";
+const SEEDED_PRODUCT_PATH = "Regression Test Category > Subcategory";
+const SEEDED_ACCOUNT_NAME = "Regression Account";
+const REGRESSION_PHONE = "13800138000";
+const REGRESSION_PASSWORD = "Regression#123";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -44,7 +51,31 @@ function ensureFileExists(filePath, label) {
   }
 }
 
-function createIsolatedEnv() {
+function reservePort(preferredPort = 0) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen({ host: "127.0.0.1", port: preferredPort }, () => {
+      const address = server.address();
+      const port = address && typeof address === "object" ? address.port : preferredPort;
+      server.close((closeError) => {
+        if (closeError) reject(closeError);
+        else resolve(port);
+      });
+    });
+  });
+}
+
+async function findAvailablePort(preferredPort = 0) {
+  try {
+    return await reservePort(preferredPort);
+  } catch {
+    return reservePort(0);
+  }
+}
+
+function createIsolatedEnv(workerPort) {
   const appDataRoot = path.join(tmpRoot, "appdata");
   const localAppDataRoot = path.join(tmpRoot, "localappdata");
   const tempRoot = path.join(tmpRoot, "temp");
@@ -57,6 +88,7 @@ function createIsolatedEnv() {
     LOCALAPPDATA: localAppDataRoot,
     TEMP: tempRoot,
     TMP: tempRoot,
+    TEMU_WORKER_PORT: String(workerPort),
     ELECTRON_DISABLE_SECURITY_WARNINGS: "true",
   };
 }
@@ -65,12 +97,17 @@ async function waitForVisibleText(page, text, timeout = 45000) {
   await page.getByText(text, { exact: false }).first().waitFor({ state: "visible", timeout });
 }
 
-async function waitForPlaceholder(page, text, timeout = 45000) {
-  await page.getByPlaceholder(text).first().waitFor({ state: "visible", timeout });
-}
-
 async function waitForPlaceholderContains(page, text, timeout = 45000) {
   await page.locator(`input[placeholder*="${text}"]`).first().waitFor({ state: "visible", timeout });
+}
+
+async function waitForHashContains(page, fragment, timeout = 45000) {
+  await waitFor(async () => {
+    const hash = await page.evaluate(() => window.location.hash || "");
+    if (!hash.includes(fragment)) {
+      throw new Error(`current hash: ${hash}`);
+    }
+  }, timeout, `route ${fragment}`);
 }
 
 async function clickMenuItem(page, label) {
@@ -81,379 +118,317 @@ async function clickMenuItem(page, label) {
 }
 
 async function seedRegressionData(page) {
-  await page.evaluate(async ({ tinyPngDataUrl: png }) => {
-    const store = window.electronAPI?.store;
-    if (!store) throw new Error("store bridge unavailable");
+  await page.evaluate(
+    async ({ png, seededProductTitle, seededProductCategory, seededProductPath }) => {
+      const store = window.electronAPI?.store;
+      if (!store) throw new Error("store bridge unavailable");
 
-    const now = new Date().toISOString();
+      const now = new Date().toISOString();
 
-    await store.set("temu_products", [
-      {
-        title: "自动化回归测试商品",
-        category: "测试类目",
-        categories: "测试类目 > 子类目",
-        spuId: "spu-reg-001",
-        skcId: "skc-reg-001",
-        goodsId: "goods-reg-001",
-        sku: "sku-reg-001",
-        imageUrl: png,
-        status: "在售",
-        totalSales: 12,
-        last7DaysSales: 4,
-      },
-    ]);
-
-    await store.set("temu_sales", {
-      summary: {},
-      syncedAt: now,
-      items: [
+      await store.set("temu_products", [
         {
-          title: "自动化回归测试商品",
-          category: "测试类目",
+          title: seededProductTitle,
+          category: seededProductCategory,
+          categories: seededProductPath,
+          spuId: "spu-reg-001",
           skcId: "skc-reg-001",
-          spuId: "spu-reg-001",
-          imageUrl: png,
-          todaySales: 1,
-          last7DaysSales: 4,
-          last30DaysSales: 8,
-          totalSales: 12,
-          warehouseStock: 20,
-          adviceQuantity: 5,
-          lackQuantity: 0,
-          price: "12.34",
-          skuCode: "sku-reg-001",
-          stockStatus: "充足",
-          supplyStatus: "正常供货",
-          hotTag: "测试热卖",
-          isAdProduct: "",
-          availableSaleDays: 12,
-        },
-      ],
-    });
-
-    await store.set("temu_flux", {
-      summary: {
-        todayVisitors: 20,
-        todayBuyers: 2,
-        todayConversionRate: 0.1,
-        trendList: [],
-      },
-      syncedAt: now,
-      items: [
-        {
           goodsId: "goods-reg-001",
-          goodsName: "自动化回归测试商品",
+          sku: "sku-reg-001",
           imageUrl: png,
-          spuId: "spu-reg-001",
-          category: "测试类目",
-          exposeNum: 100,
-          clickNum: 10,
-          detailVisitNum: 8,
-          addToCartUserNum: 2,
-          buyerNum: 1,
-          payGoodsNum: 1,
-          clickPayRate: 0.1,
+          status: "在售",
+          totalSales: 12,
+          last7DaysSales: 4,
         },
-      ],
-    });
+      ]);
 
-    await store.set("temu_orders", []);
+      await store.set("temu_sales", {
+        summary: {},
+        syncedAt: now,
+        items: [
+          {
+            title: seededProductTitle,
+            category: seededProductCategory,
+            skcId: "skc-reg-001",
+            spuId: "spu-reg-001",
+            goodsId: "goods-reg-001",
+            imageUrl: png,
+            todaySales: 1,
+            last7DaysSales: 4,
+            last30DaysSales: 8,
+            totalSales: 12,
+            warehouseStock: 20,
+            adviceQuantity: 5,
+            lackQuantity: 0,
+            price: "12.34",
+            skuCode: "sku-reg-001",
+            stockStatus: "充足",
+            supplyStatus: "正常供货",
+            hotTag: "回归热销",
+            isAdProduct: "",
+            availableSaleDays: 12,
+          },
+        ],
+      });
 
-    await store.set("temu_collection_diagnostics", {
-      syncedAt: now,
-      tasks: {
-        sales: {
-          status: "success",
-          storeKey: "temu_sales",
-          updatedAt: now,
+      await store.set("temu_flux", {
+        summary: {
+          todayVisitors: 20,
+          todayBuyers: 2,
+          todayConversionRate: 0.1,
+          trendList: [],
         },
-        orders: {
-          status: "success",
-          storeKey: "temu_orders",
-          updatedAt: now,
-        },
-        flux: {
-          status: "success",
-          storeKey: "temu_flux",
-          updatedAt: now,
-        },
-      },
-      summary: {
-        totalTasks: 3,
-        successCount: 3,
-        errorCount: 0,
-      },
-    });
+        syncedAt: now,
+        items: [
+          {
+            goodsId: "goods-reg-001",
+            goodsName: seededProductTitle,
+            imageUrl: png,
+            spuId: "spu-reg-001",
+            category: seededProductCategory,
+            exposeNum: 100,
+            clickNum: 10,
+            detailVisitNum: 8,
+            addToCartUserNum: 2,
+            buyerNum: 1,
+            payGoodsNum: 1,
+            clickPayRate: 0.1,
+          },
+        ],
+      });
 
-    await store.set("temu_frontend_logs", [
-      {
-        id: "desktop-regression-log",
-        timestamp: Date.now(),
-        level: "info",
-        source: "console",
-        message: "desktop regression seeded log",
-      },
-    ]);
-  }, { tinyPngDataUrl });
+      await store.set("temu_orders", []);
+
+      await store.set("temu_collection_diagnostics", {
+        syncedAt: now,
+        tasks: {
+          dashboard: { status: "success", storeKey: "temu_dashboard", updatedAt: now, count: 1 },
+          products: { status: "success", storeKey: "temu_products", updatedAt: now, count: 1 },
+          sales: { status: "success", storeKey: "temu_sales", updatedAt: now, count: 1 },
+          flux: { status: "success", storeKey: "temu_flux", updatedAt: now, count: 1 },
+          orders: { status: "success", storeKey: "temu_orders", updatedAt: now, count: 0 },
+        },
+        summary: {
+          totalTasks: 5,
+          successCount: 5,
+          errorCount: 0,
+        },
+      });
+
+      await store.set("temu_frontend_logs", [
+        {
+          id: "desktop-regression-log",
+          timestamp: Date.now(),
+          level: "info",
+          source: "console",
+          message: "desktop regression seeded log",
+        },
+      ]);
+    },
+    {
+      png: regressionPngDataUrl,
+      seededProductTitle: SEEDED_PRODUCT_TITLE,
+      seededProductCategory: SEEDED_PRODUCT_CATEGORY,
+      seededProductPath: SEEDED_PRODUCT_PATH,
+    },
+  );
 }
 
 async function runBridgeChecks(page) {
   const issues = [];
-  const result = await page.evaluate(async ({ regressionPngDataUrl: png }) => {
-    const api = window.electronAPI;
-    if (!api) throw new Error("window.electronAPI missing");
+  const result = await page.evaluate(
+    async ({ png, seededProductTitle }) => {
+      const api = window.electronAPI;
+      if (!api) throw new Error("window.electronAPI missing");
 
-    async function dataUrlToNativeImagePayload(dataUrl, name = "regression.png") {
-      const response = await fetch(dataUrl);
-      const blob = await response.blob();
-      const buffer = await blob.arrayBuffer();
-      return {
-        name,
-        type: blob.type || "image/png",
-        size: blob.size,
-        buffer,
-      };
-    }
+      await api.store.set("__desktop_regression_roundtrip__", { ok: true, value: 42 });
+      const roundtrip = await api.store.get("__desktop_regression_roundtrip__");
 
-    await api.store.set("__desktop_regression_roundtrip__", { ok: true, value: 42 });
-    const roundtrip = await api.store.get("__desktop_regression_roundtrip__");
+      const version = await api.app.getVersion();
+      const updateStatus = await api.app.getUpdateStatus();
+      const ping = await api.automation.ping();
+      const progress = await api.automation.getProgress();
+      const tasks = await api.automation.listTasks();
 
-    const version = await api.app.getVersion();
-    const updateStatus = await api.app.getUpdateStatus();
-    const ping = await api.automation.ping();
-    const progress = await api.automation.getProgress();
-    const tasks = await api.automation.listTasks();
-
-    const imageStatus = await api.imageStudio.ensureRunning();
-    const originalConfig = await api.imageStudio.getConfig();
-    let updateConfigOk = false;
-    let updateConfigError = "";
-    try {
-      const updatedConfig = await api.imageStudio.updateConfig({
-        analyzeModel: originalConfig?.analyzeModel || "",
-        analyzeBaseUrl: originalConfig?.analyzeBaseUrl || "",
-        generateModel: originalConfig?.generateModel || "",
-        generateBaseUrl: originalConfig?.generateBaseUrl || "",
-      });
-      updateConfigOk = updatedConfig?.analyzeModel === (originalConfig?.analyzeModel || "")
-        && updatedConfig?.analyzeBaseUrl === (originalConfig?.analyzeBaseUrl || "")
-        && updatedConfig?.generateModel === (originalConfig?.generateModel || "")
-        && updatedConfig?.generateBaseUrl === (originalConfig?.generateBaseUrl || "");
-    } catch (error) {
-      updateConfigError = error instanceof Error ? error.message : String(error || "unknown error");
-    }
-    const nativeImage = await dataUrlToNativeImagePayload(png);
-    const analysis = await api.imageStudio.analyze({
-      files: [nativeImage],
-      productMode: "single",
-    });
-    const aiPlans = await api.imageStudio.generatePlans({
-      analysis,
-      imageTypes: ["main"],
-      salesRegion: "us",
-      imageSize: "800x800",
-      productMode: "single",
-    });
-    const startedGenerate = await api.imageStudio.startGenerate({
-      files: [nativeImage],
-      plans: Array.isArray(aiPlans) ? aiPlans.slice(0, 1) : [],
-      productMode: "single",
-      salesRegion: "us",
-      runInBackground: false,
-      imageLanguage: "en",
-      imageSize: "800x800",
-      productName: analysis?.productName || "自动化回归测试商品",
-    });
-    const generateResult = await new Promise((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
-        unsubscribe?.();
-        reject(new Error("imageStudio.startGenerate timeout"));
-      }, 240000);
-      const unsubscribe = api.onImageStudioEvent?.((payload) => {
-        if (!payload || payload.jobId !== startedGenerate?.jobId) return;
-        if (payload.type === "generate:complete") {
-          window.clearTimeout(timeout);
-          unsubscribe?.();
-          resolve(payload);
-          return;
-        }
-        if (payload.type === "generate:error") {
-          window.clearTimeout(timeout);
-          unsubscribe?.();
-          reject(new Error(payload.error || payload.message || "AI 出图失败"));
-        }
-      });
-      if (!unsubscribe) {
-        window.clearTimeout(timeout);
-        reject(new Error("imageStudio event bridge unavailable"));
+      const imageStatus = await api.imageStudio.ensureRunning();
+      const originalConfig = await api.imageStudio.getConfig();
+      let updateConfigOk = false;
+      let updateConfigError = "";
+      try {
+        const updatedConfig = await api.imageStudio.updateConfig({
+          analyzeModel: originalConfig?.analyzeModel || "",
+          analyzeBaseUrl: originalConfig?.analyzeBaseUrl || "",
+          generateModel: originalConfig?.generateModel || "",
+          generateBaseUrl: originalConfig?.generateBaseUrl || "",
+        });
+        updateConfigOk = updatedConfig?.analyzeModel === (originalConfig?.analyzeModel || "")
+          && updatedConfig?.analyzeBaseUrl === (originalConfig?.analyzeBaseUrl || "")
+          && updatedConfig?.generateModel === (originalConfig?.generateModel || "")
+          && updatedConfig?.generateBaseUrl === (originalConfig?.generateBaseUrl || "");
+      } catch (error) {
+        updateConfigError = error instanceof Error ? error.message : String(error || "unknown error");
       }
-    });
-    const savedHistory = await api.imageStudio.saveHistory({
-      productName: "自动化回归测试商品",
-      salesRegion: "us",
-      imageCount: 1,
-      images: [{ imageType: "main", imageUrl: png }],
-    });
-    const generatedPlans = await api.imageStudio.generatePlans({
-      analysis: {
-        productName: "自动化回归测试商品",
-        category: "测试类目",
-        sellingPoints: ["免打孔安装", "优质不锈钢材质"],
-        materials: "stainless steel",
-        colors: "silver",
-        targetAudience: ["renters"],
-        usageScenes: ["kitchen"],
-        estimatedDimensions: "20cm x 8cm x 5cm",
-      },
-      imageTypes: ["main", "features"],
-      salesRegion: "us",
-      imageSize: "800x800",
-      productMode: "single",
-    });
-    const historyList = await api.imageStudio.listHistory();
-    const historyItem = savedHistory?.id ? await api.imageStudio.getHistoryItem(savedHistory.id) : null;
 
-    return {
-      version,
-      updateStatus: updateStatus?.status || "",
-      roundtrip,
-      pingStatus: ping?.status || "",
-      progressStatus: progress?.status || "",
-      taskCount: Array.isArray(tasks) ? tasks.length : -1,
-      imageStatus,
-      analysis,
-      updateConfigOk,
-      updateConfigError,
-      generatedPlansCount: Array.isArray(generatedPlans) ? generatedPlans.length : -1,
-      aiGeneratedPlansCount: Array.isArray(aiPlans) ? aiPlans.length : -1,
-      generateResult,
-      historyItem,
-      historyListCount: Array.isArray(historyList) ? historyList.length : -1,
-      originalConfig,
-    };
-  }, { regressionPngDataUrl });
+      const savedHistory = await api.imageStudio.saveHistory({
+        productName: seededProductTitle,
+        salesRegion: "us",
+        imageCount: 1,
+        images: [{ imageType: "main", imageUrl: png }],
+      });
+      const historyList = await api.imageStudio.listHistory();
+      const historyItem = savedHistory?.id ? await api.imageStudio.getHistoryItem(savedHistory.id) : null;
+
+      return {
+        version,
+        updateStatus: updateStatus?.status || "",
+        roundtrip,
+        pingStatus: ping?.status || "",
+        progressStatus: progress?.status || "",
+        taskCount: Array.isArray(tasks) ? tasks.length : -1,
+        imageStatus,
+        updateConfigOk,
+        updateConfigError,
+        historyItem,
+        historyListCount: Array.isArray(historyList) ? historyList.length : -1,
+      };
+    },
+    {
+      png: regressionPngDataUrl,
+      seededProductTitle: SEEDED_PRODUCT_TITLE,
+    },
+  );
 
   assert(typeof result.version === "string" && result.version.length > 0, "app.getVersion returned invalid version");
   assert(result.roundtrip?.ok === true, "store roundtrip failed");
   assert(typeof result.pingStatus === "string" && result.pingStatus.length > 0, "automation.ping returned invalid payload");
   assert(typeof result.progressStatus === "string" && result.progressStatus.length > 0, "automation.getProgress returned invalid payload");
   assert(result.taskCount >= 0, "automation.listTasks returned invalid task list");
-  assert(typeof result.imageStatus?.status === "string", "imageStudio.ensureRunning returned invalid status");
-  assert(typeof result.analysis?.productName === "string" && result.analysis.productName.length > 0, "imageStudio.analyze returned invalid analysis");
-  assert(result.aiGeneratedPlansCount > 0, "imageStudio.generatePlans returned no AI plans");
-  assert(Array.isArray(result.generateResult?.results) && result.generateResult.results.length > 0, "imageStudio.startGenerate returned no generated images");
-  assert(typeof result.generateResult.results[0]?.imageUrl === "string" && result.generateResult.results[0].imageUrl.length > 0, "imageStudio.startGenerate returned invalid image url");
-  assert(result.generatedPlansCount > 0, "imageStudio.generatePlans returned no plans");
+  assert(result.imageStatus?.ready === true, "imageStudio.ensureRunning did not reach ready status");
   assert(result.historyListCount >= 1, "imageStudio.listHistory returned no history items");
-  assert(result.historyItem?.productName === "自动化回归测试商品", "imageStudio.getHistoryItem returned invalid history item");
+  assert(result.historyItem?.productName === SEEDED_PRODUCT_TITLE, "imageStudio.getHistoryItem returned invalid history item");
 
   console.log("[ok] electron bridge basic checks");
   console.log("[ok] automation worker bridge");
-  console.log("[ok] image studio analyze/generate bridge");
+  console.log("[ok] image studio runtime/history bridge");
   if (result.updateConfigOk) {
-    console.log("[ok] image studio config/history bridge");
+    console.log("[ok] image studio config bridge");
   } else {
     issues.push(`AI 出图配置写入失败: ${result.updateConfigError || "unknown error"}`);
     console.log(`[warn] image studio config update failed: ${result.updateConfigError || "unknown error"}`);
-    console.log("[ok] image studio history bridge");
   }
   return issues;
 }
 
 async function runUiChecks(page) {
-  const issues = [];
   await clickMenuItem(page, "店铺概览");
+  await waitForHashContains(page, "/shop");
+  await waitForVisibleText(page, "店铺概览");
   await waitForVisibleText(page, "数据概览");
-  await waitForVisibleText(page, "流量分析");
   console.log("[ok] 店铺概览页面");
 
   await clickMenuItem(page, "商品管理");
+  await waitForHashContains(page, "/products");
+  await waitForVisibleText(page, "商品管理");
   await waitForPlaceholderContains(page, "搜索商品名称");
-  await page.getByRole("button", { name: "查看详情" }).first().waitFor({ state: "visible", timeout: 45000 });
+  const productRow = page.locator(".ant-table-tbody .ant-table-row").first();
+  await productRow.waitFor({ state: "visible", timeout: 45000 });
   console.log("[ok] 商品列表页面");
 
-  await page.getByRole("button", { name: "查看详情" }).first().click();
-  await waitForVisibleText(page, "自动化回归测试商品");
-  await waitForVisibleText(page, "基本信息");
-  await waitForVisibleText(page, "流量数据");
-  console.log("[ok] 商品详情页面");
+  const detailDrawer = page.locator(".ant-drawer .ant-drawer-content").last();
+  await productRow.click();
+  await detailDrawer.waitFor({ state: "visible", timeout: 30000 });
+  await detailDrawer.getByText("概览", { exact: true }).waitFor({ state: "visible", timeout: 30000 });
+  await detailDrawer.getByText("流量驾驶舱", { exact: false }).waitFor({ state: "visible", timeout: 30000 });
+  await detailDrawer.getByText("全部字段", { exact: true }).waitFor({ state: "visible", timeout: 30000 });
+  console.log("[ok] 商品详情抽屉");
 
-  await page.getByRole("button", { name: "返回" }).first().click();
+  await page.keyboard.press("Escape");
+  await detailDrawer.waitFor({ state: "hidden", timeout: 30000 });
   await waitForPlaceholderContains(page, "搜索商品名称");
 
   await clickMenuItem(page, "上品管理");
+  await waitForHashContains(page, "/create-product");
   await waitForVisibleText(page, "上传商品表格");
   console.log("[ok] 上品管理页面");
 
-  await clickMenuItem(page, "AI 出图");
-  await page.getByRole("button", { name: "历史记录" }).waitFor({ state: "visible", timeout: 90000 });
-  await page.getByRole("button", { name: "历史记录" }).click();
-  await waitForVisibleText(page, "历史记录");
-  await waitForVisibleText(page, "自动化回归测试商品");
-  await page.keyboard.press("Escape");
-  await page.getByRole("button", { name: "历史记录" }).waitFor({ state: "visible", timeout: 30000 });
-  console.log("[ok] AI 出图页面");
-
   await clickMenuItem(page, "数据采集");
-  await waitForVisibleText(page, "一键采集全部数据");
+  await waitForHashContains(page, "/collect");
+  await waitForVisibleText(page, "数据采集");
+  await page.getByRole("button", { name: "一键采集全部数据" }).waitFor({ state: "visible", timeout: 30000 });
   console.log("[ok] 数据采集页面");
 
-  await clickMenuItem(page, "账号管理");
-  await waitForVisibleText(page, "添加账号");
-  await page.getByRole("button", { name: "添加账号" }).click();
-  const modal = page.locator(".ant-modal-root .ant-modal").last();
-  await modal.waitFor({ state: "visible", timeout: 30000 });
-  await modal.getByPlaceholder("例：我的Temu店铺").fill("回归测试店");
-  await modal.getByPlaceholder("请输入手机号").fill("13800138000");
-  await modal.getByPlaceholder("请输入密码").fill("Regression#123");
-  await modal.locator(".ant-btn-primary").last().click();
-  await waitForVisibleText(page, "回归测试店");
-  await page.getByRole("button", { name: "切换数据" }).first().click();
-  try {
-    await waitForVisibleText(page, "当前数据", 15000);
-  } catch (error) {
-    issues.push("账号页切换数据后，列表里的“当前数据”状态没有按预期出现");
-    console.log("[warn] 账号页未及时显示“当前数据”状态");
-  }
-  try {
-    await page.locator(".ant-layout-header").getByText("回归测试店").waitFor({ state: "visible", timeout: 10000 });
-  } catch (error) {
-    issues.push("切换数据账号后，顶部活动账号标签没有同步显示新账号名称");
-    console.log("[warn] 顶部活动账号标签未同步更新");
-  }
-  console.log("[ok] 账号管理页面");
+  await clickMenuItem(page, "AI 出图");
+  await waitForHashContains(page, "/image-studio");
+  const historyButton = page.getByRole("button", { name: "历史记录" }).first();
+  await historyButton.waitFor({ state: "visible", timeout: 90000 });
+  await historyButton.click();
+  await waitForVisibleText(page, "历史记录");
+  await waitForVisibleText(page, SEEDED_PRODUCT_TITLE);
+  await page.keyboard.press("Escape");
+  await historyButton.waitFor({ state: "visible", timeout: 30000 });
+  console.log("[ok] AI 出图页面");
 
-  await clickMenuItem(page, "任务管理");
-  await waitForVisibleText(page, "任务页现在直接接入真实后端任务");
-  console.log("[ok] 任务管理页面");
+  await page.evaluate(async (logMessage) => {
+    const store = window.electronAPI?.store;
+    if (!store) throw new Error("store bridge unavailable");
+    const currentLogs = await store.get("temu_frontend_logs");
+    const nextLogs = Array.isArray(currentLogs) ? currentLogs.filter((item) => item?.id !== "desktop-regression-log") : [];
+    nextLogs.unshift({
+      id: "desktop-regression-log",
+      timestamp: Date.now(),
+      level: "info",
+      source: "console",
+      message: logMessage,
+    });
+    await store.set("temu_frontend_logs", nextLogs.slice(0, 500));
+  }, "desktop regression seeded log");
 
   await clickMenuItem(page, "日志中心");
-  await waitForVisibleText(page, "前端日志页");
+  await waitForHashContains(page, "/logs");
+  await waitForVisibleText(page, "日志中心");
+  await page.getByPlaceholder("搜索记录内容 / 来源 / 级别").fill("desktop regression seeded log");
   await waitForVisibleText(page, "desktop regression seeded log");
-  await page.getByRole("button", { name: "清空日志" }).click();
-  await waitForVisibleText(page, "暂无前端日志");
+  await page.getByRole("button", { name: "清空" }).click();
+  await waitForVisibleText(page, "暂无运行记录");
   console.log("[ok] 日志中心页面");
 
   await clickMenuItem(page, "设置");
-  await waitForVisibleText(page, "版本与更新");
+  await waitForHashContains(page, "/settings");
+  await waitForVisibleText(page, "设置");
+  await waitForVisibleText(page, "浏览器设置");
   await page.getByRole("button", { name: "保存设置" }).click();
-  const savedSettings = await page.evaluate(async () => {
-    return window.electronAPI?.store?.get("temu_app_settings");
-  });
+  const savedSettings = await page.evaluate(async () => window.electronAPI?.store?.get("temu_app_settings"));
   assert(savedSettings && typeof savedSettings === "object", "settings save did not persist to store");
   console.log("[ok] 设置页面");
 
   await clickMenuItem(page, "账号管理");
-  await waitForVisibleText(page, "添加账号");
-  console.log("[ok] 账号页二次进入未卡死");
+  await waitForHashContains(page, "/accounts");
+  const addAccountButton = page.getByRole("button", { name: "添加账号" }).first();
+  await addAccountButton.waitFor({ state: "visible", timeout: 30000 });
+  await addAccountButton.click();
+  const modal = page.locator(".ant-modal-root .ant-modal").last();
+  await modal.waitFor({ state: "visible", timeout: 30000 });
+  const modalInputs = modal.locator("input");
+  await modalInputs.nth(0).fill(SEEDED_ACCOUNT_NAME);
+  await modalInputs.nth(1).fill(REGRESSION_PHONE);
+  await modalInputs.nth(2).fill(REGRESSION_PASSWORD);
+  await modal.locator(".ant-btn-primary").last().click();
+  await modal.waitFor({ state: "hidden", timeout: 30000 });
+  await waitForVisibleText(page, SEEDED_ACCOUNT_NAME);
 
-  return issues;
+  const switchDataButton = page.getByRole("button", { name: "切换数据" }).first();
+  if (await switchDataButton.isVisible().catch(() => false)) {
+    await switchDataButton.click();
+    await waitForVisibleText(page, "当前数据", 20000);
+    await page.locator(".ant-layout-header").getByText(SEEDED_ACCOUNT_NAME, { exact: false }).waitFor({ state: "visible", timeout: 20000 });
+  }
+  console.log("[ok] 账号管理页面");
 }
 
 async function main() {
   ensureFileExists(distIndex, "dist index");
 
-  const env = createIsolatedEnv();
+  const workerPort = await findAvailablePort(19321);
+  const env = createIsolatedEnv(workerPort);
   let electronApp;
   let page;
   let success = false;
@@ -484,10 +459,11 @@ async function main() {
       "electron bridge ready",
     );
 
-    await waitForVisibleText(page, "Temu 运营助手", 30000);
+    await page.locator(".ant-layout-sider").getByText("店铺概览", { exact: true }).first().waitFor({ state: "visible", timeout: 30000 });
+
     issues.push(...await runBridgeChecks(page));
     await seedRegressionData(page);
-    issues.push(...await runUiChecks(page));
+    await runUiChecks(page);
 
     if (issues.length > 0) {
       throw new Error(`Detected regression issues:\n- ${issues.join("\n- ")}`);

@@ -17,7 +17,7 @@ export const SCRAPE_TASKS = {
   // ---- 核心数据 ----
   products:       { type: "page", path: "/goods/list", opts: { waitTime: 8000, waitForApi: "product/skc/pageQuery", waitForApiTimeout: 90000, paginate: true, paginateApi: "product/skc/pageQuery", paginateMaxPages: 30 } },
   orders:         { type: "page", path: "/stock/fully-mgt/order-manage", opts: { waitTime: 8000, waitForApi: "querySubOrderList", waitForApiTimeout: 90000 } },
-  flux:           { type: "page", path: "/main/flux-analysis-full" },
+  flux:           { type: "custom", path: "/main/flux-analysis-full", custom: "fluxAnalysis", opts: { siteLabel: "全球" } },
   dashboard:      { type: "page", path: "/", opts: { waitTime: 12000 } },
   aftersales:     { type: "page", path: "/main/aftersales/information" },
   soldout:        { type: "page", path: "/stock/fully-mgt/sale-manage/board/sku-sale-out" },
@@ -135,8 +135,8 @@ export const SCRAPE_TASKS = {
   activityUS:     { type: "page", path: null, opts: { fullUrl: "https://agentseller-us.temu.com/main/act/data-full", lite: false, waitTime: 10000, businessOnly: true } },
   activityEU:     { type: "page", path: null, opts: { fullUrl: "https://agentseller-eu.temu.com/main/act/data-full", lite: false, waitTime: 10000, businessOnly: true } },
   mallFluxUS:     { type: "page", path: null, opts: { fullUrl: "https://agentseller-us.temu.com/main/mall-flux-analysis-full" } },
-  fluxUS:         { type: "page", path: null, opts: { fullUrl: "https://agentseller-us.temu.com/main/flux-analysis-full" } },
-  fluxEU:         { type: "page", path: null, opts: { fullUrl: "https://agentseller-eu.temu.com/main/flux-analysis-full" } },
+  fluxUS:         { type: "custom", path: "/main/flux-analysis-full", custom: "fluxAnalysis", opts: { siteLabel: "美国" } },
+  fluxEU:         { type: "custom", path: "/main/flux-analysis-full", custom: "fluxAnalysis", opts: { siteLabel: "欧区" } },
   mallFluxEU:     { type: "page", path: null, opts: { fullUrl: "https://agentseller-eu.temu.com/main/mall-flux-analysis-full" } },
   qualityDashboardEU:{ type: "page", path: null, opts: { fullUrl: "https://agentseller-eu.temu.com/main/quality/dashboard" } },
 
@@ -193,6 +193,8 @@ export function getScrapeFunction(taskKey, executors) {
       return () => executors.scrapePageWithListener(task.path, task.matchers, task.opts || {});
     case "govern":
       return () => executors.scrapeGovernPage(task.subPath, { taskKey, task });
+    case "custom":
+      return () => executors.scrapeCustomTask(taskKey, task);
     default:
       return null;
   }

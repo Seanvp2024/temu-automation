@@ -2,6 +2,7 @@ export const ACCOUNT_STORE_KEY = "temu_accounts";
 export const ACTIVE_ACCOUNT_ID_KEY = "temu_active_account_id";
 export const ACTIVE_ACCOUNT_CHANGED_EVENT = "temu:active-account-changed";
 export const STORE_VALUE_UPDATED_EVENT = "temu:store-value-updated";
+export const STORE_VALUES_UPDATED_EVENT = "temu:store-values-updated";
 
 export interface MultiStoreAccount {
   id: string;
@@ -20,9 +21,10 @@ export const ACCOUNT_SCOPED_BASE_KEYS = [
   "temu_orders",
   "temu_sales",
   "temu_flux",
-  "temu_task_manager_state",
+  "temu_flux_history",
   "temu_raw_goodsData",
   "temu_raw_lifecycle",
+  "temu_raw_globalPerformance",
   "temu_raw_imageTask",
   "temu_raw_sampleManage",
   "temu_raw_activity",
@@ -81,12 +83,24 @@ export const ACCOUNT_SCOPED_BASE_KEYS = [
   "temu_raw_adsHelp",
   "temu_raw_adsNotification",
   "temu_raw_usRetrieval",
+  "temu_competitor_keywords",
+  "temu_competitor_keyword_pool",
+  "temu_competitor_tracked",
+  "temu_competitor_reports",
 ] as const;
 
 type StoreLike = {
   get: (key: string) => Promise<any>;
+  getMany?: (keys: string[]) => Promise<Record<string, any>>;
   set: (key: string, value: any) => Promise<any>;
+  setMany?: (entries: Record<string, any>) => Promise<any>;
 } | undefined;
+
+type StoreUpdateDetail = {
+  baseKey?: string | null;
+  baseKeys?: string[] | null;
+  accountId?: string | null;
+} | null | undefined;
 
 export function buildScopedStoreKey(accountId: string, baseKey: string) {
   return `temu_store:${accountId}:${baseKey}`;
@@ -136,24 +150,67 @@ export function emitStoreValueUpdated(baseKey: string, accountId: string | null 
   );
 }
 
+export function emitStoreValuesUpdated(baseKeys: readonly string[], accountId: string | null = null) {
+  const nextKeys = Array.from(new Set(baseKeys.map((key) => String(key || "").trim()).filter(Boolean)));
+  if (nextKeys.length === 0) return;
+  window.dispatchEvent(
+    new CustomEvent(STORE_VALUES_UPDATED_EVENT, {
+      detail: {
+        baseKeys: nextKeys,
+        accountId: accountId || null,
+      },
+    }),
+  );
+}
+
+export function storeUpdateTouchesKeys(detail: StoreUpdateDetail, keys: readonly string[]) {
+  if (!detail) return false;
+  const targetKeys = new Set(keys);
+  if (detail.baseKey && targetKeys.has(detail.baseKey)) return true;
+  if (Array.isArray(detail.baseKeys)) {
+    return detail.baseKeys.some((key) => targetKeys.has(key));
+  }
+  return false;
+}
+
 export async function syncScopedDataToGlobalStore(store: StoreLike, accountId: string | null) {
   if (!store) return;
 
   if (!accountId) {
-    for (const baseKey of ACCOUNT_SCOPED_BASE_KEYS) {
-      await store.set(baseKey, null);
+    const emptyEntries = Object.fromEntries(
+      ACCOUNT_SCOPED_BASE_KEYS.map((baseKey) => [baseKey, null]),
+    );
+    if (store.setMany) {
+      await store.setMany(emptyEntries);
+    } else {
+      for (const baseKey of ACCOUNT_SCOPED_BASE_KEYS) {
+        await store.set(baseKey, null);
+      }
     }
     return;
   }
 
-  const scopedEntries: Array<readonly [string, any]> = [];
-  for (const baseKey of ACCOUNT_SCOPED_BASE_KEYS) {
-    const value = await store.get(buildScopedStoreKey(accountId, baseKey));
-    scopedEntries.push([baseKey, value ?? null] as const);
-  }
+  const scopedKeys = ACCOUNT_SCOPED_BASE_KEYS.map((baseKey) => buildScopedStoreKey(accountId, baseKey));
+  const scopedValues = store.getMany
+    ? await store.getMany(scopedKeys)
+    : Object.fromEntries(
+        await Promise.all(
+          scopedKeys.map(async (key) => [key, await store.get(key)] as const),
+        ),
+      );
+  const nextEntries = Object.fromEntries(
+    ACCOUNT_SCOPED_BASE_KEYS.map((baseKey) => {
+      const scopedKey = buildScopedStoreKey(accountId, baseKey);
+      return [baseKey, scopedValues?.[scopedKey] ?? null];
+    }),
+  );
 
-  for (const [baseKey, value] of scopedEntries) {
-    await store.set(baseKey, value);
+  if (store.setMany) {
+    await store.setMany(nextEntries);
+  } else {
+    for (const [baseKey, value] of Object.entries(nextEntries)) {
+      await store.set(baseKey, value);
+    }
   }
 }
 
@@ -169,21 +226,37 @@ export async function setActiveAccountAndSync(store: StoreLike, accounts: MultiS
   return nextId;
 }
 
-export async function setStoreValueForActiveAccount(store: StoreLike, baseKey: string, value: any) {
+export async function setStoreValueForActiveAccount(
+  store: StoreLike,
+  baseKey: string,
+  value: any,
+  options?: { emit?: boolean },
+) {
   if (!store) return;
+  const shouldEmit = options?.emit !== false;
 
-  await store.set(baseKey, value);
   if (!ACCOUNT_SCOPED_BASE_KEYS.includes(baseKey as typeof ACCOUNT_SCOPED_BASE_KEYS[number])) {
-    emitStoreValueUpdated(baseKey, null);
+    await store.set(baseKey, value);
+    if (shouldEmit) emitStoreValueUpdated(baseKey, null);
     return;
   }
 
   const activeAccountId = await readActiveAccountId(store);
   if (!activeAccountId) {
-    emitStoreValueUpdated(baseKey, null);
+    await store.set(baseKey, value);
+    if (shouldEmit) emitStoreValueUpdated(baseKey, null);
     return;
   }
 
-  await store.set(buildScopedStoreKey(activeAccountId, baseKey), value);
-  emitStoreValueUpdated(baseKey, activeAccountId);
+  const scopedKey = buildScopedStoreKey(activeAccountId, baseKey);
+  if (store.setMany) {
+    await store.setMany({
+      [baseKey]: value,
+      [scopedKey]: value,
+    });
+  } else {
+    await store.set(baseKey, value);
+    await store.set(scopedKey, value);
+  }
+  if (shouldEmit) emitStoreValueUpdated(baseKey, activeAccountId);
 }

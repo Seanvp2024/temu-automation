@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 自动化 Worker - 通过 HTTP 服务通信，避免 stdio pipe 继承问题
  */
 import { chromium } from "playwright";
@@ -14,6 +14,8 @@ import { randomDelay, downloadImage, saveBase64Image, getDebugDir, getTmpDir, lo
 import { browserState, ensureBrowser as _ensureBrowser, launch as _launch, login, saveCookies, closeBrowser, findLatestCookie } from "./browser.mjs";
 import { ADS_GROUP_TABS, GOVERN_GROUP_TARGETS, buildScrapeHandlers, getScrapeFunction } from "./scrape-registry.mjs";
 import { getConfiguredMaxRetries, getDelayScale, shouldAutoLoginRetry, shouldCaptureErrorScreenshots } from "./runtime-config.mjs";
+import { buildYunqiOnlineHandlers } from "./yunqi-online.mjs";
+import { createGeminiClient } from "./gemini-client.mjs";
 const require = createRequire(import.meta.url);
 const XLSX = require("xlsx");
 const FormDataLib = require("form-data");
@@ -57,6 +59,19 @@ const AI_MODEL = process.env.VECTORENGINE_MODEL || "gemini-3.1-flash-lite-previe
 const ATTRIBUTE_AI_API_KEY = process.env.VECTORENGINE_ATTRIBUTE_API_KEY || AI_API_KEY;
 const ATTRIBUTE_AI_BASE_URL = normalizeChatBaseUrl(process.env.VECTORENGINE_ATTRIBUTE_BASE_URL, AI_BASE_URL);
 const ATTRIBUTE_AI_MODEL = process.env.VECTORENGINE_ATTRIBUTE_MODEL || AI_MODEL;
+
+let _aiGeminiClient = null;
+function getAiGeminiClient() {
+  if (_aiGeminiClient || !AI_API_KEY) return _aiGeminiClient;
+  _aiGeminiClient = createGeminiClient({ apiKey: AI_API_KEY, baseURL: AI_BASE_URL });
+  return _aiGeminiClient;
+}
+let _attributeGeminiClient = null;
+function getAttributeGeminiClient() {
+  if (_attributeGeminiClient || !ATTRIBUTE_AI_API_KEY) return _attributeGeminiClient;
+  _attributeGeminiClient = createGeminiClient({ apiKey: ATTRIBUTE_AI_API_KEY, baseURL: ATTRIBUTE_AI_BASE_URL });
+  return _attributeGeminiClient;
+}
 const GENERATED_WORKER_AUTH_TOKEN = crypto.randomBytes(32).toString("hex");
 const WORKER_AUTH_TOKEN = process.env.WORKER_AUTH_TOKEN || GENERATED_WORKER_AUTH_TOKEN;
 const CATEGORY_HISTORY_FILE = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "temu_category_history.json");
@@ -126,6 +141,15 @@ let stickyCredentialPassword = "";
 const recentChildSpecValues = [];
 let categoryHistoryCache = null;
 let categoryHistorySeeded = false;
+const yunqiHandlers = buildYunqiOnlineHandlers({
+  ensureBrowser: async () => {
+    await _ensureBrowser();
+    syncBrowserState();
+  },
+  getContext: () => context,
+  randomDelay,
+  logSilent,
+});
 
 function getCategoryHistoryFilePath() {
   fs.mkdirSync(path.dirname(CATEGORY_HISTORY_FILE), { recursive: true });
@@ -1264,16 +1288,106 @@ function getWorkerTypingDelay() {
 }
 
 async function findVisibleInputOnPage(page, selectors = []) {
-  for (const selector of selectors) {
-    const locator = page.locator(selector);
-    const count = await locator.count().catch(() => 0);
-    for (let index = 0; index < count; index += 1) {
-      const candidate = locator.nth(index);
-      const visible = await candidate.isVisible().catch(() => false);
-      const editable = await candidate.isEditable().catch(() => false);
-      if (visible && editable) return candidate;
+  const targets = [];
+  if (page) targets.push(page);
+  if (typeof page?.frames === "function") {
+    for (const frame of page.frames()) {
+      if (frame && frame !== page.mainFrame?.()) targets.push(frame);
     }
   }
+
+  for (const target of targets) {
+    for (const selector of selectors) {
+      const locator = target.locator(selector);
+      const count = await locator.count().catch(() => 0);
+      for (let index = 0; index < count; index += 1) {
+        const candidate = locator.nth(index);
+        const visible = await candidate.isVisible().catch(() => false);
+        const editable = await candidate.isEditable().catch(() => false);
+        if (visible && editable) return candidate;
+      }
+    }
+
+    const genericSelectors = [
+      'input:not([type="hidden"]):not([disabled])',
+      'textarea:not([disabled])',
+    ];
+    for (const selector of genericSelectors) {
+      const locator = target.locator(selector);
+      const count = await locator.count().catch(() => 0);
+      for (let index = 0; index < count; index += 1) {
+        const candidate = locator.nth(index);
+        const visible = await candidate.isVisible().catch(() => false);
+        const editable = await candidate.isEditable().catch(() => false);
+        if (visible && editable) return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+async function readVisibleInputMeta(input) {
+  try {
+    return await input.evaluate((node) => {
+      const rect = node.getBoundingClientRect();
+      return {
+        id: node.id || "",
+        name: node.getAttribute("name") || "",
+        type: node.getAttribute("type") || "",
+        placeholder: node.getAttribute("placeholder") || "",
+        autocomplete: node.getAttribute("autocomplete") || "",
+        value: node.value || "",
+        width: Math.round(rect.width || 0),
+        height: Math.round(rect.height || 0),
+      };
+    });
+  } catch {
+    return {
+      id: "",
+      name: "",
+      type: "",
+      placeholder: "",
+      autocomplete: "",
+      value: "",
+      width: 0,
+      height: 0,
+    };
+  }
+}
+
+function isLikelySellerCountryCodeInput(meta = {}) {
+  const value = String(meta?.value || "").trim();
+  const placeholder = String(meta?.placeholder || "").trim();
+  const id = String(meta?.id || "").trim();
+  const name = String(meta?.name || "").trim();
+  const width = Number(meta?.width) || 0;
+
+  if (id === "usernameId" || name === "usernameId") return false;
+  if (name === "phone" || name === "mobile") return false;
+  if (placeholder.includes("手机") || placeholder.includes("号码")) return false;
+  if (/^\+\d+$/.test(value)) return true;
+  if (!placeholder && !id && !name && width > 0 && width <= 120) return true;
+  return false;
+}
+
+async function findSellerPhoneInputOnPage(page) {
+  const selectorGroups = [
+    ['#usernameId', 'input[name="usernameId"]'],
+    ['input[placeholder="手机号码"]', 'input[placeholder*="手机号码"]', 'input[placeholder*="手机号"]', 'input[placeholder*="手机"]', 'input[placeholder*="号码"]'],
+    ['input[name="phone"]', 'input[name="mobile"]', 'input[name="account"]', 'input[data-testid*="phone"]', 'input[autocomplete="username"]'],
+    ['input[type="tel"]', 'input[inputmode="numeric"]', '.el-input__inner'],
+  ];
+
+  for (const selectors of selectorGroups) {
+    for (const selector of selectors) {
+      const candidate = await findVisibleInputOnPage(page, [selector]);
+      if (!candidate) continue;
+      const meta = await readVisibleInputMeta(candidate);
+      if (isLikelySellerCountryCodeInput(meta)) continue;
+      return { input: candidate, meta, selector };
+    }
+  }
+
   return null;
 }
 
@@ -1300,15 +1414,20 @@ async function fillInputWithVerification(input, value, options = {}) {
     }).catch(() => {});
   };
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
     await clearInput();
     await randomDelay(120, 240);
 
-    if (attempt < 2) {
+    if (attempt === 0) {
+      // Attempt 0: Playwright .fill() — most reliable for React controlled inputs
+      await input.fill(String(value ?? "")).catch(() => {});
+    } else if (attempt < 3) {
+      // Attempt 1-2: char-by-char typing (simulates human input)
       for (const char of String(value ?? "")) {
         await input.type(char, { delay: getWorkerTypingDelay() });
       }
     } else {
+      // Attempt 3: direct evaluate (last resort)
       await input.evaluate((node, nextValue) => {
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
         setter?.call(node, nextValue);
@@ -1331,6 +1450,11 @@ function buildSellerCentralUrl(targetPath = "/goods/list") {
   return /^https?:\/\//i.test(String(targetPath || ""))
     ? String(targetPath)
     : `https://agentseller.temu.com${targetPath}`;
+}
+
+function isSellerCentralWorkspaceUrl(url = "") {
+  const text = String(url || "");
+  return /^https:\/\/agentseller(?:-[a-z]+)?\.temu\.com\//i.test(text);
 }
 
 async function openSellerCentralTarget(page, targetPath = "/goods/list", options = {}) {
@@ -1432,23 +1556,76 @@ async function tryAutoLoginInPopup(popup, logPrefix = "[popup-login]") {
   }
 
   try {
+    const initialStage = await detectSellerPopupStage(popup);
+    if (initialStage === "auth") {
+      await ensurePopupConsentChecked(popup, `${logPrefix}-auth`);
+      const clicked = await clickSellerAuthConfirmButton(popup, `${logPrefix}-auth`);
+      if (clicked) {
+        console.error(`${logPrefix} Popup already in auth stage, clicked confirm directly`);
+        return true;
+      }
+    }
+
     try {
-      const accountTab = popup.locator('text=账号登录').first();
-      if (await accountTab.isVisible({ timeout: 1500 })) {
-        await accountTab.click();
-        await randomDelay(500, 1000);
+      const tabSelectors = [
+        'text=账号登录',
+        '[role="tab"]:has-text("账号登录")',
+        '.tab:has-text("账号登录")',
+        'div:has-text("账号登录")',
+        'span:has-text("账号登录")',
+      ];
+      for (const selector of tabSelectors) {
+        const accountTab = popup.locator(selector).first();
+        if (await accountTab.isVisible({ timeout: 800 }).catch(() => false)) {
+          await accountTab.click().catch(() => {});
+          await randomDelay(500, 1000);
+          break;
+        }
       }
     } catch (e) { logSilent("ui.action", e); }
 
-    const phoneInput = await findVisibleInputOnPage(popup, [
-      '#usernameId',
-      'input[name="usernameId"]',
-      'input[placeholder*="手机"]',
-      'input[placeholder*="号码"]',
-      'input[type="tel"]',
-      'input[inputmode="numeric"]',
-    ]);
+    await popup.waitForFunction(() => {
+      const selectors = [
+        '#usernameId',
+        'input[name="usernameId"]',
+        'input[name="phone"]',
+        'input[name="mobile"]',
+        'input[name="account"]',
+        'input[autocomplete="username"]',
+        'input[type="tel"]',
+        'input[inputmode="numeric"]',
+        '#passwordId',
+        'input[name="password"]',
+        'input[type="password"]',
+      ];
+      return selectors.some((selector) => {
+        const node = document.querySelector(selector);
+        if (!node) return false;
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+      });
+    }, { timeout: 12000 }).catch(() => {});
+    await randomDelay(500, 900);
+
+    const stageAfterTab = await detectSellerPopupStage(popup);
+    if (stageAfterTab === "auth") {
+      await ensurePopupConsentChecked(popup, `${logPrefix}-auth-after-tab`);
+      const clicked = await clickSellerAuthConfirmButton(popup, `${logPrefix}-auth-after-tab`);
+      if (clicked) {
+        console.error(`${logPrefix} Popup switched to auth stage after tab click, confirmed directly`);
+        return true;
+      }
+    }
+
+    let phoneTarget = await findSellerPhoneInputOnPage(popup);
+    if (!phoneTarget) {
+      await randomDelay(800, 1200);
+      phoneTarget = await findSellerPhoneInputOnPage(popup);
+    }
+    const phoneInput = phoneTarget?.input || null;
     if (!phoneInput) throw new Error("未找到手机号输入框");
+    console.error(`${logPrefix} Using phone input selector=${phoneTarget?.selector || "-"} id=${phoneTarget?.meta?.id || "-"} name=${phoneTarget?.meta?.name || "-"} width=${phoneTarget?.meta?.width || 0}`);
     await phoneInput.click();
     await fillInputWithVerification(phoneInput, phone, {
       label: "手机号",
@@ -1457,7 +1634,18 @@ async function tryAutoLoginInPopup(popup, logPrefix = "[popup-login]") {
     });
     await randomDelay(400, 800);
 
-    const passwordInput = await findVisibleInputOnPage(popup, ['#passwordId', 'input[type="password"]']);
+    const passwordSelectors = [
+      '#passwordId',
+      'input[name="password"]',
+      'input[type="password"]',
+      'input[autocomplete="current-password"]',
+      'input[placeholder*="密码"]',
+    ];
+    let passwordInput = await findVisibleInputOnPage(popup, passwordSelectors);
+    if (!passwordInput) {
+      await randomDelay(500, 1000);
+      passwordInput = await findVisibleInputOnPage(popup, passwordSelectors);
+    }
     if (!passwordInput) throw new Error("未找到密码输入框");
     await passwordInput.click();
     await fillInputWithVerification(passwordInput, password, {
@@ -1699,14 +1887,46 @@ async function detectSellerPopupStage(popup) {
     return await popup.evaluate(() => {
       const rawText = document.body?.innerText || "";
       const text = rawText.replace(/\s+/g, "");
-      const hasPhoneInput = Boolean(document.querySelector(
-        '#usernameId, input[name="usernameId"], input[type="tel"], input[inputmode="numeric"], input[placeholder*="手机"], input[placeholder*="号码"]'
-      ));
-      const hasPasswordInput = Boolean(document.querySelector('#passwordId, input[type="password"]'));
+
+      const isVisible = (node) => {
+        if (!node) return false;
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+      };
+
+      // ★ 先检测登录输入框 — 如果页面有手机号/密码输入框，说明需要填写凭证
+      //   即使页面同时包含"授权登录"按钮或授权文案，也应该优先判定为 login
+      //   （Temu 登录页会同时显示授权文案 + 登录表单）
+      const loginSelectors = [
+        '#usernameId',
+        'input[name="usernameId"]',
+        'input[name="phone"]',
+        'input[autocomplete="username"]',
+        'input[type="tel"]',
+        'input[inputmode="numeric"]',
+        'input[placeholder*="手机号"]',
+        'input[placeholder*="手机"]',
+        'input[placeholder*="号码"]',
+        'input[placeholder*="账号"]',
+      ];
+      const hasPhoneInput = loginSelectors.some((selector) => {
+        const node = document.querySelector(selector);
+        return isVisible(node);
+      });
+      const passwordNode = document.querySelector('#passwordId, input[name="password"], input[type="password"]');
+      const hasPasswordInput = isVisible(passwordNode);
       const looksLikeLogin = hasPhoneInput || hasPasswordInput || /手机号|密码|账号登录/.test(text);
       if (looksLikeLogin) return "login";
-      if (/确认授权|即将前往|SellerCentral/.test(text)) return "auth";
-      if (text.includes("授权登录")) return "auth";
+
+      const hasVisibleAuthButton = [...document.querySelectorAll('button, [role="button"], a, div[class*="btn"], span[class*="btn"]')]
+        .some((node) => {
+          if (!isVisible(node)) return false;
+          const nodeText = (node.textContent || "").replace(/\s+/g, "");
+          return /确认授权并前往|确认授权|授权登录|确认并前往|进入/.test(nodeText);
+        });
+      const hasVisibleAuthCopy = /确认授权|即将前往|SellerCentral|您授权您的账号ID和店铺名称/.test(text);
+      if (hasVisibleAuthButton || hasVisibleAuthCopy) return "auth";
       return "unknown";
     });
   } catch (error) {
@@ -1839,26 +2059,26 @@ async function ensureSellerCentralSessionReady(page, targetPath = "/goods/list",
       return false;
     }
     const authPending = await isSellerCentralAuthPage(page);
-    if (!authPending && page.url().includes("agentseller.temu.com")) {
+    const currentUrl = page.url();
+    if (!authPending && isSellerCentralWorkspaceUrl(currentUrl)) {
       console.error(`${logPrefix} Ready on attempt ${attempt}: ${page.url()}`);
       return true;
     }
 
-    console.error(`${logPrefix} Auth pending on attempt ${attempt}: ${page.url()}`);
-    if (page.url().includes("/main/authentication") || page.url().includes("/main/entry")) {
-      await triggerSellerCentralAuthEntry(page, `${logPrefix}-self`);
-      await randomDelay(1200, 2000);
-    }
-    await handleOpenSellerAuthPages(`${logPrefix}-popup`);
-    await randomDelay(1500, 2500);
-
-    if (await isSellerCentralAuthPage(page)) {
-      await openSellerCentralTarget(page, targetPath, { lite: false, logPrefix: `${logPrefix}-goto` });
+    console.error(`${logPrefix} Session not ready on attempt ${attempt}: authPending=${authPending} url=${currentUrl}`);
+    const handledExistingPages = await handleOpenSellerAuthPages(`${logPrefix}-popup`);
+    if (handledExistingPages) {
       await randomDelay(1500, 2500);
     }
 
-    // 第 3 次仍未拿到授权 → 触发一次完整 dedicated 登录（会刷新 cookie）再继续重试
-    if (attempt === 3 && !dedicatedLoginAttempted) {
+    const urlAfterPopupPass = page.url();
+    const authStillPending = await isSellerCentralAuthPage(page);
+    if (!authStillPending && isSellerCentralWorkspaceUrl(urlAfterPopupPass)) {
+      console.error(`${logPrefix} Ready after popup handling: ${urlAfterPopupPass}`);
+      return true;
+    }
+
+    if (!dedicatedLoginAttempted && attempt >= 2) {
       dedicatedLoginAttempted = true;
       console.error(`${logPrefix} Auth still pending after ${attempt} attempts, invoking dedicated seller login fallback`);
       const ok = await ensureDedicatedSellerLogin(`${logPrefix}-dedicated`);
@@ -1866,10 +2086,29 @@ async function ensureSellerCentralSessionReady(page, targetPath = "/goods/list",
         try {
           await openSellerCentralTarget(page, targetPath, { lite: false, logPrefix: `${logPrefix}-post-login` });
           await randomDelay(1500, 2500);
+          const urlAfterDedicated = page.url();
+          if (!await isSellerCentralAuthPage(page) && isSellerCentralWorkspaceUrl(urlAfterDedicated)) {
+            console.error(`${logPrefix} Ready after dedicated login: ${urlAfterDedicated}`);
+            return true;
+          }
         } catch (error) {
           logSilent("ui.action", error);
         }
       }
+    }
+
+    if (page.url().includes("/main/authentication") || page.url().includes("/main/entry")) {
+      const triggered = await triggerSellerCentralAuthEntry(page, `${logPrefix}-self`);
+      if (triggered) {
+        await randomDelay(1200, 2000);
+        await handleOpenSellerAuthPages(`${logPrefix}-popup-after-entry`);
+        await randomDelay(1200, 2000);
+      }
+    }
+
+    if (await isSellerCentralAuthPage(page)) {
+      await openSellerCentralTarget(page, targetPath, { lite: false, logPrefix: `${logPrefix}-goto` });
+      await randomDelay(1500, 2500);
     }
   }
 
@@ -1898,8 +2137,24 @@ async function handleSellerAuthPopupPage(newPage, logPrefix = "[popup-monitor]")
         return;
       }
       try {
+        // Re-check URL each iteration — page may have navigated to workspace after auth
+        const loopUrl = newPage.isClosed() ? "" : (newPage.url() || "");
+        if (newPage.isClosed()) return;
+        const isStillAuthUrl = /seller-login|\/settle\/|\/settle$|\/main\/authentication|\/main\/entry/i.test(loopUrl);
+        if (!isStillAuthUrl && isSellerCentralWorkspaceUrl(loopUrl)) {
+          await saveCookies();
+          console.error(`${logPrefix} Page already on workspace: ${loopUrl}`);
+          return;
+        }
+        // Also treat kuajingmaihuo.com/main/* (non-auth paths) as workspace
+        if (!isStillAuthUrl && /kuajingmaihuo\.com\/main\//.test(loopUrl) && !/authentication|entry/.test(loopUrl)) {
+          await saveCookies();
+          console.error(`${logPrefix} Page on kuajingmaihuo workspace: ${loopUrl}`);
+          return;
+        }
+
         const popupStage = await detectSellerPopupStage(newPage);
-        console.error(`${logPrefix} Popup stage on attempt ${attempt + 1}: ${popupStage}`);
+        console.error(`${logPrefix} Popup stage on attempt ${attempt + 1}: ${popupStage} url=${loopUrl.slice(0, 100)}`);
 
         if (popupStage === "login") {
           const submitted = await tryAutoLoginInPopup(newPage, logPrefix);
@@ -1915,6 +2170,35 @@ async function handleSellerAuthPopupPage(newPage, logPrefix = "[popup-monitor]")
           }
 
           await randomDelay(2000, 3000);
+          continue;
+        }
+
+        if (popupStage === "unknown") {
+          // If page is on a non-auth URL but stage is unknown, auth is likely done
+          if (!isStillAuthUrl) {
+            await saveCookies();
+            console.error(`${logPrefix} Unknown stage but URL is not auth, considering done: ${loopUrl}`);
+            return;
+          }
+
+          await ensurePopupConsentChecked(newPage, `${logPrefix}-unknown`);
+          const authClicked = await clickSellerAuthConfirmButton(newPage, `${logPrefix}-unknown`);
+          if (authClicked) {
+            await randomDelay(2500, 3500);
+            const nextStage = await detectSellerPopupStage(newPage);
+            if (nextStage !== "login" && nextStage !== "auth") {
+              await saveCookies();
+              console.error(`${logPrefix} Unknown popup resolved via auth confirm`);
+              return;
+            }
+          }
+
+          const submitted = await tryAutoLoginInPopup(newPage, `${logPrefix}-unknown`);
+          if (submitted) {
+            await randomDelay(2500, 3500);
+          } else {
+            await randomDelay(1500, 2500);
+          }
           continue;
         }
 
@@ -2159,638 +2443,67 @@ const TEMU_BASE_URL = "https://seller.kuajingmaihuo.com";
 
 // 返回实际使用的 page（可能因 popup 切换到新窗口）
 async function navigateToSellerCentral(page, targetPath, options = {}) {
-  // 诊断陷阱：记录谁在打开新建商品页（用户反馈 scrape_all 期间出现意外的 create 页）
   if (typeof targetPath === "string" && targetPath.includes("/goods/create/category")) {
     console.error("[NAV-TRAP] /goods/create/category called! Stack:");
     console.error(new Error("nav-trap").stack);
   }
-  const lite = options.lite || _navLiteMode; // lite 模式：不处理弹窗，交给外部监控器
-  const directUrl = /^https?:\/\//i.test(String(targetPath || ""))
-    ? String(targetPath)
-    : `https://agentseller.temu.com${targetPath}`;
-  console.error(`[nav] Navigating to ${directUrl} (lite=${lite})`);
-  // ERR_ABORTED / frame detached 重试
-  for (let navTry = 0; navTry < 3; navTry++) {
-    try {
-      await page.goto(directUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      break;
-    } catch (navErr) {
-      const retryable = /ERR_ABORTED|frame was detached|ERR_FAILED/i.test(navErr.message);
-      if (retryable && navTry < 2) {
-        console.error(`[nav] goto ERR (attempt ${navTry + 1}), retrying: ${navErr.message}`);
-        await randomDelay(lite ? 800 : 2000, lite ? 1200 : 3000);
-      } else {
-        throw navErr;
-      }
-    }
-  }
-  // 用 readyState / body 就绪替代固定白等
-  await page.waitForSelector("body", { timeout: lite ? 2500 : 5000 }).catch(() => {});
-  await page.waitForFunction(
-    () => document.readyState === "interactive" || document.readyState === "complete",
-    { timeout: lite ? 2000 : 4000 }
-  ).catch(() => {});
-  await page.waitForLoadState("domcontentloaded", { timeout: lite ? 2000 : 4000 }).catch(() => {});
-  await randomDelay(lite ? 300 : 700, lite ? 600 : 1100);
-  await page.waitForURL(/.*/, { timeout: lite ? 3000 : 10000 }).catch(() => {});
-  console.error(`[nav] Current URL: ${page.url()}`);
 
-  // lite 模式：如果被重定向到 authentication，等待弹窗监控器处理后重试
-  if (lite && (page.url().includes("/main/authentication") || page.url().includes("/main/entry"))) {
-    console.error("[nav-lite] On authentication page, waiting for popup monitor to handle...");
-    // 先点击"商家中心 >"触发弹窗（让监控器接管）
-    try {
-      const gotoBtn = page.locator('[class*="authentication_goto"]').first();
-      if (await gotoBtn.isVisible({ timeout: 3000 })) {
-        await gotoBtn.click();
-        console.error("[nav-lite] Clicked authentication_goto to trigger popup");
-      } else {
-        await page.evaluate(() => {
-          const all = [...document.querySelectorAll("div, span, a")];
-          for (const el of all) {
-            const text = (el.textContent?.trim() || "").replace(/\s+/g, "");
-            if (text.includes("商家中心") && !text.includes("其他地区") && text.length < 20) {
-              el.click(); return;
-            }
-          }
-        });
-      }
-    } catch (e) { logSilent("ui.action", e); }
+  const resolvedTargetPath = targetPath || "/goods/list";
+  const lite = Boolean(options.lite || _navLiteMode);
+  const logPrefix = options.logPrefix || "[nav]";
+  const directUrl = /^https?:\/\//i.test(String(resolvedTargetPath || ""))
+    ? String(resolvedTargetPath)
+    : buildSellerCentralUrl(resolvedTargetPath);
+  const directUrlWithoutQuery = directUrl.split("?")[0];
 
-    // 等待弹窗被监控器处理（最多60秒），同时主动检查授权弹窗
-    for (let retry = 0; retry < 12; retry++) {
-      await randomDelay(lite ? 1800 : 5000, lite ? 2200 : 5000);
+  let activePage = page;
+  console.error(`${logPrefix} Navigating to ${directUrl} (lite=${lite})`);
 
-      // 主动扫描所有页面，处理未关闭的授权弹窗
-      try {
-        for (const p of context.pages()) {
-          if (p === page || p.isClosed()) continue;
-          const pUrl = p.url();
-          if (!pUrl.includes("kuajingmaihuo.com") && !pUrl.includes("seller-login")) continue;
-          const popupStage = await detectSellerPopupStage(p);
-          if (popupStage === "login") {
-            await tryAutoLoginInPopup(p, "[nav-lite]");
-            await randomDelay(2000, 3000);
-            continue;
-          }
-          if (popupStage === "auth") {
-            console.error("[nav-lite] Found unhandled auth popup, handling...");
-            await ensurePopupConsentChecked(p, "[nav-lite]");
-            await randomDelay(300, 500);
-            try {
-              const btn = p.locator('button:has-text("授权登录"), button:has-text("确认授权并前往"), button:has-text("确认授权")').first();
-              if (await btn.isVisible({ timeout: 1000 })) { await btn.click(); console.error("[nav-lite] Clicked auth button"); }
-            } catch {}
-            await randomDelay(2000, 3000);
-          }
-        }
-      } catch (e) { logSilent("ui.action", e); }
-
-      // 尝试重新导航
-      try {
-        await page.goto(directUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-        await page.waitForSelector("body", { timeout: lite ? 1500 : 3000 }).catch(() => {});
-        await randomDelay(lite ? 500 : 1200, lite ? 800 : 1800);
-        if (!page.url().includes("/main/authentication") && !page.url().includes("/main/entry")) {
-          console.error(`[nav-lite] Successfully navigated after ${retry + 1} retries, URL: ${page.url()}`);
-          break;
-        }
-      } catch (e) { logSilent("ui.action", e); }
-      console.error(`[nav-lite] Still on auth page, retry ${retry + 1}/12...`);
-    }
-
-    // 关闭页面弹窗
-    for (let i = 0; i < 5; i++) {
-      try {
-        const btn = page.locator('button:has-text("知道了"), button:has-text("我知道了"), button:has-text("确定"), button:has-text("关闭"), button:has-text("暂不")').first();
-        if (await btn.isVisible({ timeout: 500 })) await btn.click();
-        else break;
-      } catch { break; }
-    }
-    console.error(`[nav-lite] Final URL: ${page.url()}`);
-    return page;
-  }
-
-  // 情况1：被重定向到 agentseller 的认证/入口页面
-  if (page.url().includes("/main/authentication") || page.url().includes("/main/entry")) {
-    console.error("[nav] On authentication page, trying entry flow...");
-
-    // 等待微前端加载
-    for (let wait = 0; wait < 10; wait++) {
-      const hasContent = await page.evaluate(() => {
-        const root = document.querySelector('#root');
-        return root && root.innerHTML.length > 10;
-      });
-      if (hasContent) { console.error(`[nav] Micro-app loaded after ${wait}s`); break; }
-      await randomDelay(1000, 1500);
-    }
-    await randomDelay(2000, 3000);
-
-    // 保存截图用于调试
-    const debugDir2 = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
-    fs.mkdirSync(debugDir2, { recursive: true });
-    await page.screenshot({ path: path.join(debugDir2, "entry_page.png"), fullPage: true }).catch(() => {});
-
-    // ★ 优先方案：在当前页面直接找"进入"按钮（Seller Central 授权页面）
-    // 页面结构：勾选授权复选框 → 点击"进入 >"按钮
-    console.error("[nav] Step A: Try checkbox + 进入 button on current page...");
-
-    // A1: 勾选授权复选框
-    const cbResult = await page.evaluate(() => {
-      // 标准 checkbox
-      const inputs = [...document.querySelectorAll('input[type="checkbox"]')];
-      for (const cb of inputs) { if (!cb.checked) { cb.click(); return "checked input"; } return "already checked"; }
-      // 自定义 checkbox
-      const customs = [...document.querySelectorAll('[class*="checkbox"], [class*="Checkbox"], [role="checkbox"], label')];
-      for (const el of customs) {
-        const text = el.innerText || el.textContent || "";
-        if (text.includes("授权") || text.includes("同意") || el.className?.toString().toLowerCase().includes("checkbox")) {
-          el.click(); return "clicked custom: " + el.tagName;
-        }
-      }
-      return "no checkbox found";
-    });
-    console.error("[nav] Checkbox result:", cbResult);
-    await randomDelay(500, 1000);
-
-    // A2: 点击"进入 >"按钮
-    const enterResult = await page.evaluate(() => {
-      const keywords = ["进入", "确认授权并前往", "确认授权", "确认并前往"];
-      const all = [...document.querySelectorAll('button, [role="button"], a, div[class*="btn"], div[class*="Btn"], span[class*="btn"]')];
-      for (const keyword of keywords) {
-        for (const el of all) {
-          const text = el.innerText?.trim() || "";
-          if (text.includes(keyword) && text.length < 20) {
-            el.click(); return "clicked: " + text;
-          }
-        }
-      }
-      return "not found";
-    });
-    console.error("[nav] Enter button result:", enterResult);
-
-    if (enterResult !== "not found") {
-      await randomDelay(5000, 8000);
-      console.error(`[nav] After enter click, URL: ${page.url()}`);
-    }
-
-    // ★ 如果"进入"按钮没有找到或仍在 authentication 页面，走 popup 流程
-    if (page.url().includes("/main/authentication") || page.url().includes("/main/entry")) {
-      console.error("[nav] Step B: Try popup flow (authentication_goto)...");
-
-      // ★ 先检查是否已经有 popup 窗口打开了（可能在页面加载时就弹出了）
-      let popup = context.pages().find(p =>
-        p !== page && (p.url().includes("kuajingmaihuo.com") || p.url().includes("seller-login"))
-      );
-      if (popup) {
-        console.error("[nav] Found existing popup:", popup.url());
-      } else {
-        // 注册事件监听，然后点击触发 popup
-        const popupPromise = context.waitForEvent("page", { timeout: 15000 }).catch(() => null);
-
-        // 点击"商家中心 >"
-        try {
-          const gotoBtn = page.locator('[class*="authentication_goto"]').first();
-          if (await gotoBtn.isVisible({ timeout: 3000 })) {
-            await gotoBtn.click();
-            console.error("[nav] Clicked authentication_goto");
-          } else {
-            await page.evaluate(() => {
-              const all = [...document.querySelectorAll("div, span, a")];
-              for (const el of all) {
-                const text = (el.textContent?.trim() || "").replace(/\s+/g, "");
-                if (text.includes("商家中心") && !text.includes("其他地区") && text.length < 20) {
-                  el.click(); return;
-                }
-              }
-            });
-            console.error("[nav] Clicked 商家中心 via evaluate");
-          }
-        } catch (e) {
-          console.error("[nav] Click error:", e.message);
-        }
-
-        popup = await popupPromise;
-
-        // 如果 waitForEvent 没拿到，再检查一次 context.pages()
-        if (!popup) {
-          popup = context.pages().find(p =>
-            p !== page && (p.url().includes("kuajingmaihuo.com") || p.url().includes("seller-login"))
-          );
-          if (popup) console.error("[nav] Found popup via context.pages() fallback:", popup.url());
-        }
-      }
-
-      if (popup) {
-        console.error(`[nav] Popup opened: ${popup.url()}`);
-        await popup.waitForLoadState("domcontentloaded").catch(() => {});
-        await randomDelay(3000, 5000);
-        console.error(`[nav] Popup URL: ${popup.url()}`);
-
-        // 判断 popup 是登录页还是授权确认页
-        if (popup.url().includes("seller-login") || popup.url().includes("/login")) {
-          // Popup 打开了 seller-login，可能是：
-          // A) cookie 有效 → 自动登录后弹出"确认授权并前往"弹窗（URL 不变）
-          // B) cookie 过期 → 需要用户手动登录
-          console.error("[nav] Popup is login page, waiting for auth dialog or login...");
-          await randomDelay(3000, 5000);
-
-          // 先检查是否已经出现了授权确认弹窗（cookie 自动登录成功的情况）
-          async function tryAuthInPopup() {
-            try {
-              const popupStage = await detectSellerPopupStage(popup);
-              console.error("[nav] Popup stage:", popupStage, "url:", popup.url());
-              if (popupStage !== "auth") {
-                return false;
-              }
-
-              console.error("[nav] Auth dialog found in popup! Handling...");
-              await ensurePopupConsentChecked(popup, "[nav]");
-              await randomDelay(800, 1500);
-
-              let btnClicked = false;
-              const authButtons = [
-                'button:has-text("确认授权并前往")',
-                'button:has-text("确认授权")',
-                'button:has-text("授权登录")',
-              ];
-              for (const selector of authButtons) {
-                if (btnClicked) break;
-                try {
-                  const btn = popup.locator(selector).first();
-                  if (await btn.isVisible({ timeout: 1000 })) {
-                    await btn.click();
-                    console.error(`[nav] Clicked auth button via locator: ${selector}`);
-                    btnClicked = true;
-                  }
-                } catch (e) {
-                  logSilent("ui.action", e);
-                }
-              }
-              if (!btnClicked) {
-                const btnResult = await popup.evaluate(() => {
-                  const keywords = ["确认授权并前往", "确认授权", "授权登录", "确认并前往", "进入"];
-                  const all = [...document.querySelectorAll('button, [role="button"], a, div[class*="btn"], div[class*="Btn"]')];
-                  for (const kw of keywords) {
-                    for (const el of all) {
-                      const text = (el.innerText || "").trim();
-                      if (text.includes(kw) && text.length < 20) { el.click(); return "clicked: " + text; }
-                    }
-                  }
-                  return "not found";
-                });
-                console.error("[nav] Popup auth button (fallback):", btnResult);
-                btnClicked = btnResult !== "not found";
-              }
-
-              if (btnClicked) {
-                await randomDelay(5000, 8000);
-                const nextStage = await detectSellerPopupStage(popup);
-                console.error("[nav] Popup stage after auth click:", nextStage);
-                if (nextStage !== "login") {
-                  await saveCookies();
-                  return true;
-                }
-                console.error("[nav] Auth click landed back on login stage, waiting for a real login/auth transition");
-              }
-            } catch (e) {
-              console.error("[nav] tryAuthInPopup error:", e.message);
-            }
-            return false;
-          }
-
-          // 尝试最多30秒等待弹窗出现
-          let authHandled = false;
-          for (let attempt = 0; attempt < 6; attempt++) {
-            authHandled = await tryAuthInPopup();
-            if (authHandled) break;
-            console.error(`[nav] Auth dialog not found yet, attempt ${attempt + 1}/6...`);
-            await randomDelay(3000, 5000);
-          }
-
-          if (!authHandled) {
-            // 没有授权弹窗 → cookie 过期，尝试自动登录
-            const { phone: lastPhone, password: lastPassword } = getRequestCredentials();
-            if (shouldAutoLoginRetry() && lastPhone && lastPassword) {
-              console.error("[nav] Cookie expired, auto-login with saved credentials...");
-              try {
-                const submitted = await tryAutoLoginInPopup(popup, "[nav]");
-                if (submitted) {
-                  console.error("[nav] Auto-login submitted, waiting...");
-                  await randomDelay(3000, 5000);
-                }
-
-                // 等待登录完成或验证码
-                for (let i = 0; i < 30; i++) {
-                  await randomDelay(2000, 3000);
-                  if (await tryAuthInPopup()) { authHandled = true; break; }
-                  if (!popup.url().includes("login") && !popup.url().includes("seller-login")) break;
-                }
-                if (authHandled) {
-                  await saveCookies();
-                  console.error("[nav] Auto-login succeeded!");
-                }
-              } catch (e) {
-                console.error("[nav] Auto-login failed:", e.message);
-              }
-            } else if (!shouldAutoLoginRetry()) {
-              console.error("[nav] Auto-login retry disabled by settings, waiting for manual login...");
-            }
-
-            if (!authHandled) {
-            console.error("[nav] Waiting for user manual login (max 2min)...");
-
-            // 勾选 checkbox（隐私政策）
-            try {
-              const cb = popup.locator('input[type="checkbox"]').first();
-              if (await cb.isVisible({ timeout: 2000 })) {
-                const checked = await cb.isChecked();
-                if (!checked) await cb.click();
-              }
-            } catch (e) { logSilent("ui.action", e); }
-
-            try {
-              // 等待 URL 变化或授权弹窗出现
-              await Promise.race([
-                popup.waitForURL((u) => !u.toString().includes("/login") && !u.toString().includes("seller-login"), { timeout: 120000 }),
-                (async () => {
-                  for (let i = 0; i < 24; i++) {
-                    await randomDelay(5000, 5000);
-                    if (await tryAuthInPopup()) return;
-                  }
-                })(),
-              ]);
-              console.error("[nav] Login/auth completed, popup URL:", popup.url());
-              await randomDelay(3000, 5000);
-            } catch {
-              console.error("[nav] Login timeout");
-            }
-            await saveCookies();
-          }
-          } // end if (!authHandled) fallback
-        } else {
-          // Popup 是授权确认页（包括 kuajingmaihuo.com 授权页）
-          console.error("[nav] Popup is auth confirmation page, URL:", popup.url());
-          await randomDelay(2000, 3000);
-
-          // 用 locator 方式勾选 checkbox
-          try {
-            const cb = popup.locator('input[type="checkbox"]').first();
-            if (await cb.isVisible({ timeout: 3000 })) {
-              const checked = await cb.isChecked().catch(() => false);
-              if (!checked) { await cb.click(); console.error("[nav] Popup: checked checkbox via locator"); }
-            } else {
-              const authLabel = popup.locator('text=授权').first();
-              if (await authLabel.isVisible({ timeout: 1000 })) await authLabel.click();
-            }
-          } catch (e) { logSilent("ui.action", e); }
-
-          // 用 locator 方式点击确认按钮
-          let popupBtnClicked = false;
-          try {
-            const btn = popup.locator('button:has-text("确认授权并前往")').first();
-            if (await btn.isVisible({ timeout: 2000 })) {
-              await btn.click();
-              console.error("[nav] Popup: clicked '确认授权并前往' via locator");
-              popupBtnClicked = true;
-            }
-          } catch (e) { logSilent("ui.action", e); }
-          if (!popupBtnClicked) {
-            try {
-              const btn2 = popup.locator('button:has-text("确认授权")').first();
-              if (await btn2.isVisible({ timeout: 1000 })) {
-                await btn2.click();
-                console.error("[nav] Popup: clicked '确认授权' via locator");
-                popupBtnClicked = true;
-              }
-            } catch (e) { logSilent("ui.action", e); }
-          }
-
-          // fallback: evaluate 方式
-          if (!popupBtnClicked) {
-            await popup.evaluate(() => {
-              const inputs = [...document.querySelectorAll('input[type="checkbox"]')];
-              for (const cb of inputs) { if (!cb.checked) cb.click(); }
-              const customs = [...document.querySelectorAll('[class*="checkbox"], [class*="Checkbox"], [role="checkbox"], label')];
-              for (const el of customs) {
-                const text = el.innerText || "";
-                if (text.includes("授权") || text.includes("同意")) { el.click(); break; }
-              }
-            });
-            await randomDelay(500, 1000);
-            const popupBtn = await popup.evaluate(() => {
-              const keywords = ["确认授权并前往", "确认授权", "确认并前往", "进入"];
-              const all = [...document.querySelectorAll('button, [role="button"], a, div[class*="btn"], div[class*="Btn"], span[class*="btn"]')];
-              for (const kw of keywords) {
-                for (const el of all) {
-                  const text = (el.innerText || "").trim();
-                  if (text.includes(kw) && text.length < 20) { el.click(); return "clicked: " + text; }
-                }
-              }
-              return "not found";
-            });
-            console.error("[nav] Popup confirm (fallback):", popupBtn);
-            if (popupBtn !== "not found") await randomDelay(5000, 8000);
-          }
-        }
-
-        // 点击确认后，等待跳转发生
-        console.error("[nav] Waiting for redirect after auth confirm...");
-        await randomDelay(5000, 8000);
-
-        // 检查 popup 是否跳转了（不要关闭，让浏览器自己处理）
-        try {
-          if (!popup.isClosed()) {
-            console.error("[nav] Popup still open, URL:", popup.url());
-            // popup 可能跳转到了 agentseller
-            if (popup.url().includes("agentseller.temu.com") && !popup.url().includes("authentication")) {
-              console.error("[nav] Popup redirected to agentseller, using as main page");
-              page = popup;
-            } else {
-              // 等待 popup 跳转
-              try {
-                await popup.waitForURL((u) => u.toString().includes("agentseller.temu.com"), { timeout: 15000 });
-                console.error("[nav] Popup redirected to:", popup.url());
-                if (!popup.url().includes("authentication")) {
-                  page = popup;
-                }
-              } catch {
-                console.error("[nav] Popup did not redirect, closing...");
-                await popup.close().catch(() => {});
-              }
-            }
-          }
-        } catch (e) { logSilent("ui.action", e); }
-
-        await randomDelay(2000, 3000);
-
-        // 检查原页面是否也跳转了
-        console.error("[nav] Original page URL:", page.url());
-
-        // 如果原页面还在 authentication，直接导航
-        if (page.url().includes("/main/authentication")) {
-          console.error("[nav] Still on auth, trying direct navigation...");
-          await page.goto(directUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-          await randomDelay(5000, 8000);
-          console.error("[nav] After direct goto, URL:", page.url());
-
-          // 如果现在进入了新的 authentication 页面（有进入按钮的那个）
-          if (page.url().includes("/main/authentication")) {
-            await randomDelay(3000, 5000);
-            // 再试勾选 + 点击进入
-            await page.evaluate(() => {
-              const inputs = [...document.querySelectorAll('input[type="checkbox"]')];
-              for (const cb of inputs) { if (!cb.checked) cb.click(); }
-              const customs = [...document.querySelectorAll('[class*="checkbox"], [class*="Checkbox"], [role="checkbox"], label')];
-              for (const el of customs) {
-                const t = el.innerText || "";
-                if (t.includes("授权") || t.includes("同意")) { el.click(); break; }
-              }
-            });
-            await randomDelay(500, 1000);
-            const enterResult2 = await page.evaluate(() => {
-              const keywords = ["进入", "确认授权并前往", "确认授权"];
-              const all = [...document.querySelectorAll('button, [role="button"], a, div[class*="btn"], div[class*="Btn"], span[class*="btn"]')];
-              for (const kw of keywords) {
-                for (const el of all) {
-                  const text = (el.innerText || "").trim();
-                  if (text.includes(kw) && text.length < 20) { el.click(); return "clicked: " + text; }
-                }
-              }
-              return "not found";
-            });
-            console.error("[nav] Enter button (retry):", enterResult2);
-            if (enterResult2 !== "not found") await randomDelay(5000, 8000);
-          }
-        }
-
-        // 最终检查所有页面
-        const pages = context.pages();
-        console.error(`[nav] After full auth flow, ${pages.length} pages:`);
-        for (const p of pages) console.error(`  - ${p.url()}`);
-        const targetPage = pages.find(p =>
-          p.url().includes("agentseller.temu.com") && !p.url().includes("authentication")
-        );
-        if (targetPage && targetPage !== page) {
-          console.error("[nav] Found target page, switching");
-          page = targetPage;
-        }
-      } else {
-        console.error("[nav] No popup, trying same-page fallback...");
-        await randomDelay(2000, 3000);
-      }
-    }
-
-    // 导航到目标页面
-    if (page.url().includes("/main/authentication") || !page.url().includes(targetPath)) {
-      console.error("[nav] Still on auth, trying direct goto...");
-      await page.goto(directUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await randomDelay(3000, 5000);
-    }
-  }
-
-  // 情况2：被重定向到商家中心登录页（seller.kuajingmaihuo.com）
-  if (page.url().includes("seller.kuajingmaihuo.com")) {
-    console.error("[nav] Redirected to seller.kuajingmaihuo.com, handling auth...");
-    await randomDelay(2000, 3000);
-
-    // 处理授权弹窗：勾选 checkbox + 点击"确认授权并前往"
-    async function handleAuthDialog() {
-      // 等待弹窗出现
-      await randomDelay(1000, 2000);
-
-      // 查找并勾选 checkbox
-      const cbClicked = await page.evaluate(() => {
-        // 找所有 checkbox（input 和自定义组件）
-        const inputs = [...document.querySelectorAll('input[type="checkbox"]')];
-        for (const cb of inputs) {
-          if (!cb.checked) { cb.click(); return "checked input"; }
-          return "already checked";
-        }
-        // 自定义 checkbox
-        const customs = [...document.querySelectorAll('[class*="checkbox"], [class*="Checkbox"], [role="checkbox"]')];
-        for (const el of customs) {
-          el.click(); return "clicked custom: " + (el.className?.toString().slice(0, 50) || el.tagName);
-        }
-        // label 里的 checkbox
-        const labels = [...document.querySelectorAll('label')];
-        for (const label of labels) {
-          const text = label.innerText || "";
-          if (text.includes("授权") || text.includes("同意") || text.includes("隐私")) {
-            label.click(); return "clicked label: " + text.slice(0, 30);
-          }
-        }
-        return "not found";
-      });
-      console.error("[nav] Checkbox result:", cbClicked);
-      await randomDelay(500, 1000);
-
-      // 点击"确认授权并前往"或"进入"按钮
-      const btnClicked = await page.evaluate(() => {
-        const keywords = ["确认授权并前往", "确认授权", "确认并前往", "进入"];
-        const all = [...document.querySelectorAll('button, [role="button"], a, div[class*="btn"], div[class*="Btn"], span[class*="btn"]')];
-        for (const keyword of keywords) {
-          for (const el of all) {
-            const text = el.innerText?.trim() || "";
-            if (text.includes(keyword) && text.length < 20) {
-              el.click(); return "clicked: " + text;
-            }
-          }
-        }
-        return "not found";
-      });
-      console.error("[nav] Confirm button result:", btnClicked);
-      if (btnClicked !== "not found") {
-        await randomDelay(5000, 8000);
-      }
-    }
-
-    // 检查是否已经有授权弹窗
-    const hasDialog = await page.evaluate(() => {
-      const text = document.body.innerText || "";
-      return text.includes("确认授权") || text.includes("即将前往") || text.includes("Seller Central") || text.includes("进入");
-    });
-
-    if (hasDialog) {
-      console.error("[nav] Auth dialog already visible, handling...");
-      await handleAuthDialog();
-    } else {
-      // 没有弹窗，尝试触发它（展开商品管理菜单）
-      console.error("[nav] No auth dialog, trying to trigger via menu...");
-      try {
-        await page.getByText("商品管理", { exact: true }).first().click();
-        await randomDelay(800, 1200);
-        await page.getByText("商品列表", { exact: true }).first().click();
-        await randomDelay(2000, 3000);
-      } catch (e) { logSilent("ui.action", e); }
-      await handleAuthDialog();
-    }
-
-    // 再次访问目标页面
-    if (!page.url().includes("agentseller.temu.com") || page.url().includes("authentication")) {
-      await page.goto(directUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await page.waitForSelector("body", { timeout: lite ? 2000 : 5000 }).catch(() => {});
-      await randomDelay(lite ? 500 : 1200, lite ? 900 : 1800);
-    }
-  }
-
-  console.error(`[nav] Final URL: ${page.url()}`);
-
-  // 关闭页面上可能的弹窗
-  for (let i = 0; i < 8; i++) {
-    try {
-      const popup = page.locator('button:has-text("知道了"), button:has-text("我知道了"), button:has-text("确定"), button:has-text("关闭"), button:has-text("查看详情")').first();
-      if (await popup.isVisible({ timeout: 800 })) {
-        await popup.click();
-        await randomDelay(300, 600);
-      } else break;
-    } catch { break; }
-  }
-  await page.evaluate(() => {
-    document.querySelectorAll('[class*=close],[class*=Close]').forEach(el => { try { el.click(); } catch {} });
+  await openSellerCentralTarget(activePage, resolvedTargetPath, {
+    lite,
+    logPrefix: `${logPrefix}-open`,
   });
+
+  let ready = await ensureSellerCentralSessionReady(activePage, resolvedTargetPath, `${logPrefix}-session`);
+  activePage = getLatestWorkerPage(activePage) || activePage;
+
+  const shouldReopenTarget = (currentUrl = "") => {
+    if (!currentUrl) return true;
+    if (isSellerCentralAuthUrl(currentUrl)) return true;
+    if (!isSellerCentralWorkspaceUrl(currentUrl)) return true;
+    if (/^https?:\/\//i.test(String(resolvedTargetPath || ""))) {
+      return !currentUrl.startsWith(directUrlWithoutQuery);
+    }
+    return !currentUrl.includes(String(resolvedTargetPath));
+  };
+
+  if (ready && shouldReopenTarget(activePage?.url?.() || "")) {
+    console.error(`${logPrefix} Reopening exact target after session warmup: ${activePage?.url?.() || ""}`);
+    await openSellerCentralTarget(activePage, resolvedTargetPath, {
+      lite,
+      logPrefix: `${logPrefix}-reopen`,
+    });
+    ready = await ensureSellerCentralSessionReady(activePage, resolvedTargetPath, `${logPrefix}-recheck`);
+    activePage = getLatestWorkerPage(activePage) || activePage;
+  }
+
+  if (!ready) {
+    const failedPage = getLatestWorkerPage(activePage) || activePage;
+    const failedUrl = failedPage?.url?.() || "";
+    await captureWorkerErrorScreenshot("seller_central_nav_failed", failedPage);
+    if (__fatalLoginError) {
+      throw new Error(__fatalLoginError);
+    }
+    throw new Error(`登录超时，仍停留在 ${failedUrl || directUrl}`);
+  }
+
+  await handleOpenSellerAuthPages(`${logPrefix}-final-popup`).catch((error) => logSilent("ui.action", error));
+  activePage = getLatestWorkerPage(activePage) || activePage;
+  await dismissCommonDialogs(activePage, ["查看详情"]).catch((error) => logSilent("ui.action", error));
   await randomDelay(lite ? 200 : 500, lite ? 400 : 1000);
-  return page;
+
+  console.error(`${logPrefix} Final URL: ${activePage?.url?.() || ""}`);
+  return activePage;
 }
 
 // 核心采集函数已移到 scrape-registry.mjs（配置驱动）
@@ -6598,12 +6311,323 @@ async function captureApiRequests(targetUrl) {
   }
 }
 
+const FLUX_ANALYSIS_TARGETS = {
+  flux: {
+    siteLabel: "\u5168\u7403",
+    fullUrl: "https://agentseller.temu.com/main/flux-analysis-full",
+  },
+  fluxUS: {
+    siteLabel: "\u7f8e\u56fd",
+    fullUrl: "https://agentseller-us.temu.com/main/flux-analysis-full",
+  },
+  fluxEU: {
+    siteLabel: "\u6b27\u533a",
+    fullUrl: "https://agentseller-eu.temu.com/main/flux-analysis-full",
+  },
+};
+
+const FLUX_ANALYSIS_RANGE_STEPS = [
+  { label: "\u4eca\u65e5", aliases: ["\u4eca\u65e5", "\u5f53\u5929"] },
+  { label: "\u8fd17\u65e5", aliases: ["\u8fd17\u65e5", "\u8fd17\u5929"] },
+  { label: "\u8fd130\u65e5", aliases: ["\u8fd130\u65e5", "\u8fd130\u5929"] },
+  { label: "\u672c\u6708", aliases: ["\u672c\u6708"] },
+];
+
+function normalizeFluxUiText(text = "") {
+  return String(text || "")
+    .replace(/\s+/g, "")
+    .replace(/\u00a0/g, "")
+    .trim();
+}
+
+async function closeFluxAnalysisPrompts(page) {
+  for (let round = 0; round < 6; round += 1) {
+    let clicked = false;
+    try {
+      const btn = page.locator(
+        'button:has-text("知道了"), button:has-text("我知道了"), button:has-text("确定"), button:has-text("关闭"), button:has-text("暂不"), button:has-text("去处理")'
+      ).first();
+      if (await btn.isVisible({ timeout: 500 })) {
+        await btn.click();
+        clicked = true;
+      }
+    } catch {}
+
+    if (!clicked) {
+      try {
+        clicked = await page.evaluate(() => {
+          const nodes = Array.from(document.querySelectorAll("button, span, div, i"));
+          for (const node of nodes) {
+            const text = (node.textContent || "").replace(/\s+/g, "");
+            if (!text) continue;
+            if (!["知道了", "我知道了", "确定", "关闭", "暂不", "去处理"].some((keyword) => text.includes(keyword))) {
+              continue;
+            }
+            const rect = node.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) continue;
+            node.click();
+            return true;
+          }
+          return false;
+        });
+      } catch {}
+    }
+
+    if (!clicked) break;
+    await randomDelay(300, 600);
+  }
+}
+
+async function clickFluxRangeTab(page, aliases = []) {
+  try {
+    return await page.evaluate((rangeAliases) => {
+      const normalizedAliases = rangeAliases.map((value) =>
+        String(value || "").replace(/\s+/g, "").replace(/\u00a0/g, "").trim()
+      );
+      const elements = Array.from(
+        document.querySelectorAll('button, [role="button"], .arco-radio-button, .arco-segmented-item, .arco-tabs-tab, .tab, .tabs-item, span, div')
+      );
+      const matches = elements.filter((element) => {
+        const text = (element.textContent || "").replace(/\s+/g, "").replace(/\u00a0/g, "").trim();
+        if (!text) return false;
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        return normalizedAliases.some((alias) => text === alias || text.includes(alias));
+      });
+      const target = matches.find((element) => {
+        const disabled = element.getAttribute("disabled") !== null
+          || element.getAttribute("aria-disabled") === "true"
+          || element.classList.contains("disabled")
+          || element.classList.contains("is-disabled");
+        return !disabled;
+      });
+      if (!target) return false;
+      target.click();
+      return true;
+    }, aliases);
+  } catch {
+    return false;
+  }
+}
+
+function extractFluxIdentity(resp) {
+  try {
+    const request = resp.request?.();
+    const raw = request?.postData?.() || "";
+    if (!raw) return null;
+    const payload = JSON.parse(raw);
+    const identity = {
+      goodsId: String(payload?.goodsId || payload?.productId || payload?.productSpuId || ""),
+      productSkcId: String(payload?.productSkcId || payload?.skcId || payload?.goodsSkcId || ""),
+      productSkuId: String(payload?.productSkuId || payload?.skuId || ""),
+      productSpuId: String(payload?.productSpuId || payload?.productId || payload?.spuId || ""),
+      goodsName: String(payload?.goodsName || payload?.productName || payload?.title || ""),
+    };
+    return Object.values(identity).some(Boolean) ? identity : null;
+  } catch {
+    return null;
+  }
+}
+
+async function scrapeCustomTask(taskKey, task = {}) {
+  if (task?.custom !== "fluxAnalysis") {
+    throw new Error(`Unsupported custom task: ${taskKey}`);
+  }
+
+  const target = FLUX_ANALYSIS_TARGETS[taskKey];
+  if (!target) {
+    throw new Error(`Unsupported flux analysis task: ${taskKey}`);
+  }
+
+  let currentRangeLabel = "\u8fd17\u65e5";
+  const capturedApis = [];
+  const seen = new Set();
+  const responseTracker = createPendingTaskTracker();
+  const page = await createSellerCentralPage(target.fullUrl, {
+    lite: false,
+    readyDelayMin: 1200,
+    readyDelayMax: 1800,
+    logPrefix: `[flux:${taskKey}]`,
+  });
+
+  const hasRangeApi = (rangeLabel, pathPart) =>
+    capturedApis.some((entry) => entry.rangeLabel === rangeLabel && String(entry.path || "").includes(pathPart));
+
+  const waitForRangeApis = async (rangeLabel, timeoutMs = 18000) => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (hasRangeApi(rangeLabel, "/mall/summary") && hasRangeApi(rangeLabel, "/goods/list")) {
+        return true;
+      }
+      await randomDelay(350, 650);
+    }
+    return hasRangeApi(rangeLabel, "/mall/summary") || hasRangeApi(rangeLabel, "/goods/list");
+  };
+
+  try {
+    page.on("response", (resp) => responseTracker.track((async () => {
+      try {
+        const url = resp.url();
+        const pathname = new URL(url).pathname;
+        if (!pathname.includes("/api/seller/full/flow/analysis/")) return;
+        if (resp.status() !== 200) return;
+        const contentType = resp.headers()["content-type"] || "";
+        if (!contentType.includes("json")) return;
+
+        const body = await resp.json().catch(() => null);
+        if (!body || (body.result === undefined && body.success === undefined)) return;
+
+        const dedupeKey = [
+          currentRangeLabel,
+          pathname,
+          JSON.stringify(body?.result ?? body).slice(0, 400),
+        ].join("|");
+        if (seen.has(dedupeKey)) return;
+        seen.add(dedupeKey);
+
+        const entry = {
+          path: pathname,
+          data: body,
+          rangeLabel: currentRangeLabel,
+        };
+        const fluxIdentity = extractFluxIdentity(resp);
+        if (fluxIdentity) entry.fluxIdentity = fluxIdentity;
+        capturedApis.push(entry);
+        console.error(`[flux:${taskKey}] Captured ${pathname} @ ${currentRangeLabel}`);
+      } catch (error) {
+        logSilent("ui.action", error);
+      }
+    })()));
+
+    await closeFluxAnalysisPrompts(page);
+    await randomDelay(900, 1400);
+
+    const availableRanges = [];
+    for (const step of FLUX_ANALYSIS_RANGE_STEPS) {
+      currentRangeLabel = step.label;
+      const clicked = await clickFluxRangeTab(page, step.aliases);
+      if (clicked) {
+        await randomDelay(900, 1500);
+      }
+      const hit = await waitForRangeApis(step.label, clicked ? 18000 : 12000);
+      if (hit) {
+        availableRanges.push(step.label);
+      } else {
+        console.error(`[flux:${taskKey}] Missing business APIs for ${step.label}`);
+      }
+    }
+
+    await responseTracker.drain(2500);
+    await saveCookies();
+
+    const primaryRangeLabel = availableRanges.includes("\u8fd17\u65e5")
+      ? "\u8fd17\u65e5"
+      : (availableRanges[0] || "\u4eca\u65e5");
+
+    // ---- 商品日趋势采集：为每个商品请求最近30天的每日流量 ----
+    try {
+      const goodsListApis = capturedApis.filter((a) => String(a.path || "").includes("/goods/list"));
+      const allGoodsIds = new Set();
+      for (const api of goodsListApis) {
+        const list = api.data?.result?.list || api.data?.result?.pageItems || [];
+        for (const item of list) {
+          const gid = String(item.goodsId || item.productSkcId || "");
+          if (gid) allGoodsIds.add(gid);
+        }
+      }
+      if (allGoodsIds.size > 0) {
+        console.error(`[flux:${taskKey}] Fetching daily trends for ${allGoodsIds.size} products...`);
+        const endDate = new Date().toISOString().slice(0, 10);
+        const startDate = new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10);
+        const dailyCache = {};
+        let fetchedCount = 0;
+        for (const goodsId of allGoodsIds) {
+          try {
+            const resp = await page.evaluate(async ({ goodsId, startDate, endDate }) => {
+              try {
+                const r = await fetch("/api/seller/full/flow/analysis/goods/detail", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ goodsId, startDate, endDate }),
+                });
+                if (!r.ok) return null;
+                return await r.json();
+              } catch { return null; }
+            }, { goodsId, startDate, endDate });
+            if (resp?.result) {
+              const detailList = resp.result.list || resp.result.dailyList || resp.result.trendList || [];
+              if (Array.isArray(detailList) && detailList.length > 0) {
+                dailyCache[goodsId] = {
+                  stations: {
+                    [target.siteLabel]: {
+                      daily: detailList.map((d) => ({
+                        date: d.statDate || d.day || d.date || "",
+                        exposeNum: d.exposeNum || d.goodsExposeNum || 0,
+                        clickNum: d.clickNum || d.goodsClickNum || 0,
+                        detailVisitNum: d.goodsDetailVisitNum || d.detailVisitNum || d.goodsPageView || 0,
+                        detailVisitorNum: d.goodsDetailVisitorNum || d.detailVisitorNum || 0,
+                        addToCartUserNum: d.addToCartUserNum || 0,
+                        collectUserNum: d.collectUserNum || 0,
+                        buyerNum: d.buyerNum || d.payBuyerNum || 0,
+                        payGoodsNum: d.payGoodsNum || 0,
+                        payOrderNum: d.payOrderNum || 0,
+                        exposeClickRate: d.exposeClickConversionRate || d.exposeClickRate || 0,
+                        clickPayRate: d.clickPayConversionRate || d.clickPayRate || 0,
+                        searchExposeNum: d.searchExposeNum || 0,
+                        searchClickNum: d.searchClickNum || 0,
+                        searchPayGoodsNum: d.searchPayGoodsNum || 0,
+                        searchPayOrderNum: d.searchPayOrderNum || 0,
+                        recommendExposeNum: d.recommendExposeNum || 0,
+                        recommendClickNum: d.recommendClickNum || 0,
+                        recommendPayGoodsNum: d.recommendPayGoodsNum || 0,
+                        recommendPayOrderNum: d.recommendPayOrderNum || 0,
+                      })),
+                    },
+                  },
+                };
+                fetchedCount++;
+              }
+            }
+            await randomDelay(200, 500);
+          } catch (e) {
+            console.error(`[flux:${taskKey}] Failed to fetch daily for ${goodsId}:`, e?.message);
+          }
+        }
+        if (fetchedCount > 0) {
+          console.error(`[flux:${taskKey}] Got daily trends for ${fetchedCount}/${allGoodsIds.size} products`);
+          // 将日趋势数据放入返回结果，由 CollectionContext 保存
+          capturedApis.push({
+            path: "__flux_product_daily_cache__",
+            data: { result: dailyCache },
+            rangeLabel: "__daily__",
+          });
+        }
+      }
+    } catch (dailyErr) {
+      console.error(`[flux:${taskKey}] Daily trend fetch failed:`, dailyErr?.message);
+    }
+
+    return {
+      apis: capturedApis,
+      meta: {
+        siteLabel: target.siteLabel,
+        rangeLabel: primaryRangeLabel,
+      },
+      availableRanges,
+    };
+  } finally {
+    await responseTracker.drain(2000);
+    await page.close().catch(() => {});
+  }
+}
+
 // ---- 注册表采集辅助（供 scrape_all 使用） ----
 const _scrapeExecutors = () => ({
   scrapePageCaptureAll,
   scrapeSidebarCaptureAll,
   scrapePageWithListener,
   scrapeGovernPage: (subPath, meta) => scrapeSingleGovernTarget(subPath, meta),
+  scrapeCustomTask,
   ensureBrowser,
 });
 const _registryScrape = (key) => {
@@ -6759,170 +6783,16 @@ async function handleRequest(body) {
       });
 
       try {
-      // 一键采集：并发执行，用弹窗监控器自动处理授权弹窗
-      // 接收 main 进程传来的凭据，用于 cookie 过期时自动登录
       if (params.credentials?.phone) {
         console.error(`[scrape_all] Received credentials for ${params.credentials.phone.slice(0, 3)}***`);
       }
       await ensureBrowser();
       console.error("[scrape_all] Step 1: Setup popup monitor + establish session...");
-
-      // ★ 弹窗监控器：监听所有新窗口，自动处理授权弹窗
-      let popupMonitorActive = true;
-      const handleAuthPopup = async (newPage) => {
-        if (!popupMonitorActive) return;
-        try {
-          const url = newPage.url();
-          console.error(`[popup-monitor] New page detected: ${url}`);
-
-          // 等待页面加载
-          await newPage.waitForLoadState("domcontentloaded").catch(() => {});
-          await randomDelay(2000, 4000);
-
-          const currentUrl = newPage.url();
-          console.error(`[popup-monitor] Page loaded, URL: ${currentUrl}`);
-
-          // 只处理 kuajingmaihuo.com 授权弹窗
-          if (!currentUrl.includes("kuajingmaihuo.com") && !currentUrl.includes("seller-login")) {
-            console.error("[popup-monitor] Not an auth popup, ignoring");
-            return;
-          }
-
-          // 等待授权弹窗内容出现（最多30秒）
-          for (let attempt = 0; attempt < 10; attempt++) {
-            try {
-              const latestUrl = newPage.url();
-              if (latestUrl.includes("seller-login") || latestUrl.includes("/login")) {
-                await tryAutoLoginInPopup(newPage, "[popup-monitor]");
-              }
-
-              const text = await newPage.evaluate(() => document.body?.innerText || "");
-              if (text.includes("确认授权") || text.includes("即将前往") || text.includes("Seller Central") || text.includes("授权登录")) {
-                console.error(`[popup-monitor] Auth dialog found on attempt ${attempt + 1}!`);
-
-                // 勾选 checkbox
-                try {
-                  const cb = newPage.locator('input[type="checkbox"]').first();
-                  if (await cb.isVisible({ timeout: 2000 })) {
-                    const checked = await cb.isChecked().catch(() => false);
-                    if (!checked) {
-                      await cb.click();
-                      console.error("[popup-monitor] Checkbox checked");
-                    }
-                  }
-                } catch (e) {
-                  // fallback
-                  await newPage.evaluate(() => {
-                    const inputs = [...document.querySelectorAll('input[type="checkbox"]')];
-                    for (const cb of inputs) { if (!cb.checked) cb.click(); }
-                  }).catch(() => {});
-                }
-                await randomDelay(500, 1000);
-
-                // 点击"确认授权并前往"
-                let clicked = false;
-                try {
-                  const btn = newPage.locator('button:has-text("授权登录")').first();
-                  if (await btn.isVisible({ timeout: 2000 })) {
-                    await btn.click();
-                    console.error("[popup-monitor] Clicked '授权登录'");
-                    clicked = true;
-                  }
-                } catch (e) { logSilent("ui.action", e); }
-                if (!clicked) {
-                  try {
-                    const btn1b = newPage.locator('button:has-text("确认授权并前往")').first();
-                    if (await btn1b.isVisible({ timeout: 1000 })) {
-                      await btn1b.click();
-                      console.error("[popup-monitor] Clicked '确认授权并前往'");
-                      clicked = true;
-                    }
-                  } catch (e) { logSilent("ui.action", e); }
-                }
-                if (!clicked) {
-                  try {
-                    const btn2 = newPage.locator('button:has-text("确认授权")').first();
-                    if (await btn2.isVisible({ timeout: 1000 })) {
-                      await btn2.click();
-                      console.error("[popup-monitor] Clicked '确认授权'");
-                      clicked = true;
-                    }
-                  } catch (e) { logSilent("ui.action", e); }
-                }
-                if (!clicked) {
-                  // evaluate fallback
-                  const result = await newPage.evaluate(() => {
-                    const keywords = ["授权登录", "确认授权并前往", "确认授权", "确认并前往", "进入"];
-                    const all = [...document.querySelectorAll('button, [role="button"], a, div[class*="btn"]')];
-                    for (const kw of keywords) {
-                      for (const el of all) {
-                        const text = (el.innerText || "").trim();
-                        if (text.includes(kw) && text.length < 20) { el.click(); return "clicked: " + text; }
-                      }
-                    }
-                    return "not found";
-                  });
-                  console.error("[popup-monitor] Fallback button result:", result);
-                }
-
-                await saveCookies();
-                console.error("[popup-monitor] Auth popup handled successfully!");
-                return;
-              }
-            } catch (e) {
-              if (newPage.isClosed()) return;
-            }
-            await randomDelay(2000, 3000);
-          }
-          console.error("[popup-monitor] Auth dialog not found after 10 attempts");
-        } catch (e) {
-          console.error("[popup-monitor] Error handling popup:", e.message);
-        }
-      };
-
-      // 注册弹窗监控
-      context.on("page", handleAuthPopup);
-      console.error("[popup-monitor] Monitor registered");
-
-      // Step 1: 用一个页面先完成授权流程（warmup 用完整模式）
-      const warmupPage = await context.newPage();
+      const stopPopupMonitor = registerSellerAuthPopupMonitor("[popup-monitor]");
       try {
-        await navigateToSellerCentral(warmupPage, "/goods/list", { lite: false });
-        await randomDelay(2000, 3000);
-
-        // 如果 warmup 后仍在登录/入口页，阻塞等待用户手动登录（最长 5 分钟）
-        const waitForLoginDeadline = Date.now() + 5 * 60 * 1000;
-        let warnedUser = false;
-        while (Date.now() < waitForLoginDeadline) {
-          const cur = warmupPage.url();
-          if (!cur.includes("/main/authentication") && !cur.includes("/main/entry") && !cur.includes("seller-login")) {
-            console.error(`[scrape_all] Login confirmed: ${cur}`);
-            break;
-          }
-          if (!warnedUser) {
-            console.error(`[scrape_all] ⚠ Waiting for user manual login in worker browser. Current URL: ${cur}`);
-            warnedUser = true;
-          }
-          await randomDelay(1800, 2500);
-          // 尝试点击入口按钮 / 自动登录（最大努力）
-          await triggerSellerCentralAuthEntry(warmupPage, "[scrape_all-wait]").catch(() => {});
-        }
-        const finalUrl = warmupPage.url();
-        if (finalUrl.includes("/main/authentication") || finalUrl.includes("/main/entry") || finalUrl.includes("seller-login")) {
-          throw new Error(`登录超时，仍停留在: ${finalUrl}。请在 worker 浏览器中手动登录后重试一键采集。`);
-        }
-        // 关闭页面弹窗
-        for (let i = 0; i < 5; i++) {
-          try {
-            const btn = warmupPage.locator('button:has-text("知道了"), button:has-text("我知道了"), button:has-text("确定"), button:has-text("关闭"), button:has-text("暂不")').first();
-            if (await btn.isVisible({ timeout: 500 })) await btn.click();
-            else break;
-          } catch { break; }
-        }
-        await saveCookies();
-        console.error("[scrape_all] Session established, URL:", warmupPage.url());
-      } finally {
-        await warmupPage.close();
+        await establishSellerCentralSession("[scrape_all]");
+      } catch (error) {
+        throw new Error(`登录超时或授权未完成：${error.message}`);
       }
 
       // Step 2: 并发执行采集，限制并发避免风控
@@ -7150,8 +7020,7 @@ async function handleRequest(body) {
       } finally {
       // 关闭弹窗监控和 lite 模式（即使出错也要清理）
       _navLiteMode = false;
-      popupMonitorActive = false;
-      try { context.removeListener("page", handleAuthPopup); } catch (e) { console.error("[scrape_all] cleanup error:", e.message); }
+      try { stopPopupMonitor?.(); } catch (e) { console.error("[scrape_all] cleanup error:", e.message); }
       console.error("[popup-monitor] Monitor removed, lite mode off");
       }
 
@@ -7663,6 +7532,43 @@ async function handleRequest(body) {
       });
       console.error("[Worker] Pricing RESUMED");
       return { status: "resumed", taskId: currentProgress.taskId };
+    case "set_yunqi_token": {
+      const token = String(params?.token || "").trim();
+      if (!token) throw new Error("Yunqi token cannot be empty");
+      return await yunqiHandlers.setToken(token);
+    }
+    case "get_yunqi_token":
+      return await yunqiHandlers.getToken();
+    case "fetch_yunqi_token_from_browser":
+      return await yunqiHandlers.fetchTokenFromBrowser();
+    case "yunqi_set_credentials":
+      return await yunqiHandlers.setYunqiCredentials(params || {});
+    case "yunqi_get_credentials":
+      return await yunqiHandlers.getYunqiCredentials();
+    case "yunqi_delete_credentials":
+      return await yunqiHandlers.deleteYunqiCredentials();
+    case "yunqi_auto_login":
+      return await yunqiHandlers.autoLogin();
+    case "competitor_search":
+      return await yunqiHandlers.competitorSearch(params || {});
+    case "competitor_track":
+      return await yunqiHandlers.competitorTrack(params || {});
+    case "competitor_batch_track":
+      return await yunqiHandlers.competitorBatchTrack(params || {});
+    case "competitor_auto_register":
+      return await yunqiHandlers.competitorAutoRegister(params || {});
+    case "yunqi_db_import":
+      return await yunqiHandlers.yunqiDbImport(params || {});
+    case "yunqi_db_search":
+      return await yunqiHandlers.yunqiDbSearch(params || {});
+    case "yunqi_db_stats":
+      return await yunqiHandlers.yunqiDbStats();
+    case "yunqi_db_top":
+      return await yunqiHandlers.yunqiDbTop(params || {});
+    case "yunqi_db_info":
+      return await yunqiHandlers.yunqiDbInfo();
+    case "yunqi_db_sync_online":
+      return await yunqiHandlers.yunqiDbSyncOnline(params || {});
     default: {
       // 注册表驱动的采集命令（替代 50+ 重复 case）
       const scrapeHandlers = buildScrapeHandlers({
@@ -9030,27 +8936,26 @@ async function directAnalyzeProductImages({ sourceImagePath, productTitle, extra
   }
 
   try {
-    const response = await requestJsonOverHttps(`${AI_BASE_URL}/chat/completions`, {
-      model: AI_MODEL,
-      messages: [{ role: "user", content }],
-      temperature: 0.2,
-      max_tokens: 1200,
-    }, {
-      headers: {
-        Authorization: `Bearer ${AI_API_KEY}`,
-      },
-      timeoutMs: 300000,
-    });
-
-    if (!response.ok) {
+    const client = getAiGeminiClient();
+    if (!client) {
+      return { success: false, error: "Direct analyze fallback unavailable: missing AI_API_KEY" };
+    }
+    let response;
+    try {
+      response = await client.chat.completions.create({
+        model: AI_MODEL,
+        messages: [{ role: "user", content }],
+        temperature: 0.2,
+        max_tokens: 1200,
+      });
+    } catch (err) {
       return {
         success: false,
-        error: `Direct analyze fallback failed: ${response.status} ${String(response.text || "").slice(0, 240)}`.trim(),
+        error: `Direct analyze fallback failed: ${err?.message || String(err || "unknown error")}`,
       };
     }
 
-    const parsedResponse = JSON.parse(response.text || "{}");
-    const modelContent = parsedResponse?.choices?.[0]?.message?.content || "";
+    const modelContent = response?.choices?.[0]?.message?.content || "";
     const parsedAnalysis = extractJsonObjectFromText(modelContent);
     if (!parsedAnalysis || typeof parsedAnalysis !== "object") {
       return {
@@ -10577,32 +10482,27 @@ ${propsForAI.map((p, i) => `${i + 1}. ${p.name}${p.required ? '(必填)' : '(选
     console.error(`[getCategoryProperties] Calling AI to analyze ${propsForAI.length} required properties...`);
 
     // 调用 AI API（属性分析支持独立配置）
-    if (!ATTRIBUTE_AI_API_KEY) {
+    const attrClient = getAttributeGeminiClient();
+    if (!attrClient) {
       console.error(`[getCategoryProperties] ATTRIBUTE_AI_API_KEY not configured, using safe defaults`);
       throw new Error("skip_ai");
     }
 
-    const aiResp = await fetch(`${ATTRIBUTE_AI_BASE_URL}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${ATTRIBUTE_AI_API_KEY}` },
-      body: JSON.stringify({
+    try {
+      const aiData = await attrClient.chat.completions.create({
         model: ATTRIBUTE_AI_MODEL,
         messages: [{ role: "user", content: prompt }],
         temperature: 0.1,
-      }),
-    });
-
-    if (aiResp.ok) {
-      const aiData = await aiResp.json();
-      const content = aiData.choices?.[0]?.message?.content || "";
+      });
+      const content = aiData?.choices?.[0]?.message?.content || "";
       console.error(`[getCategoryProperties] AI raw response: ${content.slice(0, 300)}`);
       const jsonMatch = content.match(/\[[\s\S]*\]/);
       if (jsonMatch) {
         aiDecisions = JSON.parse(jsonMatch[0]);
         console.error(`[getCategoryProperties] AI returned ${aiDecisions.length} decisions`);
       }
-    } else {
-      console.error(`[getCategoryProperties] AI API error: ${aiResp.status} ${await aiResp.text().catch(() => '')}`);
+    } catch (innerErr) {
+      console.error(`[getCategoryProperties] AI API error: ${innerErr?.message || String(innerErr)}`);
     }
   } catch (e) {
     console.error(`[getCategoryProperties] AI analysis failed: ${e.message}, falling back to safe defaults`);
@@ -10820,19 +10720,23 @@ async function aiSelfRepair(errorMsg, errorCode, payload, params) {
 只返回需要的action，不要返回所有类型。`;
 
   try {
-    const resp = await fetch(`${AI_BASE_URL}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${AI_API_KEY}` },
-      body: JSON.stringify({ model: AI_MODEL, messages: [{ role: "user", content: prompt }], temperature: 0.1 }),
-    });
-
-    if (!resp.ok) {
-      console.error(`[selfRepair] AI API error: ${resp.status}`);
+    const client = getAiGeminiClient();
+    if (!client) {
+      console.error(`[selfRepair] AI_API_KEY not configured`);
       return null;
     }
-
-    const data = await resp.json();
-    const content = data.choices?.[0]?.message?.content || "";
+    let data;
+    try {
+      data = await client.chat.completions.create({
+        model: AI_MODEL,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.1,
+      });
+    } catch (innerErr) {
+      console.error(`[selfRepair] AI API error: ${innerErr?.message || String(innerErr)}`);
+      return null;
+    }
+    const content = data?.choices?.[0]?.message?.content || "";
     console.error(`[selfRepair] AI response: ${content.slice(0, 300)}`);
 
     const jsonMatch = content.match(/\{[\s\S]*\}/);
@@ -11239,19 +11143,15 @@ async function createProductViaAPI(params) {
       if (catPath) {
         try {
           console.error(`[api-create] AI verifying category: "${catPath}" for "${params.title.slice(0, 30)}..."`);
-          const verifyResp = await fetch(`${AI_BASE_URL}/chat/completions`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${AI_API_KEY}` },
-            body: JSON.stringify({
+          const verifyClient = getAiGeminiClient();
+          if (verifyClient) {
+            const vData = await verifyClient.chat.completions.create({
               model: AI_MODEL,
               messages: [{ role: "user", content: `商品标题: "${params.title.slice(0, 80)}"\n分类路径: "${catPath}"\n\n这个分类是否适合该商品？只回答 "yes" 或 "no"。如果商品明显不属于这个分类就回答no。` }],
               temperature: 0,
               max_tokens: 10,
-            }),
-          });
-          if (verifyResp.ok) {
-            const vData = await verifyResp.json();
-            const answer = (vData.choices?.[0]?.message?.content || "").trim().toLowerCase();
+            });
+            const answer = (vData?.choices?.[0]?.message?.content || "").trim().toLowerCase();
             console.error(`[api-create] Category verify: ${answer}`);
             if (answer.includes("no")) {
               console.error(`[api-create] Category mismatch! Re-searching with product title...`);
