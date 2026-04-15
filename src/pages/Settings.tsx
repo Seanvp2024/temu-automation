@@ -86,7 +86,7 @@ export default function Settings() {
             <Progress percent={updateStatus.progressPercent} strokeColor="var(--color-brand)" size="small" />
           )}
 
-          <Space>
+          <Space wrap>
             <Button icon={<ReloadOutlined />} onClick={handleCheckUpdate} disabled={updateStatus.status === "downloading"}>
               检查更新
             </Button>
@@ -100,7 +100,21 @@ export default function Settings() {
                 立即安装更新
               </Button>
             )}
+            {updateStatus.status === "error" && updateStatus.manualDownloadUrl && (
+              <Button
+                icon={<CloudDownloadOutlined />}
+                onClick={() => window.open(updateStatus.manualDownloadUrl, "_blank")}
+              >
+                手动下载最新版
+              </Button>
+            )}
           </Space>
+
+          {updateStatus.status === "error" && (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              若自动更新多次失败,可点击"手动下载最新版"从镜像站点直接下载安装包。
+            </Text>
+          )}
         </Space>
       </div>
 

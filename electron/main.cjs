@@ -318,8 +318,10 @@ function filterAutoPricingProductTable(inputPath) {
 
 // ============ 自动更新 ============
 
-const GITHUB_UPDATE_OWNER = "9619221";
-const GITHUB_UPDATE_REPO = "temu-automation";
+// 走 gh-proxy.com 反代 GitHub Release,避免大陆用户直连 github.com 超时
+// /releases/latest/download/ 是 GitHub 的稳定别名,不用每次发版改 URL
+const UPDATE_FEED_URL = "https://gh-proxy.com/https://github.com/9619221/temu-automation/releases/latest/download/";
+const UPDATE_MANUAL_DOWNLOAD_URL = "https://gh-proxy.com/https://github.com/9619221/temu-automation/releases/latest";
 
 let updateState = {
   status: "idle",
@@ -327,6 +329,7 @@ let updateState = {
   message: "未检查更新",
   releaseVersion: null,
   progressPercent: null,
+  manualDownloadUrl: UPDATE_MANUAL_DOWNLOAD_URL,
 };
 
 function broadcastUpdateState(patch) {
@@ -344,11 +347,10 @@ function configureAutoUpdater() {
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.setFeedURL({
-    provider: "github",
-    owner: GITHUB_UPDATE_OWNER,
-    repo: GITHUB_UPDATE_REPO,
+    provider: "generic",
+    url: UPDATE_FEED_URL,
   });
-  broadcastUpdateState({ message: `更新源: GitHub ${GITHUB_UPDATE_OWNER}/${GITHUB_UPDATE_REPO}` });
+  broadcastUpdateState({ message: "更新源: gh-proxy 镜像", manualDownloadUrl: UPDATE_MANUAL_DOWNLOAD_URL });
 }
 
 autoUpdater.on("checking-for-update", () => {
