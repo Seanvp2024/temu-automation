@@ -587,23 +587,85 @@ function pickLatestFluxDetailRecord(detailResult: any) {
   )[0];
 }
 
+// 汇总 goods/detail 返回的每日明细 list，把数值字段求和而不是只取最近一天，
+// 这样 KPI 卡、转化漏斗显示的就是"区间汇总"而不是"最新单日"，与 Temu 后台关键指标一致。
+function sumFluxDetailRecords(detailResult: any) {
+  const records = toArray(detailResult?.list);
+  if (records.length === 0) return null;
+  const numericKeys = [
+    "exposeNum", "goodsExposeNum",
+    "clickNum", "goodsClickNum",
+    "goodsDetailVisitNum", "detailVisitNum",
+    "goodsDetailVisitorNum", "detailVisitorNum",
+    "addToCartUserNum", "collectUserNum",
+    "buyerNum", "payBuyerNum", "payGoodsNum", "payOrderNum",
+    "searchExposeNum", "searchClickNum", "searchPayGoodsNum", "searchPayOrderNum",
+    "recommendExposeNum", "recommendClickNum", "recommendPayGoodsNum", "recommendPayOrderNum",
+  ];
+  const sum: Record<string, number> = {};
+  for (const key of numericKeys) sum[key] = 0;
+  for (const r of records) {
+    for (const key of numericKeys) {
+      sum[key] += toNumberValue(r?.[key]);
+    }
+  }
+  return sum;
+}
+
 function mergeFluxItemDetail(item: any, detailResult: any, trendResult: any) {
   const latestDetail = pickLatestFluxDetailRecord(detailResult);
+  const sumDetail = sumFluxDetailRecords(detailResult);
+  // 优先使用 sumDetail（区间汇总）覆盖 item，保持 KPI 口径与 Temu 后台"关键指标分析"一致；
+  // 若没有 daily list，则回退到 latestDetail 单行 / item 原值。
   return {
     ...item,
     dataDate: toStringValue(pickFirst(latestDetail?.statDate, trendResult?.pt)),
     updateTime: toStringValue(pickFirst(detailResult?.updateAt, detailResult?.updateTime)),
-    detailVisitorNum: toNumberValue(pickFirst(latestDetail?.goodsDetailVisitorNum, item.detailVisitorNum)),
-    collectUserNum: toNumberValue(pickFirst(latestDetail?.collectUserNum, item.collectUserNum)),
-    payOrderNum: toNumberValue(pickFirst(latestDetail?.payOrderNum, item.payOrderNum)),
-    payGoodsNum: toNumberValue(pickFirst(latestDetail?.payGoodsNum, item.payGoodsNum)),
-    buyerNum: toNumberValue(pickFirst(latestDetail?.buyerNum, item.buyerNum)),
-    searchExposeNum: toNumberValue(pickFirst(latestDetail?.searchExposeNum, item.searchExposeNum)),
-    searchClickNum: toNumberValue(pickFirst(latestDetail?.searchClickNum, item.searchClickNum)),
-    searchPayGoodsNum: toNumberValue(latestDetail?.searchPayGoodsNum),
-    recommendExposeNum: toNumberValue(pickFirst(latestDetail?.recommendExposeNum, item.recommendExposeNum)),
-    recommendClickNum: toNumberValue(pickFirst(latestDetail?.recommendClickNum, item.recommendClickNum)),
-    recommendPayGoodsNum: toNumberValue(latestDetail?.recommendPayGoodsNum),
+    exposeNum: sumDetail
+      ? (sumDetail.exposeNum || sumDetail.goodsExposeNum || toNumberValue(item.exposeNum))
+      : toNumberValue(item.exposeNum),
+    clickNum: sumDetail
+      ? (sumDetail.clickNum || sumDetail.goodsClickNum || toNumberValue(item.clickNum))
+      : toNumberValue(item.clickNum),
+    detailVisitNum: sumDetail
+      ? (sumDetail.goodsDetailVisitNum || sumDetail.detailVisitNum || toNumberValue(item.detailVisitNum))
+      : toNumberValue(item.detailVisitNum),
+    detailVisitorNum: sumDetail
+      ? (sumDetail.goodsDetailVisitorNum || sumDetail.detailVisitorNum || toNumberValue(item.detailVisitorNum))
+      : toNumberValue(pickFirst(latestDetail?.goodsDetailVisitorNum, item.detailVisitorNum)),
+    addToCartUserNum: sumDetail
+      ? (sumDetail.addToCartUserNum || toNumberValue(item.addToCartUserNum))
+      : toNumberValue(item.addToCartUserNum),
+    collectUserNum: sumDetail
+      ? (sumDetail.collectUserNum || toNumberValue(item.collectUserNum))
+      : toNumberValue(pickFirst(latestDetail?.collectUserNum, item.collectUserNum)),
+    payOrderNum: sumDetail
+      ? (sumDetail.payOrderNum || toNumberValue(item.payOrderNum))
+      : toNumberValue(pickFirst(latestDetail?.payOrderNum, item.payOrderNum)),
+    payGoodsNum: sumDetail
+      ? (sumDetail.payGoodsNum || toNumberValue(item.payGoodsNum))
+      : toNumberValue(pickFirst(latestDetail?.payGoodsNum, item.payGoodsNum)),
+    buyerNum: sumDetail
+      ? (sumDetail.buyerNum || sumDetail.payBuyerNum || toNumberValue(item.buyerNum))
+      : toNumberValue(pickFirst(latestDetail?.buyerNum, item.buyerNum)),
+    searchExposeNum: sumDetail
+      ? (sumDetail.searchExposeNum || toNumberValue(item.searchExposeNum))
+      : toNumberValue(pickFirst(latestDetail?.searchExposeNum, item.searchExposeNum)),
+    searchClickNum: sumDetail
+      ? (sumDetail.searchClickNum || toNumberValue(item.searchClickNum))
+      : toNumberValue(pickFirst(latestDetail?.searchClickNum, item.searchClickNum)),
+    searchPayGoodsNum: sumDetail
+      ? (sumDetail.searchPayGoodsNum || toNumberValue(item.searchPayGoodsNum))
+      : toNumberValue(latestDetail?.searchPayGoodsNum),
+    recommendExposeNum: sumDetail
+      ? (sumDetail.recommendExposeNum || toNumberValue(item.recommendExposeNum))
+      : toNumberValue(pickFirst(latestDetail?.recommendExposeNum, item.recommendExposeNum)),
+    recommendClickNum: sumDetail
+      ? (sumDetail.recommendClickNum || toNumberValue(item.recommendClickNum))
+      : toNumberValue(pickFirst(latestDetail?.recommendClickNum, item.recommendClickNum)),
+    recommendPayGoodsNum: sumDetail
+      ? (sumDetail.recommendPayGoodsNum || toNumberValue(item.recommendPayGoodsNum))
+      : toNumberValue(latestDetail?.recommendPayGoodsNum),
     trendExposeNum: toNumberValue(trendResult?.goodsExposeNum),
     trendExposeNumChange: pickFirst(trendResult?.goodsExposeNumLinkRelative, trendResult?.goodsExposeNumChange, null),
     trendPayOrderNum: toNumberValue(trendResult?.payOrderNum),

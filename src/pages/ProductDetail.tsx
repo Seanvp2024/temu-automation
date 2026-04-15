@@ -1,14 +1,12 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { Alert, Card, Segmented, Tag, Tabs, Table, Descriptions, Image, Button, Spin, Typography } from "antd";
+import { Alert, Card, Tag, Tabs, Table, Descriptions, Image, Button, Spin, Typography } from "antd";
 import {
   ArrowLeftOutlined, ShoppingOutlined, InboxOutlined,
   RiseOutlined, EyeOutlined, SafetyCertificateOutlined,
   BarChartOutlined, DatabaseOutlined, SyncOutlined,
 } from "@ant-design/icons";
 import {
-  Area,
-  AreaChart,
   CartesianGrid,
   Legend,
   Line,

@@ -48,6 +48,36 @@ export interface KeywordPoolItem {
   top10SalesShare: number;
 }
 
+/** Phase2·P2.1：机会分拆解里每一项的打分明细 */
+export interface OpportunityFactor {
+  /** 稳定 key，方便 UI 上色 */
+  key: "crowd" | "concentration" | "score" | "video" | "review" | "priceBand";
+  label: string;
+  /** 在总分里的方向：negative = 扣分项（市场越挤越高），positive = 加分项（价格带红利） */
+  direction: "negative" | "positive";
+  /** 实际打到的权重分数（绝对值），负向越大代表扣分越多 */
+  contribution: number;
+  /** 原始观测值 & 单位，给用户看"为什么" */
+  rawLabel: string;
+  /** 一句人话解释 */
+  note: string;
+}
+
+/** Phase2·P2.2：价格带 × 商品占比 × 销量占比，用来画热力图 */
+export interface PriceBandCell {
+  key: "low" | "mid" | "high";
+  label: string;
+  min: number;
+  max: number;
+  count: number;
+  sales: number;
+  countShare: number;
+  salesShare: number;
+  /** 推荐度打分：销量占比高、拥挤度低 → 分数高 */
+  opportunityScore: number;
+  isRecommended: boolean;
+}
+
 export interface MarketInsight {
   keyword: string;
   keywordType: string;
@@ -71,6 +101,10 @@ export interface MarketInsight {
   entryFocus: string;
   warehouseInsight: string;
   nextAction: string;
+  /** Phase2 新增：机会分拆解 */
+  opportunityBreakdown: OpportunityFactor[];
+  /** Phase2 新增：价格带矩阵（已按 low/mid/high 排序） */
+  priceBandMatrix: PriceBandCell[];
 }
 
 export interface NormalizedMyProduct {
@@ -346,6 +380,100 @@ export function buildMarketInsight(keyword: string, products: CompetitorProductL
     ? `${warehouseLabel}头部集中度较高，建议先从同履约模式切入。`
     : `${warehouseLabel}市场还存在分散空间，可以先做细分词测试。`;
 
+  // Phase2·P2.1：机会分拆解（按同一套 pressureScore 公式拆成 5 项负向 + 1 项正向）
+  const medianScoreValue = median(scores);
+  const medianReviewValue = median(reviewCounts);
+  const crowdContribution = clamp((Math.min(products.length, 50) / 50) * 38, 0, 38);
+  const concentrationContribution = clamp(top10SalesShare * 30, 0, 30);
+  const scoreContribution = medianScoreValue >= 4.55 ? 12 : 0;
+  const videoContribution = videoRate >= 0.6 ? 12 : 0;
+  const reviewContribution = medianReviewValue >= 300 ? 8 : 0;
+  const priceBandBonus = Math.max(0, (recommendedBand?.score || 0) / 3);
+  const opportunityBreakdown: OpportunityFactor[] = [
+    {
+      key: "crowd",
+      label: "商品拥挤度",
+      direction: "negative",
+      contribution: round(crowdContribution),
+      rawLabel: `样本 ${products.length} 个`,
+      note: products.length >= 40
+        ? "样本池接近饱和，新品进入要更明显的差异化。"
+        : products.length >= 20
+          ? "样本中等密度，可以找缝隙切入。"
+          : "样本较少，要么长尾词，要么市场还没被填满。",
+    },
+    {
+      key: "concentration",
+      label: "Top10 销量集中度",
+      direction: "negative",
+      contribution: round(concentrationContribution),
+      rawLabel: `${Math.round(top10SalesShare * 100)}%`,
+      note: top10SalesShare >= 0.55
+        ? "头部吃掉绝大多数订单，新品要靠价格或素材破圈。"
+        : top10SalesShare >= 0.35
+          ? "头部有优势但没有垄断，还有中腰部机会。"
+          : "销量分散，中腰部商品有机会起量。",
+    },
+    {
+      key: "score",
+      label: "评分门槛",
+      direction: "negative",
+      contribution: round(scoreContribution),
+      rawLabel: `中位评分 ${medianScoreValue.toFixed(2)}`,
+      note: medianScoreValue >= 4.55
+        ? "整体评分偏高，新品没评价会直接掉出推荐。"
+        : "评分不算高门槛，做到 4.3+ 即可有竞争力。",
+    },
+    {
+      key: "video",
+      label: "视频素材门槛",
+      direction: "negative",
+      contribution: round(videoContribution),
+      rawLabel: `Top10 视频率 ${Math.round(videoRate * 100)}%`,
+      note: videoRate >= 0.6
+        ? "头部普遍带视频，先补 1 条功能演示视频再上架。"
+        : videoRate >= 0.3
+          ? "视频不是必选项，但缺视频会损失一部分转化。"
+          : "视频门槛低，先把首图和卖点做扎实即可。",
+    },
+    {
+      key: "review",
+      label: "评价壁垒",
+      direction: "negative",
+      contribution: round(reviewContribution),
+      rawLabel: `中位评价 ${Math.round(medianReviewValue)}`,
+      note: medianReviewValue >= 300
+        ? "头部普遍积累了大量评价，新品前两周要靠流量和物流稳住评分。"
+        : "评价不是硬门槛，前期冲评价成本可控。",
+    },
+    {
+      key: "priceBand",
+      label: "推荐价格带红利",
+      direction: "positive",
+      contribution: round(priceBandBonus),
+      rawLabel: recommendedBand?.label || "-",
+      note: priceBandBonus >= 10
+        ? "推荐价格带有显著销量红利，值得优先测试。"
+        : priceBandBonus >= 4
+          ? "推荐价格带有一定机会，但不是压倒性优势。"
+          : "价格带之间差距不明显，要结合素材和关键词判断。",
+    },
+  ];
+
+  // Phase2·P2.2：价格带矩阵
+  const priceBandMatrix: PriceBandCell[] = bandSummaries.map((band) => ({
+    key: band.key as PriceBandCell["key"],
+    label: band.label,
+    min: band.min,
+    max: band.max,
+    count: band.count,
+    sales: band.sales,
+    countShare: band.count / Math.max(1, usableProducts.length),
+    salesShare: totalMonthlySales > 0 ? band.sales / totalMonthlySales : 0,
+    opportunityScore: round(band.score),
+    isRecommended: recommendedBand ? band.key === recommendedBand.key : false,
+  }));
+
   return {
     keyword,
     keywordType: autoClassifyKeyword(keyword),
@@ -369,6 +497,8 @@ export function buildMarketInsight(keyword: string, products: CompetitorProductL
     entryFocus,
     warehouseInsight,
     nextAction: `${entryFocus}，优先测试 ${recommendedBand?.label || "当前主价格带"}。`,
+    opportunityBreakdown,
+    priceBandMatrix,
   };
 }
 

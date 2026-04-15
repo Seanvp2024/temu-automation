@@ -7,7 +7,6 @@ import {
   Table,
   Tag,
   Tabs,
-  Descriptions,
   Progress,
   Typography,
   Space,
@@ -117,7 +116,7 @@ const ShopOverview: React.FC = () => {
   const [quality, setQuality] = useState<any>(null);
   const [govern, setGovern] = useState<any>(null);
   const [marketing, setMarketing] = useState<any>(null);
-  const [adsHome, setAdsHome] = useState<any>(null);
+  const [, setAdsHome] = useState<any>(null);
   const [fluxUS, setFluxUS] = useState<any>(null);
   const [fluxEU, setFluxEU] = useState<any>(null);
   const [fluxRegion, setFluxRegion] = useState<string>("global");
@@ -316,9 +315,6 @@ const ShopOverview: React.FC = () => {
   // 营销活动
   const marketingStats = findInRawStore(marketing, "activity/statistics");
   const marketingTodo = findInRawStore(marketing, "activity/todo");
-
-  // 广告数据
-  const adsCount = findInRawStore(adsHome, "coconut/message_box/count");
 
   const dataIssues = [
     getCollectionDataIssue(diagnostics, "dashboard", "店铺概览", Boolean(dashboard)),

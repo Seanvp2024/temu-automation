@@ -1,8 +1,10 @@
-import { useMemo, useEffect, useState } from "react";
+import { useMemo, useEffect } from "react";
 import { Card, Col, Row, Space, Tag, Typography, Button, Empty } from "antd";
 import {
   Area, AreaChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis,
 } from "recharts";
+import { OperationAdvisor, type OperationAdvisorProduct } from "./OperationAdvisor";
+import { toSafeNumber, average } from "../utils/dataTransform";
 
 const { Text } = Typography;
 
@@ -28,6 +30,12 @@ export interface TrafficFluxTrendPoint {
   visitors: number;
   buyers: number;
   conversionRate: number;
+  // 商品级日缓存的真实字段(若存在,图表优先使用真实值而非 visitors 比例估算)
+  rawExposeNum?: number;
+  rawClickNum?: number;
+  rawBuyerNum?: number;
+  rawSearchExpose?: number;
+  rawRecommendExpose?: number;
 }
 
 export interface TrafficDriverSite {
@@ -55,15 +63,7 @@ const FLUX_SITE_ORDER: Array<{ siteKey: TrafficSiteKey; siteLabel: string }> = [
   { siteKey: "eu", siteLabel: "欧区" },
 ];
 
-function toSafeNumber(value: unknown) {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : 0;
-}
-
-function average(values: number[]) {
-  if (values.length === 0) return 0;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
+// toSafeNumber / average 来自 src/utils/dataTransform.ts
 
 function formatTrafficNumber(value: unknown) {
   const num = toSafeNumber(value);
@@ -103,12 +103,28 @@ function getRelativeChangeColor(value: unknown) {
 export function normalizeFluxTrendSeries(trendList: unknown): TrafficFluxTrendPoint[] {
   const rawList = Array.isArray(trendList) ? trendList : [];
   return rawList
-    .map((item: any) => ({
-      date: String(item?.date || item?.statDate || "").trim(),
-      visitors: toSafeNumber(item?.visitors ?? item?.visitorsNum),
-      buyers: toSafeNumber(item?.buyers ?? item?.payBuyerNum),
-      conversionRate: toSafeNumber(item?.conversionRate),
-    }))
+    .map((item: any) => {
+      const hasRawExpose = item?.exposeNum != null;
+      const hasRawClick = item?.clickNum != null;
+      const hasRawBuyer = item?.buyerNum != null;
+      return {
+        date: String(item?.date || item?.statDate || "").trim(),
+        visitors: toSafeNumber(
+          item?.visitors
+          ?? item?.visitorsNum
+          ?? item?.detailVisitNum
+          ?? item?.detailVisitorNum
+          ?? item?.clickNum,
+        ),
+        buyers: toSafeNumber(item?.buyers ?? item?.payBuyerNum ?? item?.buyerNum),
+        conversionRate: toSafeNumber(item?.conversionRate),
+        rawExposeNum: hasRawExpose ? toSafeNumber(item.exposeNum) : undefined,
+        rawClickNum: hasRawClick ? toSafeNumber(item.clickNum) : undefined,
+        rawBuyerNum: hasRawBuyer ? toSafeNumber(item.buyerNum) : undefined,
+        rawSearchExpose: item?.searchExposeNum != null ? toSafeNumber(item.searchExposeNum) : undefined,
+        rawRecommendExpose: item?.recommendExposeNum != null ? toSafeNumber(item.recommendExposeNum) : undefined,
+      };
+    })
     .filter((item) => item.date)
     .sort((left, right) => left.date.localeCompare(right.date));
 }
@@ -134,6 +150,12 @@ function getTrafficModeMeta(site: any) {
   return { label: "暂无数据", color: "default" as const };
 }
 
+function hasProductSourceBreakdown(site: any) {
+  const dataOrigin = String(site?.summary?.dataOrigin || "").trim().toLowerCase();
+  if (!site?.summary) return false;
+  return dataOrigin !== "mall" && dataOrigin !== "gp";
+}
+
 function getFluxSiteDisplayName(siteKey: TrafficSiteKey) {
   if (siteKey === "global") return "全球";
   if (siteKey === "us") return "美国";
@@ -149,8 +171,25 @@ function normalizeRateToPercent(raw: unknown): number {
 
 function buildTrafficPerformanceTrendData(site: any) {
   // 优先用 trendSeries (日期轴),只有在 trendSeries 为空时才回退到 rangeData (range 标签轴)
-  const trendSeries = Array.isArray(site?.trendSeries) ? site.trendSeries.slice(-30) : [];
+  const trendSeries: TrafficFluxTrendPoint[] = Array.isArray(site?.trendSeries) ? site.trendSeries.slice(-30) : [];
   const summary = site?.summary;
+
+  // 商品级日缓存自带真实 exposeNum/clickNum/buyerNum,直接用,不做比例估算
+  const hasRawDaily = trendSeries.some((p) => p?.rawExposeNum != null || p?.rawClickNum != null || p?.rawBuyerNum != null);
+  if (trendSeries.length > 1 && hasRawDaily) {
+    return trendSeries.map((item) => {
+      const expose = toSafeNumber(item.rawExposeNum);
+      const click = toSafeNumber(item.rawClickNum);
+      const buyers = toSafeNumber(item.rawBuyerNum);
+      return {
+        label: item.date.slice(5),
+        fullLabel: item.date,
+        expose,
+        clickRate: expose > 0 ? Number(((click / expose) * 100).toFixed(1)) : 0,
+        clickPayRate: click > 0 ? Number(((buyers / click) * 100).toFixed(1)) : 0,
+      };
+    }).filter((item) => item.expose > 0 || item.clickRate > 0 || item.clickPayRate > 0);
+  }
 
   if (trendSeries.length > 1 && summary) {
     const totalExpose = Math.max(toSafeNumber(summary?.exposeNum), 1);
@@ -188,11 +227,29 @@ function buildTrafficPerformanceTrendData(site: any) {
 }
 
 function buildTrafficSourceTimelineData(site: any, days: number) {
-  const trendSeries = Array.isArray(site?.trendSeries) ? site.trendSeries.slice(-(days || 7)) : [];
+  const trendSeries: TrafficFluxTrendPoint[] = Array.isArray(site?.trendSeries) ? site.trendSeries.slice(-(days || 7)) : [];
   const summary = site?.summary;
   const totalExpose = toSafeNumber(summary?.exposeNum);
   const searchExpose = toSafeNumber(summary?.searchExposeNum);
   const recommendExpose = toSafeNumber(summary?.recommendExposeNum);
+
+  // 商品级日缓存自带 rawExposeNum/searchExposeNum/recommendExposeNum,直接渲染
+  const hasRawDaily = trendSeries.some((p) => p?.rawExposeNum != null);
+  if (trendSeries.length > 1 && hasRawDaily) {
+    return trendSeries.map((item) => {
+      const total = toSafeNumber(item.rawExposeNum);
+      const search = toSafeNumber(item.rawSearchExpose);
+      const recommend = toSafeNumber(item.rawRecommendExpose);
+      return {
+        label: item.date.slice(5),
+        fullDate: item.date,
+        search,
+        recommend,
+        other: Math.max(total - search - recommend, 0),
+        total,
+      };
+    }).filter((item) => item.total > 0 || item.search > 0 || item.recommend > 0 || item.other > 0);
+  }
 
   if (trendSeries.length > 1 && totalExpose > 0) {
     const anchorPoint = [...trendSeries].reverse().find((item: TrafficFluxTrendPoint) => item.visitors > 0) || trendSeries[trendSeries.length - 1];
@@ -302,14 +359,18 @@ function renderTrafficSourceTooltip({ active, payload, label }: any) {
   return renderTrafficTooltipCard(title, rows);
 }
 
-/** 把 ProductList 的 fluxSites (per-product) + 站点级 trendList 转成 TrafficDriverSite 数组 */
+/** 把 ProductList 的 fluxSites (per-product) + 站点级/商品级 trendList 转成 TrafficDriverSite 数组
+ *  优先使用 productDailyTrendBySite (来自 temu_flux_product_history_cache 的商品级日数据),
+ *  没有则回退到 siteTrendListBySite (站点级 mall/summary trendList) */
 export function buildTrafficDriverSitesFromProduct(
   fluxSites: any[],
   siteTrendListBySite: Record<string, any[]>,
+  productDailyTrendBySite?: Record<string, any[]>,
 ): TrafficDriverSite[] {
   return FLUX_SITE_ORDER.map((entry) => {
     const source = fluxSites.find((item: any) => item.siteKey === entry.siteKey);
-    const trendList = siteTrendListBySite[entry.siteKey] || [];
+    const productDaily = productDailyTrendBySite?.[entry.siteKey] || [];
+    const trendList = productDaily.length > 1 ? productDaily : (siteTrendListBySite[entry.siteKey] || []);
     const trendSeries = normalizeFluxTrendSeries(trendList);
     return {
       siteKey: entry.siteKey,
@@ -338,6 +399,7 @@ interface TrafficDriverPanelProps {
   onActiveSiteKeyChange: (key: TrafficSiteKey) => void;
   rangeLabel: string;
   onRangeLabelChange: (label: string) => void;
+  productContext?: OperationAdvisorProduct;
 }
 
 export function TrafficDriverPanel({
@@ -346,6 +408,7 @@ export function TrafficDriverPanel({
   onActiveSiteKeyChange,
   rangeLabel,
   onRangeLabelChange,
+  productContext,
 }: TrafficDriverPanelProps) {
   const activeSite = useMemo(
     () => sites.find((item) => item.siteKey === activeSiteKey) || sites[0] || null,
@@ -383,11 +446,15 @@ export function TrafficDriverPanel({
     const rangeDays = rangeLabel === "近30日" || rangeLabel === "本月" ? 30 : 7;
     return effectiveSite ? buildTrafficSourceTimelineData(effectiveSite, rangeDays) : [];
   }, [effectiveSite, rangeLabel]);
+  const hasSourceBreakdown = useMemo(
+    () => hasProductSourceBreakdown(effectiveSite),
+    [effectiveSite],
+  );
   const funnelSteps = useMemo(
     () => (effectiveSite ? buildTrafficFunnelSteps(effectiveSite) : []),
     [effectiveSite],
   );
-  const showSourceTimelineChart = sourceChartData.length > 1;
+  const showSourceTimelineChart = hasSourceBreakdown && sourceChartData.length > 1;
   const availableRanges = useMemo(
     () => FLUX_RANGE_ORDER.filter((label) => activeSite?.summaryByRange?.[label]),
     [activeSite],
@@ -597,6 +664,8 @@ export function TrafficDriverPanel({
           </div>
         ) : null}
 
+        <OperationAdvisor site={effectiveSite} productContext={productContext} />
+
         <Row gutter={[12, 12]}>
           {metricCards.map((metric) => (
             <Col xs={12} lg={8} xl={4} key={metric.key}>
@@ -667,6 +736,8 @@ export function TrafficDriverPanel({
                     </ResponsiveContainer>
                   </div>
                 </Space>
+              ) : !hasSourceBreakdown ? (
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无商品级来源拆分" />
               ) : (
                 <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前还没有可用的来源走势" />
               )}

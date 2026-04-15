@@ -39,7 +39,6 @@ import {
   PlusOutlined,
   ReloadOutlined,
   SearchOutlined,
-  SettingOutlined,
   ShopOutlined,
   StarOutlined,
   UnorderedListOutlined,
@@ -62,6 +61,13 @@ import {
 import { useLocation } from "react-router-dom";
 import PageHeader from "../components/PageHeader";
 import {
+  toSafeNumber,
+  formatPercentText,
+  parseReviewCountText,
+  getErrorMessage,
+  stripWorkerErrorCode,
+} from "../utils/dataTransform";
+import {
   autoClassifyKeyword,
   buildExecutionReport,
   buildMarketInsight,
@@ -71,7 +77,6 @@ import {
   type ExecutionReport,
   type KeywordPoolItem,
   type MarketInsight,
-  type NormalizedMyProduct,
 } from "../utils/competitorWorkbench";
 import CompetitorProductWorkbench, {
   type CompetitorProductPrefill,
@@ -88,12 +93,10 @@ const TEMU_ORANGE = "#e55b00";
 const CARD_STYLE: React.CSSProperties = { borderRadius: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.06)" };
 const PRICE_COLORS = ["#ff7300", "#ff9500", "#ffb700", "#ffd900", "#52c41a", "#1677ff", "#722ed1", "#eb2f96"];
 const KEYWORD_POOL_STORE_KEY = "temu_competitor_keyword_pool";
-const PRODUCT_WORKSPACE_STORE_KEY = "temu_competitor_product_workspaces";
 const MAX_KEYWORD_POOL_ITEMS = 30;
 const MAX_COMPETITOR_REPORTS = 20;
 const COMPETITOR_TRACKED_UPDATED_EVENT = "temu:competitor-tracked-updated";
 const COMPETITOR_REPORTS_UPDATED_EVENT = "temu:competitor-reports-updated";
-const YUNQI_AUTH_INVALID_CODE = "YUNQI_AUTH_INVALID";
 
 const SORT_OPTIONS = [
   { label: "综合排序", value: "" },
@@ -123,14 +126,6 @@ interface TrackedProduct {
   addedAt: string;
   sourceKeyword?: string;
   goodsId?: string;
-}
-
-interface ProductWorkspaceState {
-  productId: string;
-  keyword: string;
-  wareHouseType: number;
-  selectedUrls: string[];
-  updatedAt: string;
 }
 
 type YunqiTokenStatus = "empty" | "configured" | "checking" | "valid" | "invalid";
@@ -163,101 +158,9 @@ function emitCompetitorReportsUpdated() {
   window.dispatchEvent(new CustomEvent(COMPETITOR_REPORTS_UPDATED_EVENT));
 }
 
-function toSafeNumber(value: unknown) {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : 0;
-}
-
-function formatPercentText(value: number) {
-  return `${(value * 100).toFixed(0)}%`;
-}
-
-function parseReviewCountText(text: unknown) {
-  const raw = typeof text === "string" ? text.replace(/,/g, "") : "";
-  const match = raw.match(/(\d+(?:\.\d+)?)(k)?/i);
-  if (!match) return 0;
-  const base = Number(match[1] || 0);
-  if (!Number.isFinite(base)) return 0;
-  return match[2] ? Math.round(base * 1000) : Math.round(base);
-}
-
 async function readArrayStoreValue(key: string) {
   const value = await store?.get(key);
   return Array.isArray(value) ? value : [];
-}
-
-function getErrorMessage(error: unknown) {
-  return String((error as { message?: string })?.message || error || "");
-}
-
-function stripWorkerErrorCode(message: string) {
-  return message.replace(/^\[[A-Z0-9_]+\]\s*/, "").trim();
-}
-
-function isYunqiAuthInvalidError(error: unknown) {
-  const message = getErrorMessage(error);
-  return message.includes(`[${YUNQI_AUTH_INVALID_CODE}]`);
-}
-
-function getWorkspaceMap(value: unknown) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {} as Record<string, ProductWorkspaceState>;
-  return Object.entries(value as Record<string, any>).reduce<Record<string, ProductWorkspaceState>>((accumulator, [key, item]) => {
-    if (!item || typeof item !== "object") return accumulator;
-    accumulator[key] = {
-      productId: typeof item.productId === "string" && item.productId ? item.productId : key,
-      keyword: typeof item.keyword === "string" ? item.keyword : "",
-      wareHouseType: Number(item.wareHouseType) === 1 ? 1 : 0,
-      selectedUrls: Array.isArray(item.selectedUrls) ? item.selectedUrls.map((url: unknown) => String(url || "")).filter(Boolean) : [],
-      updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : "",
-    };
-    return accumulator;
-  }, {});
-}
-
-function dedupeStrings(items: string[]) {
-  return Array.from(new Set(items.filter(Boolean)));
-}
-
-function cleanKeywordCandidate(value: unknown) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .replace(/^[\s,，、|/]+|[\s,，、|/]+$/g, "")
-    .trim();
-}
-
-function deriveMyProductKeywords(rawProduct: Record<string, unknown> | null | undefined, normalized: NormalizedMyProduct | null) {
-  const titleSource = cleanKeywordCandidate(rawProduct?.productName || rawProduct?.title || rawProduct?.goodsName || normalized?.title || "");
-  const category = cleanKeywordCandidate(rawProduct?.category || rawProduct?.categories || rawProduct?.catName || normalized?.category || "");
-  const chunks = titleSource
-    .split(/[|/，,、;；\-()（）[\]【】]+/)
-    .map(cleanKeywordCandidate)
-    .filter((item) => item.length >= 2 && item.length <= 40);
-  const englishWords = titleSource.split(/\s+/).filter(Boolean);
-  const englishPhrases = [
-    englishWords.slice(0, 2).join(" "),
-    englishWords.slice(0, 3).join(" "),
-    englishWords.slice(0, 4).join(" "),
-  ].map(cleanKeywordCandidate).filter((item) => item.length >= 3 && item.length <= 40);
-  const shortTitle = titleSource.length > 24 ? cleanKeywordCandidate(titleSource.slice(0, 24)) : titleSource;
-  return dedupeStrings([category, shortTitle, titleSource, ...chunks, ...englishPhrases]).slice(0, 6);
-}
-
-function parsePriceBand(label: string) {
-  const match = label.match(/\$?([\d.]+)\s*-\s*\$?([\d.]+)/);
-  if (!match) return null;
-  const min = Number(match[1] || 0);
-  const max = Number(match[2] || 0);
-  if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
-  return { min, max };
-}
-
-function getMyPriceBandStatus(price: number, recommendedBand: string) {
-  if (!price) return "当前商品缺少售价，先补齐价格后再判断。";
-  const band = parsePriceBand(recommendedBand);
-  if (!band) return "先补充更多样本，再确认建议价格带。";
-  if (price < band.min * 0.98) return "当前价格低于建议带，可以测试提利润或补高客单版本。";
-  if (price > band.max * 1.02) return "当前价格高于建议带，先测试回落后再抢主词。";
-  return "当前价格落在建议带内，优先优化素材和转化承接。";
 }
 
 function getLatestSnapshot(item: TrackedProduct) {
@@ -562,7 +465,8 @@ function ProductDetailDrawer({ item, open, onClose }: { item: any; open: boolean
   );
 }
 
-function KeywordSearchTab() {
+// 旧版关键词搜索 tab，保留以便后续复用；export 以绕过 noUnusedLocals
+export function _KeywordSearchTab() {
   const [keyword, setKeyword] = useState("");
   const [wareHouseType, setWareHouseType] = useState<number>(0);
   const [sortBy, setSortBy] = useState("");
@@ -1817,8 +1721,9 @@ function YunqiDbTab() {
           if (nextStats) setStats(nextStats);
         }
       }
-    } catch {
-      // ignore
+    } catch (error) {
+      // 云启数据库未初始化 / 未连接时正常失败，下次调用会重试
+      console.warn("[CompetitorAnalysis] loadDbInfo failed", error);
     }
   }, []);
 

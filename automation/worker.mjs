@@ -11,7 +11,7 @@ import crypto from "crypto";
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
 import { randomDelay, downloadImage, saveBase64Image, getDebugDir, getTmpDir, logSilent, ERR } from "./utils.mjs";
-import { browserState, ensureBrowser as _ensureBrowser, launch as _launch, login, saveCookies, closeBrowser, findLatestCookie } from "./browser.mjs";
+import { browserState, ensureBrowser as _ensureBrowser, launch as _launch, login, saveCookies, closeBrowser, findLatestCookie, safeNewPage } from "./browser.mjs";
 import { ADS_GROUP_TABS, GOVERN_GROUP_TARGETS, buildScrapeHandlers, getScrapeFunction } from "./scrape-registry.mjs";
 import { getConfiguredMaxRetries, getDelayScale, shouldAutoLoginRetry, shouldCaptureErrorScreenshots } from "./runtime-config.mjs";
 import { buildYunqiOnlineHandlers } from "./yunqi-online.mjs";
@@ -953,14 +953,14 @@ function isExcelLikeFile(filePath) {
 
 function resolveReadScrapeDataRequest(taskKey) {
   if (typeof taskKey !== "string" || !taskKey.trim()) {
-    throw new Error("é‡‡é›†æ•°æ® key æ— æ•ˆ");
+    throw new Error("采集数据 key 无效");
   }
 
   if (taskKey.startsWith("csv_preview:")) {
     const filePath = path.resolve(taskKey.slice("csv_preview:".length));
     const extension = path.extname(filePath).toLowerCase();
     if (![".csv", ".xlsx", ".xls"].includes(extension)) {
-      throw new Error("ä»…æ”¯æŒé¢„è§ˆ CSV / Excel è¡¨æ ¼");
+      throw new Error("仅支持预览 CSV / Excel 表格");
     }
     return { type: "csv_preview", filePath };
   }
@@ -972,7 +972,7 @@ function resolveReadScrapeDataRequest(taskKey) {
     || normalizedKey.includes("\\")
     || !SCRAPE_RESULT_KEY_PATTERN.test(normalizedKey)
   ) {
-    throw new Error(`éžæ³•é‡‡é›†æ•°æ® key: ${taskKey}`);
+    throw new Error(`非法采集数据 key: ${taskKey}`);
   }
 
   const debugDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
@@ -1258,6 +1258,14 @@ function sanitizeLoginPhone(value = "") {
   return digits || raw;
 }
 
+function normalizeFilledLoginPhone(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length === 11) return digits;
+  return digits || raw;
+}
+
 function isPlaceholderLoginPhone(value = "") {
   return sanitizeLoginPhone(value) === "13800138000";
 }
@@ -1371,6 +1379,14 @@ function isLikelySellerCountryCodeInput(meta = {}) {
 }
 
 async function findSellerPhoneInputOnPage(page) {
+  const targets = [];
+  if (page) targets.push(page);
+  if (typeof page?.frames === "function") {
+    for (const frame of page.frames()) {
+      if (frame && frame !== page.mainFrame?.()) targets.push(frame);
+    }
+  }
+
   const selectorGroups = [
     ['#usernameId', 'input[name="usernameId"]'],
     ['input[placeholder="手机号码"]', 'input[placeholder*="手机号码"]', 'input[placeholder*="手机号"]', 'input[placeholder*="手机"]', 'input[placeholder*="号码"]'],
@@ -1378,13 +1394,21 @@ async function findSellerPhoneInputOnPage(page) {
     ['input[type="tel"]', 'input[inputmode="numeric"]', '.el-input__inner'],
   ];
 
-  for (const selectors of selectorGroups) {
-    for (const selector of selectors) {
-      const candidate = await findVisibleInputOnPage(page, [selector]);
-      if (!candidate) continue;
-      const meta = await readVisibleInputMeta(candidate);
-      if (isLikelySellerCountryCodeInput(meta)) continue;
-      return { input: candidate, meta, selector };
+  for (const target of targets) {
+    for (const selectors of selectorGroups) {
+      for (const selector of selectors) {
+        const locator = target.locator(selector);
+        const count = await locator.count().catch(() => 0);
+        for (let index = 0; index < count; index += 1) {
+          const candidate = locator.nth(index);
+          const visible = await candidate.isVisible().catch(() => false);
+          const editable = await candidate.isEditable().catch(() => false);
+          if (!visible || !editable) continue;
+          const meta = await readVisibleInputMeta(candidate);
+          if (isLikelySellerCountryCodeInput(meta)) continue;
+          return { input: candidate, meta, selector, index };
+        }
+      }
     }
   }
 
@@ -1630,7 +1654,7 @@ async function tryAutoLoginInPopup(popup, logPrefix = "[popup-login]") {
     await fillInputWithVerification(phoneInput, phone, {
       label: "手机号",
       logPrefix,
-      normalize: sanitizeLoginPhone,
+      normalize: normalizeFilledLoginPhone,
     });
     await randomDelay(400, 800);
 
@@ -1717,7 +1741,7 @@ async function tryAutoLoginInPopup(popup, logPrefix = "[popup-login]") {
         await fillInputWithVerification(phoneInput, phone, {
           label: "手机号",
           logPrefix,
-          normalize: sanitizeLoginPhone,
+          normalize: normalizeFilledLoginPhone,
         });
       }
       if (/密码/.test(loginHint)) {
@@ -2385,7 +2409,7 @@ async function createSellerCentralPage(targetPath = "/goods/list", options = {})
     let page = null;
     try {
       await ensureBrowser();
-      page = await context.newPage();
+      page = await safeNewPage(context);
       await openSellerCentralTarget(page, targetPath, { lite, logPrefix: `${logPrefix}-open` });
       const ready = await ensureSellerCentralSessionReady(page, targetPath, `${logPrefix}-ready`);
       if (!ready) {
@@ -2594,7 +2618,7 @@ async function scrapeGlobalPerformance({ range = "30d" } = {}) {
   await ensureBrowser();
   const page = await createSellerCentralPage("/main/data-center", { logPrefix: "[global-perf]" }).catch(async (e) => {
     console.error(`[global-perf] createSellerCentralPage fail: ${e.message}, fallback newPage`);
-    const p = await context.newPage();
+    const p = await safeNewPage(context);
     try { await p.goto("https://agentseller.temu.com/main/data-center", { waitUntil: "domcontentloaded", timeout: 60000 }); } catch {}
     return p;
   });
@@ -2653,7 +2677,7 @@ async function scrapeGlobalPerformance({ range = "30d" } = {}) {
 
   // 先访问 seller.kuajingmaihuo.com 触发该域 cookie 同步（/mms/venom/ 需要 kuajingmaihuo 会话）
   try {
-    const kjmhPage = await context.newPage();
+    const kjmhPage = await safeNewPage(context);
     console.error("[global-perf] warming kuajingmaihuo session...");
     await kjmhPage.goto("https://seller.kuajingmaihuo.com/main/authentication", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
     await kjmhPage.waitForTimeout(2000);
@@ -3118,7 +3142,7 @@ async function _yunduOpenKjmhPage() {
   if (_yunduKjmhPage && !_yunduKjmhPage.isClosed()) {
     try { await _yunduKjmhPage.evaluate(() => 1); return _yunduKjmhPage; } catch { _yunduKjmhPage = null; }
   }
-  const p = await context.newPage();
+  const p = await safeNewPage(context);
   try {
     await p.goto("https://seller.kuajingmaihuo.com/main/sale-manage", { waitUntil: "domcontentloaded", timeout: 60000 });
   } catch {}
@@ -3171,7 +3195,7 @@ async function _yunduOpenPage() {
     void origOpen;
   });
   const page = await createSellerCentralPage("/main/data-center", { logPrefix: "[yundu]" }).catch(async () => {
-    const p = await context.newPage();
+    const p = await safeNewPage(context);
     try { await p.goto("https://agentseller.temu.com/main/data-center", { waitUntil: "domcontentloaded", timeout: 60000 }); } catch {}
     return p;
   });
@@ -3693,7 +3717,7 @@ async function yunduAutoEnroll({ activityThematicId, activityType, dryRun = true
 async function scrapeSales() {
   const lite = _navLiteMode;
   // 使用通用捕获器 + 翻页逻辑
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const capturedApis = [];
   const staticExts = [".js", ".css", ".png", ".svg", ".woff", ".woff2", ".ttf", ".ico", ".jpg", ".jpeg", ".gif", ".map", ".webp"];
   const frameworkPatterns = ['phantom/xg', 'pfb/l1', 'pfb/a4', 'web-performace', '_stm', 'msgBox', 'hot-update', 'sockjs', 'hm.baidu', 'google', 'favicon', 'drogon-api', 'report/uin'];
@@ -3991,7 +4015,7 @@ async function scrapePageCaptureAll(targetPath, options = {}) {
     paginateMaxPages = 30,
   } = options;
   const waitForApiList = Array.isArray(waitForApi) ? waitForApi : (waitForApi ? [waitForApi] : []);
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const capturedApis = [];
   const staticExts = [".js", ".css", ".png", ".svg", ".woff", ".woff2", ".ttf", ".ico", ".jpg", ".jpeg", ".gif", ".map", ".webp"];
   const frameworkPatterns = ['phantom/xg', 'pfb/l1', 'pfb/a4', 'web-performace', '_stm', 'msgBox', 'hot-update', 'sockjs', 'hm.baidu', 'google', 'favicon', 'drogon-api', 'report/uin'];
@@ -4142,7 +4166,7 @@ async function scrapePageCaptureAll(targetPath, options = {}) {
 async function scrapeLifecycle(options = {}) {
   const lite = options.lite ?? _navLiteMode;
   const waitTime = options.waitTime ?? (lite ? 6000 : 8500);
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const capturedApis = [];
   const responseTracker = createPendingTaskTracker();
   const staticExts = [".js", ".css", ".png", ".svg", ".woff", ".woff2", ".ttf", ".ico", ".jpg", ".jpeg", ".gif", ".map", ".webp"];
@@ -4587,7 +4611,7 @@ async function scrapeLifecycle(options = {}) {
 async function scrapePageWithListener(targetPath, apiMatchers, options = {}) {
   const lite = options.lite ?? _navLiteMode;
   const { waitTime = lite ? 4200 : 5500, reloadIfMissing = true, fullUrl = null } = options;
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const debugDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
   fs.mkdirSync(debugDir, { recursive: true });
   const captured = {};
@@ -4666,7 +4690,7 @@ async function scrapePageWithListener(targetPath, apiMatchers, options = {}) {
 async function scrapeSidebarCaptureAll(menuText, options = {}) {
   const lite = options.lite ?? _navLiteMode;
   const { waitTime = lite ? 5200 : 7000 } = options;
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const capturedApis = [];
   const staticExts = [".js", ".css", ".png", ".svg", ".woff", ".woff2", ".ttf", ".ico", ".jpg", ".jpeg", ".gif", ".map", ".webp"];
   const frameworkPatterns = ['phantom/xg', 'pfb/l1', 'pfb/a4', 'web-performace', '_stm', 'msgBox', 'hot-update', 'sockjs', 'hm.baidu', 'google', 'favicon', 'drogon-api', 'report/uin'];
@@ -4804,7 +4828,7 @@ async function scrapeSidebarCaptureAll(menuText, options = {}) {
 // 抽检结果明细 (kuajingmaihuo.com 侧边栏导航)
 // 策略：拦截列表API获取所有商品，然后用fetch批量调用详情API
 async function scrapeQcDetail() {
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const capturedApis = [];
   let listApiUrl = ""; // 记录列表API的完整URL模板
   let detailApiUrl = ""; // 记录详情API的完整URL模板
@@ -4944,7 +4968,7 @@ async function scrapeQcDetail() {
 // 合规看板（主页仪表盘 - 包含重要通知、补充合规材料、涉嫌违反政策等汇总数据）
 async function scrapeGovernDashboard() {
   const lite = _navLiteMode;
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const capturedApis = [];
   const staticExts = [".js", ".css", ".png", ".svg", ".woff", ".woff2", ".ttf", ".ico", ".jpg", ".jpeg", ".gif", ".map", ".webp"];
   const frameworkPatterns = ['phantom/xg', 'pfb/l1', 'pfb/a4', 'web-performace', '_stm', 'msgBox', 'hot-update', 'sockjs', 'hm.baidu', 'google', 'favicon', 'drogon-api', 'report/uin'];
@@ -5320,7 +5344,7 @@ async function scrapeSingleGovernTarget(subPath, meta = {}) {
 
 async function scrapeGovernTaskGroup(targets) {
   const lite = _navLiteMode;
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const results = {};
   const collector = createGroupedApiCollector(page);
 
@@ -5365,7 +5389,7 @@ async function scrapeGovernTaskGroup(targets) {
 
 async function scrapeAdsTaskGroup(tabs = ADS_GROUP_TABS) {
   const lite = _navLiteMode;
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const results = {};
   const normalizedTabs = Array.isArray(tabs) ? tabs.filter(Boolean) : ADS_GROUP_TABS;
   const collector = createGroupedApiCollector(page, { includeErrorCode: true });
@@ -5561,7 +5585,7 @@ async function scrapeAdsNotification() {
 // 这些 /main/* 页面无法直接 page.goto，需要通过侧边栏点击导航
 async function scrapeSidebarPages(targetKeys = null) {
   const lite = _navLiteMode;
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const debugDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
   fs.mkdirSync(debugDir, { recursive: true });
 
@@ -5824,7 +5848,7 @@ async function scrapeSidebarPages(targetKeys = null) {
 // ---- 通过侧边栏点击导航来加载子应用并抓取 API ----
 
 async function scrapeViaSidebarClick() {
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const debugDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
   fs.mkdirSync(debugDir, { recursive: true });
 
@@ -6197,7 +6221,7 @@ async function scrapeViaSidebarClick() {
 // ---- 捕获 API 请求 ----
 
 async function captureApiRequests(targetUrl) {
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const debugDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
   fs.mkdirSync(debugDir, { recursive: true });
 
@@ -6460,6 +6484,56 @@ function mapFluxDailyDetailRows(rows = []) {
     .sort((a, b) => String(a.date).localeCompare(String(b.date)));
 }
 
+function readJsonFileSafe(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return null;
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function collectFluxGoodsIdFallbacks() {
+  const baseDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation");
+  const goodsMap = new Map();
+  const sourceStats = [];
+
+  const mergeCandidate = (item, sourceLabel) => {
+    const goodsId = String(item?.goodsId || "").trim();
+    if (!goodsId) return false;
+    const previous = goodsMap.get(goodsId) || {};
+    goodsMap.set(goodsId, {
+      goodsId,
+      productSpuId: String(item?.productSpuId || item?.spuId || previous.productSpuId || "").trim(),
+      productSkcId: String(item?.productSkcId || item?.skcId || previous.productSkcId || "").trim(),
+      productSkuId: String(item?.productSkuId || item?.skuId || previous.productSkuId || "").trim(),
+      title: String(item?.title || item?.goodsName || item?.productName || previous.title || "").trim(),
+      sourceLabel: previous.sourceLabel || sourceLabel,
+    });
+    return !previous.goodsId;
+  };
+
+  const collectFrom = (fileName, sourceLabel, extractItems) => {
+    const payload = readJsonFileSafe(path.join(baseDir, fileName));
+    if (!payload) return;
+    const items = Array.isArray(extractItems(payload)) ? extractItems(payload) : [];
+    let added = 0;
+    for (const item of items) {
+      if (mergeCandidate(item, sourceLabel)) added += 1;
+    }
+    sourceStats.push({ sourceLabel, fileName, total: items.length, added });
+  };
+
+  collectFrom("temu_flux.json", "flux-store", (payload) => [
+    ...(Array.isArray(payload?.items) ? payload.items : []),
+    ...Object.values(payload?.itemsByRange || {}).flatMap((value) => Array.isArray(value) ? value : []),
+  ]);
+  collectFrom("temu_products.json", "products-store", (payload) => Array.isArray(payload?.items) ? payload.items : (Array.isArray(payload) ? payload : []));
+  collectFrom("temu_sales.json", "sales-store", (payload) => Array.isArray(payload?.items) ? payload.items : (Array.isArray(payload) ? payload : []));
+
+  return { goodsMap, sourceStats };
+}
+
 async function scrapeFluxProductDetail(params = {}) {
   const target = resolveFluxAnalysisTarget(params);
   const goodsId = String(params?.goodsId || "").trim();
@@ -6480,18 +6554,24 @@ async function scrapeFluxProductDetail(params = {}) {
 
     const endDate = new Date().toISOString().slice(0, 10);
     const startDate = new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10);
+    // 在页面上下文中抓取一次 SPA 最近一次 goods/list 请求的模板（如有），
+    // 然后带上 siteIdList 等过滤参数请求 goods/detail，保证采到全站点聚合数据
     const response = await page.evaluate(async ({ goodsId, startDate, endDate }) => {
+      // 尝试观察 SPA 正在用的过滤条件：从 window 上挂的 Redux / Pinia 状态或直接触发一次 goods/list
+      // 保守做法：若 SPA 正好在同一会话内请求过 goods/list，可复用其最近一次 POST body。
+      // 这里做不到侧信道读取历史 request，直接带 siteIdList:[] 作为"全部站点"约定。
+      const body = { goodsId, startDate, endDate, siteIdList: [] };
       try {
         const result = await fetch("/api/seller/full/flow/analysis/goods/detail", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ goodsId, startDate, endDate }),
+          body: JSON.stringify(body),
         });
-        const body = await result.json().catch(() => null);
+        const respBody = await result.json().catch(() => null);
         return {
           ok: result.ok,
           status: result.status,
-          body,
+          body: respBody,
         };
       } catch (error) {
         return {
@@ -6614,6 +6694,90 @@ async function scrapeCustomTask(taskKey, task = {}) {
     console.error(`[flux:${taskKey}] [diag] page title="${pageTitle}"`);
   } catch {}
 
+  // === 安装 fetch / XHR 拦截：必须在 SPA bundle 启动前注入 ===
+  // addInitScript 在每个新文档加载前执行；之后 reload 让 SPA 重新走我们的 hook
+  try {
+    await page.addInitScript(() => {
+      if (window.__fluxHookInstalled) return;
+      window.__fluxHookInstalled = true;
+      window.__fluxCapturedBodies = {}; // path -> { url, method, body, headers }
+      const origFetch = window.fetch.bind(window);
+      window.fetch = async function (input, init) {
+        try {
+          const url = typeof input === "string" ? input : (input?.url || "");
+          if (url.includes("/flow/analysis/")) {
+            try {
+              const u = new URL(url, location.origin);
+              const path = u.pathname;
+              const method = (init?.method || (typeof input === "object" ? input.method : "GET") || "GET").toUpperCase();
+              let bodyText = null;
+              if (init?.body != null) {
+                bodyText = typeof init.body === "string" ? init.body : null;
+              } else if (typeof input === "object" && input.body) {
+                try { bodyText = await input.clone().text(); } catch {}
+              }
+              let headers = {};
+              if (init?.headers) {
+                if (init.headers instanceof Headers) {
+                  init.headers.forEach((v, k) => { headers[k] = v; });
+                } else if (Array.isArray(init.headers)) {
+                  for (const [k, v] of init.headers) headers[k] = v;
+                } else {
+                  headers = { ...init.headers };
+                }
+              } else if (typeof input === "object" && input.headers) {
+                if (input.headers.forEach) input.headers.forEach((v, k) => { headers[k] = v; });
+              }
+              window.__fluxCapturedBodies[path] = { url: u.toString(), method, bodyText, headers };
+            } catch {}
+          }
+        } catch {}
+        return origFetch(input, init);
+      };
+      // XHR fallback
+      const OrigXHR = window.XMLHttpRequest;
+      const origOpen = OrigXHR.prototype.open;
+      const origSend = OrigXHR.prototype.send;
+      const origSetHeader = OrigXHR.prototype.setRequestHeader;
+      OrigXHR.prototype.open = function (method, url) {
+        this.__fluxUrl = url;
+        this.__fluxMethod = method;
+        this.__fluxHeaders = {};
+        return origOpen.apply(this, arguments);
+      };
+      OrigXHR.prototype.setRequestHeader = function (k, v) {
+        if (this.__fluxHeaders) this.__fluxHeaders[k] = v;
+        return origSetHeader.apply(this, arguments);
+      };
+      OrigXHR.prototype.send = function (body) {
+        try {
+          const url = String(this.__fluxUrl || "");
+          if (url.includes("/flow/analysis/")) {
+            const u = new URL(url, location.origin);
+            window.__fluxCapturedBodies[u.pathname] = {
+              url: u.toString(),
+              method: (this.__fluxMethod || "GET").toUpperCase(),
+              bodyText: typeof body === "string" ? body : null,
+              headers: this.__fluxHeaders || {},
+            };
+          }
+        } catch {}
+        return origSend.apply(this, arguments);
+      };
+    });
+    console.error(`[flux:${taskKey}] fetch/XHR addInitScript installed`);
+    // 重载页面以让 hook 在 SPA bundle 启动前生效
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 }).catch((e) => {
+      console.error(`[flux:${taskKey}] reload after hook failed: ${e?.message}`);
+    });
+    await randomDelay(1500, 2200);
+    // 验证 hook 是否仍在新文档里
+    const hookOk = await page.evaluate(() => !!window.__fluxHookInstalled).catch(() => false);
+    console.error(`[flux:${taskKey}] post-reload hook present: ${hookOk}`);
+  } catch (e) {
+    console.error(`[flux:${taskKey}] hook install failed: ${e?.message}`);
+  }
+
   const dumpDiagnostics = async (label) => {
     try {
       const url = page.url();
@@ -6664,6 +6828,57 @@ async function scrapeCustomTask(taskKey, task = {}) {
     return hasRangeApi(rangeLabel, "/mall/summary") || hasRangeApi(rangeLabel, "/goods/list");
   };
 
+  // 捕获 SPA 向 flow/analysis/* 发出的完整请求（URL + headers + body），
+  // 供我们自己的 goods/detail 重放用——只替换 goodsId/startDate/endDate，
+  // 其它（siteIdList、anti-content、mallid、cookie 等）全部原样透传，确保 Temu 不拒绝。
+  let capturedFluxRequestTemplate = null; // 兼容旧代码：只保留白名单 body 字段
+  let capturedFluxFullRequest = null;     // 新：{ url, pathname, headers, body }
+  // 按路径分组保存最近一次完整请求；每次任务开始时清空，避免上次残留误判
+  const capturedFullRequestByPath = new Map();
+  capturedFullRequestByPath.clear(); // 显式清空（防御性）
+
+  const FLUX_BODY_PASSTHROUGH_KEYS = [
+    "siteIdList", "siteIdLists", "siteId", "mallIdList", "mallId",
+    "platformTypeList", "platformType", "regionIdList", "regionId",
+    "salesType", "currencyType", "currency", "categoryIdList",
+    "dateType", "statDateType", "rangeType", "dimension",
+  ];
+
+  const extractFluxTemplateFields = (rawBody) => {
+    try {
+      const parsed = typeof rawBody === "string" ? JSON.parse(rawBody) : rawBody;
+      if (!parsed || typeof parsed !== "object") return null;
+      const template = {};
+      for (const key of FLUX_BODY_PASSTHROUGH_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+          template[key] = parsed[key];
+        }
+      }
+      return Object.keys(template).length > 0 ? template : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // 过滤掉 fetch 不允许手动设置的 forbidden headers（否则 page.evaluate 内的 fetch 会抛 TypeError）
+  const FETCH_FORBIDDEN_HEADERS = new Set([
+    "host", "content-length", "connection", "origin", "referer",
+    "user-agent", "cookie", "accept-encoding", "accept-charset",
+    ":authority", ":method", ":path", ":scheme", ":status",
+  ]);
+  const sanitizeFetchHeaders = (headers) => {
+    const out = {};
+    if (!headers || typeof headers !== "object") return out;
+    for (const [rawKey, value] of Object.entries(headers)) {
+      const key = String(rawKey || "").toLowerCase();
+      if (!key || key.startsWith(":")) continue;
+      if (FETCH_FORBIDDEN_HEADERS.has(key)) continue;
+      if (value == null) continue;
+      out[rawKey] = String(value);
+    }
+    return out;
+  };
+
   try {
     page.on("request", (req) => {
       try {
@@ -6675,6 +6890,31 @@ async function scrapeCustomTask(taskKey, task = {}) {
           if (sellerRequestPathSamples.length < 60) {
             sellerRequestPathSamples.push(pathname);
           }
+        }
+        // 捕获 flow/analysis/* 的完整请求（URL + headers + body），供重放用
+        if (pathname.includes("/flow/analysis/")) {
+          try {
+            const postData = req.postData();
+            let parsedBody = null;
+            if (postData) {
+              try { parsedBody = JSON.parse(postData); } catch { parsedBody = null; }
+              const tpl = extractFluxTemplateFields(postData);
+              if (tpl) {
+                capturedFluxRequestTemplate = { ...(capturedFluxRequestTemplate || {}), ...tpl };
+              }
+            }
+            const fullReq = {
+              url,
+              pathname,
+              method: req.method ? req.method() : "?",
+              headers: { ...(req.headers() || {}) },
+              body: parsedBody,
+              rawBody: postData || null,
+              capturedAt: Date.now(),
+            };
+            capturedFullRequestByPath.set(pathname, fullReq);
+            capturedFluxFullRequest = fullReq;
+          } catch {}
         }
       } catch {}
     });
@@ -6724,6 +6964,29 @@ async function scrapeCustomTask(taskKey, task = {}) {
           }
         }
         if (!pathname.includes("/api/seller/full/flow/analysis/")) return;
+
+        // 诊断：trend/detail 类响应不管过没过滤都先打一次
+        if (pathname.includes("/goods/trend") || pathname.includes("/goods/detail")) {
+          const ctDiag = resp.headers()["content-type"] || "(no-ct)";
+          let textSample = "";
+          try {
+            const rawBuf = await resp.body().catch(() => null);
+            if (rawBuf) textSample = rawBuf.toString("utf8").slice(0, 500);
+          } catch {}
+          console.error(`[flux:${taskKey}] RESP-DIAG ${pathname} status=${resp.status()} ct=${ctDiag} bodyHead=${textSample.replace(/\s+/g, " ")}`);
+          // 如果响应是有效 JSON 且有 result.list/dailyList/trendList，直接塞进 capturedApis
+          try {
+            if (textSample) {
+              const json = JSON.parse(textSample.startsWith("{") ? textSample : "{}");
+              if (json && json.result) {
+                capturedApis.push({ path: pathname, data: json, rangeLabel: currentRangeLabel });
+                console.error(`[flux:${taskKey}] RESP-DIAG pushed ${pathname} into capturedApis (resultKeys=${Object.keys(json.result).join(",")})`);
+              }
+            }
+          } catch {}
+          return; // 这条分支独立处理，不走下面通用逻辑
+        }
+
         if (resp.status() !== 200) return;
         const contentType = resp.headers()["content-type"] || "";
         if (!contentType.includes("json")) return;
@@ -6779,106 +7042,511 @@ async function scrapeCustomTask(taskKey, task = {}) {
       : [];
     const primaryRangeLabel = currentRangeLabel;
 
+    // ---- 限流恢复：如果默认 range 下 goods/list 没被 captureApis 收到（业务错误 4000004 等），
+    // 通过点击日期切换（昨日 → 近7日）强制 SPA 重发，最多 5 轮 ----
+    {
+      let goodsListOk = capturedApis.some((a) => {
+        const path = String(a.path || "");
+        if (!path.includes("/goods/list")) return false;
+        const list = a.data?.result?.list || a.data?.result?.pageItems || [];
+        return Array.isArray(list) && list.length > 0;
+      });
+      let recoverAttempt = 0;
+      while (!goodsListOk && recoverAttempt < 5) {
+        recoverAttempt++;
+        console.error(`[flux:${taskKey}] goods/list missing, recover attempt ${recoverAttempt}: clicking 昨日 then 近7日`);
+        try {
+          // 点 "昨日"
+          const yesterdayBtn = page.locator('text="昨日"').first();
+          if (await yesterdayBtn.count() > 0) {
+            await yesterdayBtn.click({ timeout: 3000, force: true }).catch(() => {});
+            await randomDelay(2000, 3000);
+          }
+          // 点 "近7日"
+          const sevenBtn = page.locator('text="近7日"').first();
+          if (await sevenBtn.count() > 0) {
+            await sevenBtn.click({ timeout: 3000, force: true }).catch(() => {});
+            await randomDelay(3000, 4500);
+          }
+          await responseTracker.drain(3000);
+          await waitForRangeApis(currentRangeLabel, 8000).catch(() => {});
+        } catch (e) {
+          console.error(`[flux:${taskKey}] recovery click error: ${e?.message}`);
+        }
+        goodsListOk = capturedApis.some((a) => {
+          const path = String(a.path || "");
+          if (!path.includes("/goods/list")) return false;
+          const list = a.data?.result?.list || a.data?.result?.pageItems || [];
+          return Array.isArray(list) && list.length > 0;
+        });
+        if (!goodsListOk) {
+          console.error(`[flux:${taskKey}] still no goods/list after attempt ${recoverAttempt}, waiting before retry`);
+          await randomDelay(4000, 6000);
+        } else {
+          console.error(`[flux:${taskKey}] goods/list recovered on attempt ${recoverAttempt}`);
+        }
+      }
+    }
+
     // ---- 商品日趋势采集：为每个商品请求最近30天的每日流量 ----
     try {
       const goodsListApis = capturedApis.filter((a) => String(a.path || "").includes("/goods/list"));
-      const allGoodsIds = new Set();
+      const goodsCandidates = new Map();
       for (const api of goodsListApis) {
         const list = api.data?.result?.list || api.data?.result?.pageItems || [];
         for (const item of list) {
-          const gid = String(item.goodsId || item.productSkcId || "");
-          if (gid) allGoodsIds.add(gid);
+          const goodsId = String(item?.goodsId || "").trim();
+          if (!goodsId) continue;
+          goodsCandidates.set(goodsId, {
+            goodsId,
+            productSpuId: String(item?.productSpuId || item?.spuId || "").trim(),
+            productSkcId: String(item?.productSkcId || item?.skcId || "").trim(),
+            productSkuId: String(item?.productSkuId || item?.skuId || "").trim(),
+            title: String(item?.goodsName || item?.productName || item?.title || "").trim(),
+          });
         }
       }
 
-      // 兜底: 如果 goods/list 被限流捕获不到 IDs,从已有 store 文件 temu_flux.json 提取
-      // (这样即使本次 goods/list 失败,daily trends 仍可继续运行)
-      if (allGoodsIds.size === 0) {
-        try {
-          const storeFile = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "temu_flux.json");
-          if (fs.existsSync(storeFile)) {
-            const storeJson = JSON.parse(fs.readFileSync(storeFile, "utf8"));
-            const itemSources = [
-              ...(Array.isArray(storeJson?.items) ? storeJson.items : []),
-              ...Object.values(storeJson?.itemsByRange || {}).flatMap((v) => Array.isArray(v) ? v : []),
-            ];
-            for (const item of itemSources) {
-              const gid = String(item?.goodsId || item?.productSkcId || "");
-              if (gid) allGoodsIds.add(gid);
+      // 兜底: 仅当 tbody 实际有行时才用 store goodsIds（否则 SPA click loop 找不到行）
+      if (goodsCandidates.size === 0) {
+        const tbodyRows = await page.locator("tbody tr").count().catch(() => 0);
+        if (tbodyRows > 0) {
+          try {
+            const fallback = collectFluxGoodsIdFallbacks();
+            for (const [goodsId, meta] of fallback.goodsMap.entries()) {
+              goodsCandidates.set(goodsId, meta);
             }
-            console.error(`[flux:${taskKey}] Fallback: extracted ${allGoodsIds.size} goodsIds from store temu_flux.json`);
+            if (goodsCandidates.size > 0) {
+              const statsText = fallback.sourceStats
+                .map((item) => `${item.sourceLabel}:${item.added}/${item.total}`)
+                .join(", ");
+              console.error(`[flux:${taskKey}] Fallback: extracted ${goodsCandidates.size} goodsIds from local stores (${statsText || "no-stats"})`);
+            }
+          } catch (fallbackErr) {
+            console.error(`[flux:${taskKey}] Fallback goodsIds read failed: ${fallbackErr?.message || fallbackErr}`);
           }
-        } catch (fallbackErr) {
-          console.error(`[flux:${taskKey}] Fallback goodsIds read failed: ${fallbackErr?.message || fallbackErr}`);
+        } else {
+          console.error(`[flux:${taskKey}] Skip store-fallback: tbody empty (goods/list 未恢复)`);
         }
       }
 
-      if (allGoodsIds.size > 0) {
-        console.error(`[flux:${taskKey}] Fetching daily trends for ${allGoodsIds.size} products...`);
-        const endDate = new Date().toISOString().slice(0, 10);
-        const startDate = new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10);
+      if (goodsCandidates.size > 0) {
+        console.error(`[flux:${taskKey}] Fetching daily trends for ${goodsCandidates.size} products via SPA-triggered goods/detail...`);
         const dailyCache = {};
         let fetchedCount = 0;
-        for (const goodsId of allGoodsIds) {
+        const siteLabel = target.siteLabel || "全球";
+
+        // --- 打印 SPA 真实请求模板，辅助定位 ---
+        console.error(`[flux:${taskKey}] capturedFluxRequestTemplate: ${JSON.stringify(capturedFluxRequestTemplate || {})}`);
+        console.error(`[flux:${taskKey}] capturedFullRequestByPath keys: ${JSON.stringify(Array.from(capturedFullRequestByPath.keys()))}`);
+
+        // === 全上下文响应监听：trend/detail 可能在 popup / new page / iframe ===
+        // 主 page.on("response") 收不到，必须给 context 里所有当前 + 未来 page 挂监听
+        const trendRespCache = []; // { path, url, status, ct, json }
+        const ctxRespHandler = async (resp) => {
           try {
-            const resp = await page.evaluate(async ({ goodsId, startDate, endDate }) => {
-              try {
-                const r = await fetch("/api/seller/full/flow/analysis/goods/detail", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ goodsId, startDate, endDate }),
-                });
-                if (!r.ok) return null;
-                return await r.json();
-              } catch { return null; }
-            }, { goodsId, startDate, endDate });
-            if (resp?.result) {
-              const detailList = resp.result.list || resp.result.dailyList || resp.result.trendList || [];
-              if (Array.isArray(detailList) && detailList.length > 0) {
-                dailyCache[goodsId] = {
-                  stations: {
-                    [target.siteLabel]: {
-                      daily: detailList.map((d) => ({
-                        date: d.statDate || d.day || d.date || "",
-                        exposeNum: d.exposeNum || d.goodsExposeNum || 0,
-                        clickNum: d.clickNum || d.goodsClickNum || 0,
-                        detailVisitNum: d.goodsDetailVisitNum || d.detailVisitNum || d.goodsPageView || 0,
-                        detailVisitorNum: d.goodsDetailVisitorNum || d.detailVisitorNum || 0,
-                        addToCartUserNum: d.addToCartUserNum || 0,
-                        collectUserNum: d.collectUserNum || 0,
-                        buyerNum: d.buyerNum || d.payBuyerNum || 0,
-                        payGoodsNum: d.payGoodsNum || 0,
-                        payOrderNum: d.payOrderNum || 0,
-                        exposeClickRate: d.exposeClickConversionRate || d.exposeClickRate || 0,
-                        clickPayRate: d.clickPayConversionRate || d.clickPayRate || 0,
-                        searchExposeNum: d.searchExposeNum || 0,
-                        searchClickNum: d.searchClickNum || 0,
-                        searchPayGoodsNum: d.searchPayGoodsNum || 0,
-                        searchPayOrderNum: d.searchPayOrderNum || 0,
-                        recommendExposeNum: d.recommendExposeNum || 0,
-                        recommendClickNum: d.recommendClickNum || 0,
-                        recommendPayGoodsNum: d.recommendPayGoodsNum || 0,
-                        recommendPayOrderNum: d.recommendPayOrderNum || 0,
-                      })),
-                    },
-                  },
-                };
-                fetchedCount++;
+            const u = resp.url();
+            const p = new URL(u).pathname;
+            if (!p.includes("/flow/analysis/")) return;
+            const status = resp.status();
+            const ct = resp.headers()["content-type"] || "";
+            let bodyText = "";
+            try {
+              const buf = await resp.body();
+              if (buf) bodyText = buf.toString("utf8");
+            } catch {}
+            let json = null;
+            try { json = bodyText ? JSON.parse(bodyText) : null; } catch {}
+            trendRespCache.push({ path: p, url: u, status, ct, bodyLen: bodyText.length, json });
+            console.error(`[flux:${taskKey}] CTX-RESP ${p} status=${status} ct=${ct} bodyLen=${bodyText.length} bodyHead=${bodyText.slice(0, 240).replace(/\s+/g, " ")}`);
+          } catch (e) {
+            console.error(`[flux:${taskKey}] CTX-RESP handler error: ${e?.message}`);
+          }
+        };
+        const ctx = page.context();
+        for (const pg of ctx.pages()) {
+          pg.on("response", ctxRespHandler);
+        }
+        const ctxNewPageHandler = (newPg) => {
+          console.error(`[flux:${taskKey}] CTX new page: ${newPg.url()}`);
+          newPg.on("response", ctxRespHandler);
+        };
+        ctx.on("page", ctxNewPageHandler);
+
+        // --- 第 1 步：让 SPA 自己发一次 goods/detail，从而拿到真实 body 模板 ---
+        // 默认列表页 SPA 不会自动发 detail，必须模拟用户点商品行进入详情。
+        // 多策略：Playwright 原生 click（能触发 React synthetic events），失败再降级。
+        const firstGoodsId = goodsCandidates.keys().next().value;
+        console.error(`[flux:${taskKey}] Triggering SPA detail (goodsId=${firstGoodsId}) with multi-strategy click...`);
+
+        // 先 dump 第一行的 DOM 结构，失败时我们就能一眼看到该点哪里
+        try {
+          const domSnapshot = await page.evaluate(() => {
+            const firstRow = document.querySelector("tbody tr") || document.querySelector("[role='row']:nth-of-type(2)");
+            if (!firstRow) return { rowFound: false };
+            const links = Array.from(firstRow.querySelectorAll("a")).map((a) => ({
+              href: a.getAttribute("href") || "",
+              text: (a.textContent || "").trim().slice(0, 40),
+              cls: a.className || "",
+            }));
+            const buttons = Array.from(firstRow.querySelectorAll("button, [role='button']")).map((b) => ({
+              text: (b.textContent || "").trim().slice(0, 40),
+              cls: b.className || "",
+            }));
+            const clickables = Array.from(firstRow.querySelectorAll("[class*='link'], [class*='clickable'], [class*='goods'], [class*='product']")).slice(0, 6).map((el) => ({
+              tag: el.tagName,
+              text: (el.textContent || "").trim().slice(0, 40),
+              cls: el.className || "",
+            }));
+            return {
+              rowFound: true,
+              outerHead: (firstRow.outerHTML || "").slice(0, 600),
+              links, buttons, clickables,
+            };
+          });
+          console.error(`[flux:${taskKey}] DOM snapshot: ${JSON.stringify(domSnapshot).slice(0, 1200)}`);
+        } catch (e) {
+          console.error(`[flux:${taskKey}] DOM snapshot failed: ${e?.message}`);
+        }
+
+        // 优先匹配 goods/trend（真正的按日趋势 API），没有才退到 goods/detail
+        const waitForDetailReq = async (beforeKeys, timeoutMs) => {
+          const deadline = Date.now() + timeoutMs;
+          const matchOrder = ["/flow/analysis/goods/trend", "/flow/analysis/goods/detail"];
+          while (Date.now() < deadline) {
+            for (const keyword of matchOrder) {
+              for (const [path, req] of capturedFullRequestByPath.entries()) {
+                if (path.includes(keyword) && (!beforeKeys.has(path) || (req.capturedAt && req.capturedAt > Date.now() - timeoutMs))) {
+                  return req;
+                }
               }
             }
-            await randomDelay(200, 500);
+            await randomDelay(250, 400);
+          }
+          return null;
+        };
+
+        const strategies = [
+          {
+            name: "first-row-anchor",
+            run: async () => {
+              const loc = page.locator("tbody tr").first().locator("a").first();
+              if (await loc.count() === 0) return false;
+              await loc.scrollIntoViewIfNeeded().catch(() => {});
+              await loc.click({ timeout: 4000, force: true });
+              return true;
+            },
+          },
+          {
+            name: "text-in-first-row",
+            run: async () => {
+              const loc = page.locator("tbody tr").first().getByText(/详情|流量|分析|查看|详细/).first();
+              if (await loc.count() === 0) return false;
+              await loc.click({ timeout: 4000, force: true });
+              return true;
+            },
+          },
+          {
+            name: "first-row-click",
+            run: async () => {
+              const loc = page.locator("tbody tr").first();
+              if (await loc.count() === 0) return false;
+              await loc.scrollIntoViewIfNeeded().catch(() => {});
+              await loc.click({ timeout: 4000, force: true });
+              return true;
+            },
+          },
+          {
+            name: "first-row-dblclick",
+            run: async () => {
+              const loc = page.locator("tbody tr").first();
+              if (await loc.count() === 0) return false;
+              await loc.dblclick({ timeout: 4000, force: true });
+              return true;
+            },
+          },
+          {
+            name: "any-anchor-with-goodsid",
+            run: async () => {
+              const loc = page.locator(`a[href*="${firstGoodsId}"]`).first();
+              if (await loc.count() === 0) return false;
+              await loc.click({ timeout: 4000, force: true });
+              return true;
+            },
+          },
+        ];
+
+        let detailReq = null;
+        let usedStrategy = null;
+        for (const s of strategies) {
+          const beforeKeys = new Set(capturedFullRequestByPath.keys());
+          try {
+            const ran = await s.run();
+            if (!ran) {
+              console.error(`[flux:${taskKey}] strategy ${s.name}: no element found`);
+              continue;
+            }
+            console.error(`[flux:${taskKey}] strategy ${s.name}: clicked, waiting for goods/detail...`);
+            detailReq = await waitForDetailReq(beforeKeys, 8000);
+            if (detailReq) {
+              usedStrategy = s.name;
+              console.error(`[flux:${taskKey}] ✓ strategy ${s.name} triggered goods/detail`);
+              break;
+            }
+            // 关抽屉/弹窗，下一策略再来
+            await page.keyboard.press("Escape").catch(() => {});
+            await randomDelay(500, 800);
           } catch (e) {
-            console.error(`[flux:${taskKey}] Failed to fetch daily for ${goodsId}:`, e?.message);
+            console.error(`[flux:${taskKey}] strategy ${s.name} threw: ${e?.message}`);
+            await page.keyboard.press("Escape").catch(() => {});
+            await randomDelay(400, 600);
           }
         }
-        if (fetchedCount > 0) {
-          console.error(`[flux:${taskKey}] Got daily trends for ${fetchedCount}/${allGoodsIds.size} products`);
-          // 将日趋势数据放入返回结果，由 CollectionContext 保存
+
+        // body 可能是 null（postData 非 JSON），但 rawBody 通常有；尝试从 rawBody 兜底 parse
+        if (detailReq && !detailReq.body && detailReq.rawBody) {
+          try {
+            detailReq.body = JSON.parse(detailReq.rawBody);
+            console.error(`[flux:${taskKey}] detailReq.body was null, recovered from rawBody: ${detailReq.rawBody.slice(0, 300)}`);
+          } catch {
+            console.error(`[flux:${taskKey}] detailReq.rawBody is NOT JSON: ${String(detailReq.rawBody).slice(0, 300)}`);
+          }
+        }
+        // 诊断：把所有 flow/analysis 捕获请求的完整 URL（含 query）+ method + rawBody 打印一次
+        for (const [path, req] of capturedFullRequestByPath.entries()) {
+          if (path.includes("/flow/analysis/")) {
+            const raw = req.rawBody ? String(req.rawBody).slice(0, 300) : "(no postData)";
+            const method = req.method || "?";
+            console.error(`[flux:${taskKey}] CAPTURED ${method} ${req.url} rawBody=${raw}`);
+          }
+        }
+
+        // === 等 click 触发的 popup/response 全部回来，再 dump trendRespCache ===
+        await randomDelay(3000, 4000);
+        console.error(`[flux:${taskKey}] CTX pages count: ${ctx.pages().length}`);
+        for (const pg of ctx.pages()) {
+          console.error(`[flux:${taskKey}] CTX page url: ${pg.url()}`);
+        }
+        console.error(`[flux:${taskKey}] trendRespCache size: ${trendRespCache.length}`);
+        for (const r of trendRespCache.slice(-6)) {
+          const result = r.json?.result;
+          const resultKeys = result && typeof result === "object" ? Object.keys(result).join(",") : typeof result;
+          console.error(`[flux:${taskKey}] CACHE ${r.path} status=${r.status} bodyLen=${r.bodyLen} resultKeys=${resultKeys}`);
+          if (result && typeof result === "object") {
+            for (const [k, v] of Object.entries(result)) {
+              if (Array.isArray(v) && v.length > 0) {
+                console.error(`[flux:${taskKey}] CACHE ${r.path} result.${k} array len=${v.length} firstKeys=${Object.keys(v[0] || {}).join(",")} first=${JSON.stringify(v[0]).slice(0, 400)}`);
+              }
+            }
+          }
+        }
+
+        // === 旧诊断（保留）：从 capturedApis 找 trend/detail ===
+        const trendResponses = capturedApis.filter((e) => e.path && (e.path.includes("/flow/analysis/goods/trend") || e.path.includes("/flow/analysis/goods/detail")));
+        console.error(`[flux:${taskKey}] trend/detail responses captured so far: ${trendResponses.length}`);
+        for (const r of trendResponses.slice(-3)) {
+          const result = r.data?.result;
+          const resultKeys = result && typeof result === "object" ? Object.keys(result).join(",") : typeof result;
+          console.error(`[flux:${taskKey}] RESP ${r.path} resultKeys=${resultKeys}`);
+          if (result && typeof result === "object") {
+            for (const [k, v] of Object.entries(result)) {
+              if (Array.isArray(v)) {
+                console.error(`[flux:${taskKey}] RESP ${r.path} result.${k} isArray len=${v.length} first=${JSON.stringify(v[0] || null).slice(0, 400)}`);
+              } else if (typeof v === "object" && v !== null) {
+                console.error(`[flux:${taskKey}] RESP ${r.path} result.${k} keys=${Object.keys(v).join(",")} sample=${JSON.stringify(v).slice(0, 300)}`);
+              }
+            }
+            console.error(`[flux:${taskKey}] RESP ${r.path} FULL (first 800)= ${JSON.stringify(result).slice(0, 800)}`);
+          }
+        }
+
+        // === 真正的采集逻辑：循环 click 每行商品，等 goods/trend 响应，提取按日数据 ===
+        // trend.result 结构（已验证）：
+        //   trendList[0] = { key:"近7日", trendList:[{time,value}] }    ← 7 天总曝光
+        //   channelList[i] = { key:"搜索"|"推荐"|"其它", trendList:[...] } ← 7 天分渠道
+        // 必须先关掉前面 click 打开的抽屉
+        const closeDrawer = async () => {
+          await page.keyboard.press("Escape").catch(() => {});
+          await randomDelay(400, 700);
+          try {
+            const closeBtn = page.locator('[aria-label="Close"], [aria-label="关闭"], [class*="closeIcon"], [class*="close-icon"]').first();
+            if (await closeBtn.count() > 0) {
+              await closeBtn.click({ timeout: 1500, force: true }).catch(() => {});
+            }
+          } catch {}
+          await randomDelay(300, 500);
+        };
+
+        await closeDrawer();
+
+        // === 直接 fetch 模式：从 window.__fluxCapturedBodies 读 trend/detail 的真实 body 模板 ===
+        // 关闭抽屉后，trigger 阶段 SPA 已经 fetch 过 detail+trend，body 必然在 hook map 里
+        const capturedBodies = await page.evaluate(() => window.__fluxCapturedBodies || {});
+        console.error(`[flux:${taskKey}] HOOK captured paths: ${JSON.stringify(Object.keys(capturedBodies))}`);
+        const trendKey = Object.keys(capturedBodies).find((k) => k.includes("/goods/trend"));
+        const detailKey = Object.keys(capturedBodies).find((k) => k.includes("/goods/detail"));
+        const trendTpl = trendKey ? capturedBodies[trendKey] : null;
+        const detailTpl = detailKey ? capturedBodies[detailKey] : null;
+        console.error(`[flux:${taskKey}] HOOK trend captured: ${!!trendTpl} body=${trendTpl?.bodyText ? trendTpl.bodyText.slice(0, 400) : "(none)"}`);
+        console.error(`[flux:${taskKey}] HOOK detail captured: ${!!detailTpl} body=${detailTpl?.bodyText ? detailTpl.bodyText.slice(0, 400) : "(none)"}`);
+
+        if (!trendTpl?.bodyText && !detailTpl?.bodyText) {
+          console.error(`[flux:${taskKey}] FAILED: no fetch hook captures from trigger phase, abort.`);
+        } else {
+          const goodsIdsArr = Array.from(goodsCandidates.keys());
+          console.error(`[flux:${taskKey}] DIRECT-FETCH start: ${goodsIdsArr.length} products`);
+          // 探测 goodsId 字段名
+          let goodsIdField = null;
+          if (trendTpl?.bodyText) {
+            try {
+              const obj = JSON.parse(trendTpl.bodyText);
+              for (const k of ["goodsId", "goodsIdList", "spuId", "productId"]) {
+                if (k in obj) { goodsIdField = k; break; }
+              }
+              console.error(`[flux:${taskKey}] trend body keys: ${Object.keys(obj).join(",")}, goodsIdField=${goodsIdField}`);
+            } catch {}
+          }
+          if (!goodsIdField && detailTpl?.bodyText) {
+            try {
+              const obj = JSON.parse(detailTpl.bodyText);
+              for (const k of ["goodsId", "goodsIdList", "spuId", "productId"]) {
+                if (k in obj) { goodsIdField = k; break; }
+              }
+              console.error(`[flux:${taskKey}] detail body keys: ${Object.keys(obj).join(",")}, goodsIdField=${goodsIdField}`);
+            } catch {}
+          }
+          if (!goodsIdField) goodsIdField = "goodsId"; // 默认猜测
+
+          for (let i = 0; i < goodsIdsArr.length; i++) {
+            const goodsId = goodsIdsArr[i];
+            const meta = goodsCandidates.get(goodsId) || {};
+            try {
+              // 同时调 trend + detail（trend 是按日真数据，detail 是站点维度兜底）
+              const result = await page.evaluate(async ({ trendTpl, detailTpl, goodsId, field }) => {
+                const buildBody = (tpl) => {
+                  if (!tpl?.bodyText) return null;
+                  try {
+                    const obj = JSON.parse(tpl.bodyText);
+                    if (field === "goodsIdList") obj[field] = [String(goodsId)];
+                    else obj[field] = String(goodsId);
+                    return JSON.stringify(obj);
+                  } catch { return null; }
+                };
+                const callApi = async (tpl, body) => {
+                  if (!tpl || !body) return null;
+                  try {
+                    const r = await fetch(tpl.url, {
+                      method: tpl.method || "POST",
+                      headers: { ...(tpl.headers || {}), "content-type": "application/json" },
+                      body,
+                      credentials: "include",
+                    });
+                    return await r.json();
+                  } catch (e) { return { __err: String(e?.message || e) }; }
+                };
+                const trendBody = buildBody(trendTpl);
+                const detailBody = buildBody(detailTpl);
+                const [trendRes, detailRes] = await Promise.all([
+                  callApi(trendTpl, trendBody),
+                  callApi(detailTpl, detailBody),
+                ]);
+                return { trendRes, detailRes };
+              }, { trendTpl, detailTpl, goodsId, field: goodsIdField });
+
+              const dailyMap = {};
+              let usedTrend = false;
+              let usedDetail = false;
+              const tr = result?.trendRes?.result;
+              if (tr && result.trendRes.success !== false) {
+                usedTrend = true;
+                const totalTrend = (tr.trendList || []).find((x) => x.key === "近7日") || (tr.trendList || [])[0];
+                for (const pt of (totalTrend?.trendList || [])) {
+                  const date = pt.time;
+                  if (!date) continue;
+                  dailyMap[date] = dailyMap[date] || { date };
+                  dailyMap[date].exposeNum = Number(pt.value || 0);
+                }
+                for (const ch of (tr.channelList || [])) {
+                  const key = ch.key === "搜索" ? "searchExposeNum"
+                            : ch.key === "推荐" ? "recommendExposeNum"
+                            : ch.key === "其它" ? "otherExposeNum"
+                            : null;
+                  if (!key) continue;
+                  for (const pt of (ch.trendList || [])) {
+                    const date = pt.time;
+                    if (!date) continue;
+                    dailyMap[date] = dailyMap[date] || { date };
+                    dailyMap[date][key] = Number(pt.value || 0);
+                  }
+                }
+              }
+              const dr = result?.detailRes?.result;
+              if (dr && result.detailRes.success !== false) {
+                usedDetail = true;
+                const list = dr.list || dr.dataList || [];
+                for (const row of list) {
+                  const date = row.statDate || row.date || row.time;
+                  if (!date) continue;
+                  dailyMap[date] = dailyMap[date] || { date };
+                  // 基础流量
+                  if (row.exposeNum != null && dailyMap[date].exposeNum == null) dailyMap[date].exposeNum = Number(row.exposeNum || 0);
+                  if (row.clickNum != null) dailyMap[date].clickNum = Number(row.clickNum || 0);
+                  if (row.searchExposeNum != null && dailyMap[date].searchExposeNum == null) dailyMap[date].searchExposeNum = Number(row.searchExposeNum || 0);
+                  if (row.recommendExposeNum != null && dailyMap[date].recommendExposeNum == null) dailyMap[date].recommendExposeNum = Number(row.recommendExposeNum || 0);
+                  if (row.otherExposeNum != null && dailyMap[date].otherExposeNum == null) dailyMap[date].otherExposeNum = Number(row.otherExposeNum || 0);
+                  // 详情访客 / 加购 / 收藏
+                  if (row.goodsDetailVisitNum != null) dailyMap[date].detailVisitNum = Number(row.goodsDetailVisitNum || 0);
+                  if (row.goodsDetailVisitorNum != null) dailyMap[date].detailVisitorNum = Number(row.goodsDetailVisitorNum || 0);
+                  if (row.addToCartUserNum != null) dailyMap[date].addToCartUserNum = Number(row.addToCartUserNum || 0);
+                  if (row.collectUserNum != null) dailyMap[date].collectUserNum = Number(row.collectUserNum || 0);
+                  // 支付转化
+                  if (row.payGoodsNum != null) dailyMap[date].payGoodsNum = Number(row.payGoodsNum || 0);
+                  if (row.payOrderNum != null) dailyMap[date].payOrderNum = Number(row.payOrderNum || 0);
+                  if (row.buyerNum != null) dailyMap[date].buyerNum = Number(row.buyerNum || 0);
+                  // 转化率（后端已算好；前端可直接用，无需再除）
+                  if (row.exposePayConversionRate != null) dailyMap[date].exposePayConversionRate = Number(row.exposePayConversionRate || 0);
+                  if (row.exposeClickConversionRate != null) dailyMap[date].exposeClickConversionRate = Number(row.exposeClickConversionRate || 0);
+                  if (row.clickPayConversionRate != null) dailyMap[date].clickPayConversionRate = Number(row.clickPayConversionRate || 0);
+                }
+              }
+              const daily = Object.values(dailyMap).sort((a, b) => a.date.localeCompare(b.date));
+
+              if (daily.length === 0) {
+                const trendErr = result?.trendRes?.errorCode || result?.trendRes?.__err || "?";
+                const detailErr = result?.detailRes?.errorCode || result?.detailRes?.__err || "?";
+                console.error(`[flux:${taskKey}] FETCH#${i} goodsId=${goodsId} EMPTY trend.err=${trendErr} detail.err=${detailErr}`);
+                continue;
+              }
+
+              dailyCache[goodsId] = {
+                goodsId,
+                productId: String(meta?.productSpuId || "").trim(),
+                productSkcId: String(meta?.productSkcId || "").trim(),
+                productSkuId: String(meta?.productSkuId || "").trim(),
+                title: String(meta?.title || "").trim(),
+                stations: { [siteLabel]: { daily } },
+              };
+              fetchedCount++;
+              if (i < 3 || i === goodsIdsArr.length - 1 || i % 10 === 0) {
+                console.error(`[flux:${taskKey}] FETCH#${i} goodsId=${goodsId} OK trend=${usedTrend} detail=${usedDetail} daily.len=${daily.length} sample=${JSON.stringify(daily[0] || {})}`);
+              }
+            } catch (e) {
+              console.error(`[flux:${taskKey}] FETCH#${i} goodsId=${goodsId} error: ${e?.message}`);
+            }
+            // 节流，避免触发 4000004
+            await randomDelay(350, 600);
+          }
+        }
+
+        if (Object.keys(dailyCache).length > 0) {
+          console.error(`[flux:${taskKey}] SUCCESS: ${Object.keys(dailyCache).length}/${goodsCandidates.size} products fetched via direct fetch`);
           capturedApis.push({
             path: "__flux_product_daily_cache__",
             data: { result: dailyCache },
             rangeLabel: "__daily__",
           });
+        } else {
+          console.error(`[flux:${taskKey}] FAILED: no products fetched.`);
         }
       }
     } catch (dailyErr) {
@@ -7026,6 +7694,14 @@ async function handleRequest(body) {
     }
     case "scrape_flux_product_detail": {
       return await scrapeFluxProductDetail(params || {});
+    }
+    case "scrape_one": {
+      // 临时调试 action：直接跑 _registryScrape(key)，不需要登录 establishSession
+      await ensureBrowser();
+      const key = params?.key;
+      if (!key) throw new Error("scrape_one: key required");
+      const result = await _registryScrape(key);
+      return { key, result };
     }
     case "scrape_skc_region_detail": {
       const productId = params?.productId || params?.pid;
@@ -7357,7 +8033,7 @@ async function handleRequest(body) {
       // 探测指定页面的所有业务 API
       await ensureBrowser();
       const targetPath = params.path || "/goods/list";
-      const page = await context.newPage();
+      const page = await safeNewPage(context);
       const allApis = [];
       const responseTracker = createPendingTaskTracker();
       const frameworkPatterns = ['phantom/xg', 'pfb/l1', 'pfb/a4', 'web-performace', 'get-leo-config', '_stm', 'msgBox', 'auth/userInfo', 'auth/menu', 'queryTotalExam', 'feedback/entrance', 'rule/unreadNum', 'suggestedPrice', 'checkAbleFeedback', 'queryFeedbackNotReadTotal', 'pop/query', '.js', '.css', '.png', '.svg', '.woff', '.ico', '.jpg', '.gif', '.map', '.webp', 'hm.baidu', 'google', 'favicon', 'hot-update', 'sockjs'];
@@ -7409,7 +8085,7 @@ async function handleRequest(body) {
         let page = null;
         let responseTracker = null;
         try {
-          page = await context.newPage();
+          page = await safeNewPage(context);
           responseTracker = createPendingTaskTracker();
           const apis = [];
           const frameworkPatterns = ['phantom/xg', 'pfb/l1', 'pfb/a4', 'web-performace', 'get-leo-config', '_stm', 'msgBox', 'auth/userInfo', 'auth/menu', 'queryTotalExam', 'feedback/entrance', 'rule/unreadNum', 'suggestedPrice', 'checkAbleFeedback', 'queryFeedbackNotReadTotal', 'pop/query', '.js', '.css', '.png', '.svg', '.woff', '.ico', '.jpg', '.gif', '.map', '.webp', 'hm.baidu', 'google', 'favicon', 'hot-update', 'sockjs'];
@@ -7460,7 +8136,7 @@ async function handleRequest(body) {
       await ensureBrowser();
       let pg = context.pages().find(p => p.url().includes("goods") || p.url().includes("product"));
       if (!pg) {
-        pg = context.pages()[0] || await context.newPage();
+        pg = context.pages()[0] || await safeNewPage(context);
       }
       // 无论如何都导航到商品管理页
       await pg.goto("https://agentseller.temu.com/goods/list", { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -7495,7 +8171,7 @@ async function handleRequest(body) {
       // 扫描侧边栏所有菜单项，返回文本和链接
       await ensureBrowser();
       const pg = context.pages().find(p => p.url().includes("agentseller.temu.com") && !p.url().includes("authentication"));
-      const scanPage = pg || await context.newPage();
+      const scanPage = pg || await safeNewPage(context);
       if (!pg) {
         await navigateToSellerCentral(scanPage, "/goods/list");
         await randomDelay(3000, 5000);
@@ -7550,7 +8226,7 @@ async function handleRequest(body) {
       // 探索指定页面的所有 API
       await ensureBrowser();
       const { targetUrl, menuText } = params;
-      const ep = await context.newPage();
+      const ep = await safeNewPage(context);
       const debugDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
       fs.mkdirSync(debugDir, { recursive: true });
 
@@ -7643,7 +8319,7 @@ async function handleRequest(body) {
     case "capture_add_payload": {
       // 专门捕获 product/add 的完整请求体（用 route 拦截）
       await ensureBrowser();
-      const page = await context.newPage();
+      const page = await safeNewPage(context);
       const capturedBodies = [];
       const saveDir = path.join(process.env.APPDATA || "C:/Users/Administrator/AppData/Roaming", "temu-automation", "debug");
       fs.mkdirSync(saveDir, { recursive: true });
@@ -7697,7 +8373,7 @@ async function handleRequest(body) {
     case "test_api": {
       // 在已登录页面中调用指定 API 端点，用于调试
       await ensureBrowser();
-      const page = await context.newPage();
+      const page = await safeNewPage(context);
       try {
         await navigateToSellerCentral(page, params.navPath || "/goods/list");
         await randomDelay(5000, 8000);
@@ -7745,7 +8421,7 @@ async function handleRequest(body) {
       // 在已登录页面中执行任意 JS（用于调试）
       await ensureBrowser();
       const evalCode = params.code || params.expression || "";
-      const page = await context.newPage();
+      const page = await safeNewPage(context);
       try {
         await navigateToSellerCentral(page, params.navPath || "/goods/list");
         await randomDelay(3000, 5000);
@@ -8827,7 +9503,7 @@ async function temuXHR(page, endpoint, body, options = {}) {
 // ============================================================
 
 async function probeCreateFlow(params) {
-  const page = await context.newPage();
+  const page = await safeNewPage(context);
   const captured = [];
   const frameworkPatterns = [
     'phantom/xg', 'pfb/l1', 'pfb/a4', 'web-performace', 'get-leo-config',

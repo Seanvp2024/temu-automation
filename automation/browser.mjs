@@ -37,6 +37,14 @@ function normalizeLoginPhone(value = "") {
   return digits || raw;
 }
 
+function normalizeFilledLoginPhone(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length === 11) return digits;
+  return digits || raw;
+}
+
 async function findVisibleInput(page, selectors = []) {
   for (const selector of selectors) {
     const locator = page.locator(selector);
@@ -292,7 +300,13 @@ export async function launch(accountId, headless) {
     executablePath: chromeExe,
     headless: effectiveHeadless,
     slowMo,
-    args: ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"],
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--disable-dev-shm-usage",
+      "--disable-features=PasswordManagerOnboarding,AutofillServerCommunication,PasswordLeakDetection",
+      "--disable-save-password-bubble",
+      "--password-store=basic",
+    ],
   });
 
   browserState.context = await browserState.browser.newContext({
@@ -318,6 +332,138 @@ export async function closeBrowser() {
     await browserState.browser.close();
     browserState.browser = null;
     browserState.context = null;
+  }
+}
+
+// ---- 授权弹窗处理（供 login 和 safeNewPage 共用） ----
+const AUTH_URL_PATTERN = /seller-login|seller\.kuajingmaihuo\.com\/settle|agentseller\.temu/i;
+
+async function tryHandleAuthOnPage(targetPage, tag = "main") {
+  try {
+    if (!targetPage || targetPage.isClosed()) return false;
+    const url = targetPage.url() || "";
+    if (!AUTH_URL_PATTERN.test(url)) return false;
+    console.error(`[auth] [${tag}] handling Seller Central auth at ${url}`);
+    await targetPage.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+    await randomDelay(1200, 2200);
+
+    const cbResult = await targetPage.evaluate(() => {
+      const tryCheck = (input) => {
+        try {
+          if (!input.checked) input.click();
+          if (!input.checked) {
+            const d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked");
+            d?.set?.call(input, true);
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+          return input.checked;
+        } catch { return false; }
+      };
+      const inputs = [...document.querySelectorAll('input[type="checkbox"]')];
+      for (const cb of inputs) { if (tryCheck(cb)) return "checked input"; }
+      const customs = [...document.querySelectorAll('[class*="checkbox"], [class*="Checkbox"], [role="checkbox"]')];
+      for (const el of customs) { el.click(); return "clicked custom"; }
+      return "not found";
+    }).catch(() => "error");
+    console.error(`[auth] [${tag}] auth checkbox:`, cbResult);
+    await randomDelay(400, 800);
+
+    const btnResult = await targetPage.evaluate(() => {
+      const keywords = ["确认授权并前往", "确认授权", "确认并前往", "授权登录", "同意并登录", "同意", "进入"];
+      const all = [...document.querySelectorAll('button, a, [role="button"], div[class*="btn"], div[class*="Btn"], span[class*="btn"], span[class*="Btn"]')];
+      for (const kw of keywords) {
+        for (const el of all) {
+          const text = (el.innerText || el.textContent || "").trim();
+          if (text && text.includes(kw) && text.length < 30) {
+            el.click();
+            return "clicked: " + text;
+          }
+        }
+      }
+      return "not found";
+    }).catch(() => "error");
+    console.error(`[auth] [${tag}] auth enter button:`, btnResult);
+    if (typeof btnResult === "string" && btnResult.startsWith("clicked")) {
+      await randomDelay(3000, 5000);
+      await saveCookies();
+      return true;
+    }
+    return false;
+  } catch (e) {
+    console.error(`[auth] [${tag}] handler error:`, e?.message || e);
+    return false;
+  }
+}
+
+// Promise 超时包装器：超时则 resolve(defaultVal)，不会 reject
+function withTimeout(promise, ms, defaultVal, label = "op") {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => {
+      logSilent(`timeout.${label}`, new Error(`${label} exceeded ${ms}ms`));
+      resolve(defaultVal);
+    }, ms)),
+  ]);
+}
+
+// 扫描 context 中所有页面，处理掉阻塞的授权弹窗（整体 8 秒硬超时，单页 evaluate 3 秒）
+async function drainPendingAuthPopups(context) {
+  if (!context) return;
+  const overallTimeoutMs = 8000;
+  const perPageEvalTimeoutMs = 3000;
+  const perPageAuthTimeoutMs = 4000;
+
+  await withTimeout((async () => {
+    try {
+      const pages = context.pages();
+      for (const p of pages) {
+        if (p.isClosed()) continue;
+        const url = p.url() || "";
+        if (!AUTH_URL_PATTERN.test(url)) continue;
+        const hasBtn = await withTimeout(
+          p.evaluate(() => {
+            const all = [...document.querySelectorAll('button, a, [role="button"], div[class*="btn"], div[class*="Btn"], span[class*="btn"], span[class*="Btn"]')];
+            return all.some((el) => {
+              const t = (el.innerText || el.textContent || "").trim();
+              return t && (t.includes("确认授权") || t.includes("同意并登录") || t.includes("授权登录"));
+            });
+          }).catch(() => false),
+          perPageEvalTimeoutMs,
+          false,
+          "drain.evaluate",
+        );
+        if (hasBtn) {
+          await withTimeout(
+            tryHandleAuthOnPage(p, "drain").catch(() => false),
+            perPageAuthTimeoutMs,
+            false,
+            "drain.handleAuth",
+          );
+        }
+      }
+    } catch (e) {
+      logSilent("auth.drain", e);
+    }
+  })(), overallTimeoutMs, undefined, "drain.overall");
+}
+
+// 开新页前的全局互斥：同一时刻只有一个调用在执行 drain + newPage
+let _newPageMutex = Promise.resolve();
+export async function safeNewPage(context, { skipDrain = false } = {}) {
+  const target = context || browserState.context;
+  if (!target) throw new Error("浏览器上下文不可用");
+  const previous = _newPageMutex;
+  let release;
+  _newPageMutex = new Promise((resolve) => { release = resolve; });
+  try {
+    await previous;
+    if (!skipDrain) {
+      await drainPendingAuthPopups(target);
+    }
+    return await target.newPage();
+  } finally {
+    release();
   }
 }
 
@@ -354,21 +500,19 @@ export async function login(phone, password) {
     } catch (e) { logSilent("login.tab", e); }
 
     // 输入手机号
-    const ph = await findVisibleInput(page, [
-      '#usernameId',
-      'input[name="usernameId"]',
-      'input[placeholder*="手机"]',
-      'input[placeholder*="号码"]',
-      'input[type="tel"]',
-      'input[inputmode="numeric"]',
-    ]);
+    const phoneTarget = await findLoginPhoneInput(page);
+    const ph = phoneTarget?.input || null;
+    // Use the dedicated phone selector so we do not target the +86 country-code field.
     if (!ph) throw new Error("未找到手机号输入框");
+    console.error(
+      `[login] Using phone input selector=${phoneTarget.selector} index=${phoneTarget.index} id=${phoneTarget.meta?.id || "-"} name=${phoneTarget.meta?.name || "-"} width=${phoneTarget.meta?.width || 0}`
+    );
     await ph.click();
     await randomDelay(200, 500);
     await fillInputVerified(ph, normalizedPhone, {
       label: "手机号",
       logPrefix: "[login]",
-      normalize: normalizeLoginPhone,
+      normalize: normalizeFilledLoginPhone,
     });
     await randomDelay(800, 1500);
 
@@ -468,64 +612,6 @@ export async function login(phone, password) {
     await saveCookies();
 
     // 处理履约中心授权（可能在当前 page，也可能弹到新的 window/tab）
-    const tryHandleAuthOnPage = async (targetPage, tag = "main") => {
-      try {
-        if (!targetPage || targetPage.isClosed()) return false;
-        const url = targetPage.url() || "";
-        if (!/seller-login|seller\.kuajingmaihuo\.com|settle|agentseller\.temu/i.test(url)) return false;
-        console.error(`[login] [${tag}] handling Seller Central auth at ${url}`);
-        await targetPage.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
-        await randomDelay(1200, 2200);
-
-        const cbResult = await targetPage.evaluate(() => {
-          const tryCheck = (input) => {
-            try {
-              if (!input.checked) input.click();
-              if (!input.checked) {
-                const d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked");
-                d?.set?.call(input, true);
-                input.dispatchEvent(new Event("input", { bubbles: true }));
-                input.dispatchEvent(new Event("change", { bubbles: true }));
-              }
-              return input.checked;
-            } catch { return false; }
-          };
-          const inputs = [...document.querySelectorAll('input[type="checkbox"]')];
-          for (const cb of inputs) { if (tryCheck(cb)) return "checked input"; }
-          const customs = [...document.querySelectorAll('[class*="checkbox"], [class*="Checkbox"], [role="checkbox"]')];
-          for (const el of customs) { el.click(); return "clicked custom"; }
-          return "not found";
-        }).catch(() => "error");
-        console.error(`[login] [${tag}] auth checkbox:`, cbResult);
-        await randomDelay(400, 800);
-
-        const btnResult = await targetPage.evaluate(() => {
-          const keywords = ["确认授权并前往", "确认授权", "确认并前往", "授权登录", "同意并登录", "同意", "进入"];
-          const all = [...document.querySelectorAll('button, a, [role="button"], div[class*="btn"], div[class*="Btn"], span[class*="btn"], span[class*="Btn"]')];
-          for (const kw of keywords) {
-            for (const el of all) {
-              const text = (el.innerText || el.textContent || "").trim();
-              if (text && text.includes(kw) && text.length < 30) {
-                el.click();
-                return "clicked: " + text;
-              }
-            }
-          }
-          return "not found";
-        }).catch(() => "error");
-        console.error(`[login] [${tag}] auth enter button:`, btnResult);
-        if (typeof btnResult === "string" && btnResult.startsWith("clicked")) {
-          await randomDelay(3000, 5000);
-          await saveCookies();
-          return true;
-        }
-        return false;
-      } catch (e) {
-        console.error(`[login] [${tag}] auth handler error:`, e?.message || e);
-        return false;
-      }
-    };
-
     // 当前页先试一次
     await tryHandleAuthOnPage(page, "main");
 

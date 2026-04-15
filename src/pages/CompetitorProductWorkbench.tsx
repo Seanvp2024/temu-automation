@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Alert,
   Button,
   Card,
   Col,
@@ -19,6 +20,7 @@ import {
   message,
 } from "antd";
 import {
+  CopyOutlined,
   DeleteOutlined,
   EyeOutlined,
   LinkOutlined,
@@ -36,10 +38,19 @@ import {
   Legend,
   Line,
   LineChart,
+  PolarAngleAxis,
+  PolarGrid,
+  PolarRadiusAxis,
+  Radar,
+  RadarChart,
+  ReferenceLine,
   ResponsiveContainer,
+  Scatter,
+  ScatterChart,
   Tooltip as RTooltip,
   XAxis,
   YAxis,
+  ZAxis,
 } from "recharts";
 import {
   buildExecutionReport,
@@ -54,6 +65,15 @@ import {
 import { parseFluxData, parseProductsData, parseSalesData } from "../utils/parseRawApis";
 import { getStoreValue, getStoreValues } from "../utils/storeCompat";
 import { setStoreValueForActiveAccount } from "../utils/multiStore";
+import { withRetry } from "../utils/withRetry";
+import {
+  toSafeNumber,
+  average,
+  formatPercentText,
+  parseReviewCountText,
+  getErrorMessage,
+  stripWorkerErrorCode,
+} from "../utils/dataTransform";
 
 const { Text, Paragraph } = Typography;
 
@@ -146,11 +166,32 @@ interface TrackedProduct {
   goodsId?: string;
 }
 
+interface ProductWorkspaceSnapshotCache {
+  url: string;
+  title?: string;
+  sourceKeyword?: string;
+  goodsId?: string;
+  addedAt?: string;
+  snapshot: any;
+  updatedAt: string;
+}
+
+/** Phase4·P4.2：单条动作的勾选状态 */
+interface ActionStateEntry {
+  checked: boolean;
+  note?: string;
+  checkedAt?: string;
+}
+
 interface ProductWorkspaceState {
   productId: string;
   keyword: string;
   wareHouseType: number;
   selectedUrls: string[];
+  /** Phase1·P1.3：把最新一次 snapshot 冗余进 workspace，离线 / 降级时可直接渲染样本 */
+  selectedSampleSnapshots?: ProductWorkspaceSnapshotCache[];
+  /** Phase4·P4.2：动作勾选状态（key = actionId） */
+  actionStates?: Record<string, ActionStateEntry>;
   updatedAt: string;
 }
 
@@ -255,6 +296,12 @@ interface FluxTrendPoint {
   visitors: number;
   buyers: number;
   conversionRate: number;
+  // 商品级日缓存才有的原始字段；存在则图表直接渲染真实值，无需按 summary 比例估算
+  rawExposeNum?: number;
+  rawClickNum?: number;
+  rawBuyerNum?: number;
+  rawSearchExpose?: number;
+  rawRecommendExpose?: number;
 }
 
 interface DiagnosisPanel {
@@ -265,28 +312,8 @@ interface DiagnosisPanel {
   actions: string[];
 }
 
-function toSafeNumber(value: unknown) {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : 0;
-}
-
-function average(values: number[]) {
-  if (values.length === 0) return 0;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
-function formatPercentText(value: number) {
-  return `${(value * 100).toFixed(0)}%`;
-}
-
-function parseReviewCountText(text: unknown) {
-  const raw = typeof text === "string" ? text.replace(/,/g, "") : "";
-  const match = raw.match(/(\d+(?:\.\d+)?)(k)?/i);
-  if (!match) return 0;
-  const base = Number(match[1] || 0);
-  if (!Number.isFinite(base)) return 0;
-  return match[2] ? Math.round(base * 1000) : Math.round(base);
-}
+// toSafeNumber / average / formatPercentText / parseReviewCountText / getErrorMessage
+// / stripWorkerErrorCode 等通用工具已抽到 src/utils/dataTransform.ts
 
 function getRelativeChangePercent(value: unknown) {
   const num = Number(value);
@@ -314,12 +341,28 @@ function getRelativeChangeColor(value: unknown) {
 function normalizeFluxTrendSeries(trendList: unknown): FluxTrendPoint[] {
   const rawList = Array.isArray(trendList) ? trendList : [];
   return rawList
-    .map((item: any) => ({
-      date: String(item?.date || item?.statDate || "").trim(),
-      visitors: toSafeNumber(item?.visitors ?? item?.visitorsNum),
-      buyers: toSafeNumber(item?.buyers ?? item?.payBuyerNum),
-      conversionRate: toSafeNumber(item?.conversionRate),
-    }))
+    .map((item: any) => {
+      const hasRawExpose = item?.exposeNum != null;
+      const hasRawClick = item?.clickNum != null;
+      const hasRawBuyer = item?.buyerNum != null;
+      return {
+        date: String(item?.date || item?.statDate || "").trim(),
+        visitors: toSafeNumber(
+          item?.visitors
+          ?? item?.visitorsNum
+          ?? item?.detailVisitNum
+          ?? item?.detailVisitorNum
+          ?? item?.clickNum,
+        ),
+        buyers: toSafeNumber(item?.buyers ?? item?.payBuyerNum ?? item?.buyerNum),
+        conversionRate: toSafeNumber(item?.conversionRate),
+        rawExposeNum: hasRawExpose ? toSafeNumber(item.exposeNum) : undefined,
+        rawClickNum: hasRawClick ? toSafeNumber(item.clickNum) : undefined,
+        rawBuyerNum: hasRawBuyer ? toSafeNumber(item.buyerNum) : undefined,
+        rawSearchExpose: item?.searchExposeNum != null ? toSafeNumber(item.searchExposeNum) : undefined,
+        rawRecommendExpose: item?.recommendExposeNum != null ? toSafeNumber(item.recommendExposeNum) : undefined,
+      };
+    })
     .filter((item) => item.date)
     .sort((left, right) => left.date.localeCompare(right.date));
 }
@@ -330,6 +373,59 @@ function formatFluxTrendRange(trendSeries: FluxTrendPoint[]) {
   const last = trendSeries[trendSeries.length - 1]?.date || "";
   if (!first) return "";
   return first === last ? first : `${first} - ${last}`;
+}
+
+// 当某站点没有商品级 summary，但日级缓存有数据时，把日级累加成一份 summary 用于点亮漏斗 / 指标卡
+function buildSummaryFromDailyCache(daily: any[], siteKey: string, siteLabel: string, syncedAt: string): any {
+  let exposeNum = 0, clickNum = 0, buyerNum = 0, addToCartUserNum = 0;
+  let detailVisitorNum = 0, searchExposeNum = 0, recommendExposeNum = 0;
+  let searchClickNum = 0, recommendClickNum = 0, payGoodsNum = 0, payOrderNum = 0;
+  let searchPayGoodsNum = 0, recommendPayGoodsNum = 0, collectUserNum = 0;
+  for (const d of daily) {
+    exposeNum += toSafeNumber(d?.exposeNum);
+    clickNum += toSafeNumber(d?.clickNum);
+    buyerNum += toSafeNumber(d?.buyerNum);
+    addToCartUserNum += toSafeNumber(d?.addCartUserNum ?? d?.addToCartUserNum);
+    detailVisitorNum += toSafeNumber(d?.detailVisitorNum ?? d?.detailVisitNum);
+    searchExposeNum += toSafeNumber(d?.searchExposeNum);
+    recommendExposeNum += toSafeNumber(d?.recommendExposeNum);
+    searchClickNum += toSafeNumber(d?.searchClickNum);
+    recommendClickNum += toSafeNumber(d?.recommendClickNum);
+    searchPayGoodsNum += toSafeNumber(d?.searchPayGoodsNum);
+    recommendPayGoodsNum += toSafeNumber(d?.recommendPayGoodsNum);
+    payGoodsNum += toSafeNumber(d?.payGoodsNum);
+    payOrderNum += toSafeNumber(d?.payOrderNum);
+    collectUserNum += toSafeNumber(d?.collectUserNum);
+  }
+  const sorted = [...daily].sort((a, b) => String(a?.date || "").localeCompare(String(b?.date || "")));
+  const lastDate = sorted.length > 0 ? String(sorted[sorted.length - 1]?.date || "") : "";
+  return {
+    __siteKey: siteKey,
+    __siteLabel: siteLabel,
+    siteKey,
+    siteLabel,
+    dataDate: lastDate,
+    syncedAt,
+    exposeNum,
+    clickNum,
+    buyerNum,
+    addToCartUserNum,
+    payGoodsNum,
+    payOrderNum,
+    collectUserNum,
+    detailVisitorNum,
+    detailVisitNum: detailVisitorNum,
+    searchExposeNum,
+    recommendExposeNum,
+    searchClickNum,
+    recommendClickNum,
+    searchPayGoodsNum,
+    recommendPayGoodsNum,
+    trendExposeNum: exposeNum,
+    trendPayOrderNum: payOrderNum,
+    exposeClickRate: exposeNum > 0 ? clickNum / exposeNum : 0,
+    clickPayRate: clickNum > 0 ? buyerNum / clickNum : 0,
+  };
 }
 
 function buildFluxSiteDataset(siteKey: FluxSiteDataset["siteKey"], siteLabel: string, source: any): FluxSiteDataset {
@@ -483,6 +579,24 @@ function getTrafficSiteMode(site: any) {
 }
 
 function buildTrafficPerformanceTrendData(site: any) {
+  // 1) 商品级日缓存自带 rawExposeNum/rawClickNum/rawBuyerNum，直接渲染真实日值（与商品分析一致）
+  const trendSeriesAll: FluxTrendPoint[] = Array.isArray(site?.trendSeries) ? site.trendSeries.slice(-30) : [];
+  const hasRawDaily = trendSeriesAll.some((p) => p?.rawExposeNum != null || p?.rawClickNum != null || p?.rawBuyerNum != null);
+  if (trendSeriesAll.length > 1 && hasRawDaily) {
+    return trendSeriesAll.map((item) => {
+      const expose = toSafeNumber(item.rawExposeNum);
+      const click = toSafeNumber(item.rawClickNum);
+      const buyers = toSafeNumber(item.rawBuyerNum);
+      return {
+        label: item.date.slice(5),
+        fullLabel: item.date,
+        expose,
+        clickRate: expose > 0 ? Number(((click / expose) * 100).toFixed(1)) : 0,
+        clickPayRate: click > 0 ? Number(((buyers / click) * 100).toFixed(1)) : 0,
+      };
+    }).filter((item) => item.expose > 0 || item.clickRate > 0 || item.clickPayRate > 0);
+  }
+
   const labels = FLUX_RANGE_ORDER.filter((label) => site?.summaryByRange?.[label]);
   const rangeData = labels.map((label) => {
     const summary = site?.summaryByRange?.[label];
@@ -500,7 +614,7 @@ function buildTrafficPerformanceTrendData(site: any) {
 
   if (rangeData.length > 1) return rangeData;
 
-  const trendSeries = Array.isArray(site?.trendSeries) ? site.trendSeries.slice(-7) : [];
+  const trendSeries = trendSeriesAll.slice(-7);
   const summary = site?.summary;
   if (trendSeries.length <= 1 || !summary) return rangeData;
 
@@ -527,7 +641,7 @@ function buildTrafficPerformanceTrendData(site: any) {
   }).filter((item: any) => item.expose > 0 || item.clickRate > 0 || item.clickPayRate > 0);
 }
 
-function buildTrafficSourceChartData(site: any) {
+export function _buildTrafficSourceChartData(site: any) {
   const summary = site?.summary;
   if (!summary) return [];
 
@@ -563,7 +677,7 @@ function buildTrafficSourceChartData(site: any) {
   ];
 }
 
-function buildTrafficSourceOverview(summary: any) {
+export function _buildTrafficSourceOverview(summary: any) {
   if (!summary) return [];
   const searchExpose = toSafeNumber(summary.searchExposeNum);
   const recommendExpose = toSafeNumber(summary.recommendExposeNum);
@@ -597,12 +711,30 @@ function buildTrafficSourceOverview(summary: any) {
 }
 
 function buildTrafficSourceTimelineData(site: any, days: number) {
-  const trendSeries = Array.isArray(site?.trendSeries) ? site.trendSeries.slice(-(days || 7)) : [];
+  const trendSeries: FluxTrendPoint[] = Array.isArray(site?.trendSeries) ? site.trendSeries.slice(-(days || 7)) : [];
   const summary = site?.summary;
   const totalExpose = toSafeNumber(summary?.exposeNum);
   const searchExpose = toSafeNumber(summary?.searchExposeNum);
   const recommendExpose = toSafeNumber(summary?.recommendExposeNum);
-  const otherExpose = Math.max(totalExpose - searchExpose - recommendExpose, 0);
+  void Math.max(totalExpose - searchExpose - recommendExpose, 0); // otherExpose（占位，保留计算给未来恢复）
+
+  // 1) 商品级日缓存自带 rawExposeNum/rawSearchExpose/rawRecommendExpose，直接用，不做比例估算（与商品分析一致）
+  const hasRawDaily = trendSeries.some((p) => p?.rawExposeNum != null);
+  if (trendSeries.length > 1 && hasRawDaily) {
+    return trendSeries.map((item) => {
+      const total = toSafeNumber(item.rawExposeNum);
+      const search = toSafeNumber(item.rawSearchExpose);
+      const recommend = toSafeNumber(item.rawRecommendExpose);
+      return {
+        label: item.date.slice(5),
+        fullDate: item.date,
+        search,
+        recommend,
+        other: Math.max(total - search - recommend, 0),
+        total,
+      };
+    }).filter((item) => item.total > 0 || item.search > 0 || item.recommend > 0 || item.other > 0);
+  }
 
   if (trendSeries.length > 1 && totalExpose > 0) {
     const anchorPoint = [...trendSeries].reverse().find((item: FluxTrendPoint) => item.visitors > 0) || trendSeries[trendSeries.length - 1];
@@ -696,14 +828,6 @@ function getFluxSiteDisplayName(siteKey: FluxSiteDataset["siteKey"]) {
 async function readArrayStoreValue(key: string) {
   const value = await getStoreValue(store, key);
   return Array.isArray(value) ? value : [];
-}
-
-function getErrorMessage(error: unknown) {
-  return String((error as { message?: string })?.message || error || "");
-}
-
-function stripWorkerErrorCode(message: string) {
-  return message.replace(/^\[[A-Z0-9_]+\]\s*/, "").trim();
 }
 
 function stripInvokeErrorPrefix(message: string) {
@@ -1080,6 +1204,43 @@ function getSearchResultReviewCount(record: any) {
   return toSafeNumber(record?.reviewCount) || parseReviewCountText(record?.commentNumTips);
 }
 
+// Phase1·P1.4：从当前商品 / 关键词里凑出近义词建议
+const KEYWORD_STOP_WORDS = new Set([
+  "for", "the", "a", "an", "of", "with", "and", "or", "to", "in", "on", "by", "at",
+  "from", "new", "hot", "2024", "2025", "2026", "pcs", "set", "pack", "size", "style", "color",
+]);
+
+function buildKeywordSuggestions(currentKeyword: string, title?: string, category?: string): string[] {
+  const current = (currentKeyword || "").toLowerCase().trim();
+  const source = `${title || ""} ${category || ""}`.toLowerCase();
+  if (!source.trim()) return [];
+  // 粗糙分词：按空格 / 逗号 / 斜杠 / 竖线切
+  const tokens = source.split(/[\s,/|()\-·、，。]+/).map((t) => t.trim()).filter(Boolean);
+  const seen = new Set<string>();
+  const single: string[] = [];
+  for (const token of tokens) {
+    if (token.length < 3) continue;
+    if (KEYWORD_STOP_WORDS.has(token)) continue;
+    if (current && current.includes(token)) continue;
+    if (seen.has(token)) continue;
+    seen.add(token);
+    single.push(token);
+    if (single.length >= 6) break;
+  }
+  // 补一个两词组合（前两 token）作为更具体的变体
+  const bigrams: string[] = [];
+  for (let i = 0; i < tokens.length - 1 && bigrams.length < 2; i++) {
+    const a = tokens[i];
+    const b = tokens[i + 1];
+    if (!a || !b) continue;
+    if (KEYWORD_STOP_WORDS.has(a) || KEYWORD_STOP_WORDS.has(b)) continue;
+    const phrase = `${a} ${b}`;
+    if (current && current.includes(phrase)) continue;
+    bigrams.push(phrase);
+  }
+  return [...bigrams, ...single].slice(0, 6);
+}
+
 function firstTextValue(...values: unknown[]) {
   for (const value of values) {
     const text = String(value || "").trim();
@@ -1216,14 +1377,14 @@ function collectYunqiTags(detail: any) {
   ].filter(Boolean)));
 }
 
-function normalizeLookupText(value: unknown) {
+export function normalizeLookupText(value: unknown) {
   return String(value || "")
     .trim()
     .toLowerCase()
     .replace(/\s+/g, " ");
 }
 
-function buildLocalYunduOverallDetail(source: Record<string, unknown>) {
+export function buildLocalYunduOverallDetail(source: Record<string, unknown>) {
   const tags = dedupeStrings([
     ...flattenYunqiTagText(source.tagList),
     ...flattenYunqiTagText(source.statusTags),
@@ -1367,8 +1528,8 @@ export default function CompetitorProductWorkbench({
   prefillProduct = null,
 }: CompetitorProductWorkbenchProps = {}) {
   const [myProducts, setMyProducts] = useState<any[]>([]);
-  const [fluxStoreItems, setFluxStoreItems] = useState<any[]>([]);
-  const [fluxStoreSyncedAt, setFluxStoreSyncedAt] = useState("");
+  const [, setFluxStoreItems] = useState<any[]>([]);
+  const [, setFluxStoreSyncedAt] = useState("");
   const [fluxSiteDatasets, setFluxSiteDatasets] = useState<FluxSiteDataset[]>([]);
   const [tracked, setTracked] = useState<TrackedProduct[]>([]);
   const [workspaces, setWorkspaces] = useState<Record<string, ProductWorkspaceState>>({});
@@ -1391,6 +1552,95 @@ export default function CompetitorProductWorkbench({
   const [yunqiProductDetailError, setYunqiProductDetailError] = useState("");
   const [trafficActiveSiteKey, setTrafficActiveSiteKey] = useState<FluxSiteDataset["siteKey"]>("global");
   const [trafficRangeLabel, setTrafficRangeLabel] = useState<string>("今日");
+  const [productHistoryCache, setProductHistoryCache] = useState<Record<string, any>>({});
+  const [degradedReason, setDegradedReason] = useState<string>("");
+  const sampleCardRef = useRef<HTMLDivElement | null>(null);
+  // 云启"无匹配"自救：根据标题搜出候选 / 手动贴链接
+  const [yunqiRescueLoading, setYunqiRescueLoading] = useState(false);
+  const [yunqiRescueCandidates, setYunqiRescueCandidates] = useState<any[]>([]);
+  const [yunqiRescueUrl, setYunqiRescueUrl] = useState("");
+  // 标题中文化：英文标题 → 中文缓存（持久 + 运行时）
+  const [titleTranslations, setTitleTranslations] = useState<Record<string, string>>({});
+  const titleTranslatePendingRef = useRef<Set<string>>(new Set());
+  const titleTranslateHydratedRef = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (!store) return;
+        const cache = await getStoreValue(store, "temu_competitor_title_translations");
+        if (!cancelled && cache && typeof cache === "object") {
+          setTitleTranslations((prev) => ({ ...(cache as Record<string, string>), ...prev }));
+        }
+      } catch {
+        // ignore
+      } finally {
+        titleTranslateHydratedRef.current = true;
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  const displayTitle = useCallback((raw: unknown, zh?: unknown): string => {
+    const zhStr = typeof zh === "string" ? zh.trim() : "";
+    if (zhStr && /[\u4e00-\u9fa5]/.test(zhStr)) return zhStr;
+    const rawStr = typeof raw === "string" ? raw.trim() : String(raw || "").trim();
+    if (!rawStr) return "";
+    if (/[\u4e00-\u9fa5]/.test(rawStr)) return rawStr;
+    return titleTranslations[rawStr] || rawStr;
+  }, [titleTranslations]);
+  const requestTitleTranslations = useCallback((titles: Array<string | undefined | null>) => {
+    const api = (window as any).electronAPI?.imageStudio;
+    if (!api?.translate) return;
+    const pending = titleTranslatePendingRef.current;
+    const unique = new Set<string>();
+    titles.forEach((t) => {
+      const s = typeof t === "string" ? t.trim() : "";
+      if (!s) return;
+      if (s.length < 3) return;
+      if (/[\u4e00-\u9fa5]/.test(s)) return;
+      if (titleTranslations[s]) return;
+      if (pending.has(s)) return;
+      unique.add(s);
+    });
+    if (unique.size === 0) return;
+    const batch = Array.from(unique).slice(0, 20);
+    batch.forEach((t) => pending.add(t));
+    (async () => {
+      try {
+        const result = await api.translate({ texts: batch });
+        const translations = Array.isArray(result?.translations) ? result.translations : [];
+        const next: Record<string, string> = {};
+        batch.forEach((src, idx) => {
+          const dst = typeof translations[idx] === "string" ? translations[idx].trim() : "";
+          if (dst && /[\u4e00-\u9fa5]/.test(dst)) next[src] = dst;
+        });
+        if (Object.keys(next).length > 0) {
+          setTitleTranslations((prev) => {
+            const merged = { ...prev, ...next };
+            store?.set("temu_competitor_title_translations", merged).catch(() => {});
+            return merged;
+          });
+        }
+      } catch {
+        // 降级静默
+      } finally {
+        batch.forEach((t) => pending.delete(t));
+      }
+    })();
+  }, [titleTranslations]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (!store) return;
+        const cache = await getStoreValue(store, "temu_flux_product_history_cache");
+        if (!cancelled && cache && typeof cache === "object") setProductHistoryCache(cache as Record<string, any>);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
   const wareHouseType = DEFAULT_WAREHOUSE_TYPE;
 
   const activeStep = typeof controlledActiveStep === "number" ? controlledActiveStep : internalActiveStep;
@@ -1654,83 +1904,6 @@ export default function CompetitorProductWorkbench({
       })
       .filter(Boolean);
   }, [isSelectedYunqiExactMatch, selectedYunqiDetail]);
-  const legacySelectedTrafficSummary = useMemo(() => {
-    if (!selectedProduct) return null;
-    const candidateIds = new Set(
-      [
-        selectedProductMeta?.goodsId,
-        selectedProductMeta?.spuId,
-        selectedProductMeta?.skcId,
-        selectedProductMeta?.skuId,
-        selectedRawProduct?.goodsId,
-        selectedRawProduct?.spuId,
-        selectedRawProduct?.skcId,
-        selectedRawProduct?.productSkcId,
-        selectedRawProduct?.goodsSkcId,
-        selectedRawProduct?.skuId,
-        selectedRawProduct?.productSkuId,
-        selectedRawProduct?.productId,
-        selectedRawProduct?.productSpuId,
-        selectedProduct?.id,
-      ]
-        .map((value) => String(value || "").trim())
-        .filter(Boolean),
-    );
-    const titleCandidate = firstTextValue(
-      selectedRawProduct?.productName,
-      selectedRawProduct?.title,
-      selectedRawProduct?.goodsName,
-      selectedProduct?.title,
-    ).toLowerCase();
-    const matchedItems = fluxStoreItems.filter((item: any) => {
-      const goodsId = String(item?.goodsId || "").trim();
-      const spuId = String(item?.spuId || "").trim();
-      const skcId = String(item?.skcId || "").trim();
-      const skuId = String(item?.skuId || "").trim();
-      const goodsName = String(item?.goodsName || "").trim().toLowerCase();
-      return candidateIds.has(goodsId)
-        || candidateIds.has(spuId)
-        || candidateIds.has(skcId)
-        || candidateIds.has(skuId)
-        || (titleCandidate && goodsName === titleCandidate);
-    });
-    if (matchedItems.length === 0) return null;
-
-    const primary = [...matchedItems].sort((left: any, right: any) => {
-      const exposeDiff = toSafeNumber(right?.exposeNum) - toSafeNumber(left?.exposeNum);
-      if (exposeDiff !== 0) return exposeDiff;
-      return toSafeNumber(right?.clickNum) - toSafeNumber(left?.clickNum);
-    })[0];
-
-    const exposeNum = matchedItems.reduce((sum: number, item: any) => sum + toSafeNumber(item?.exposeNum), 0);
-    const clickNum = matchedItems.reduce((sum: number, item: any) => sum + toSafeNumber(item?.clickNum), 0);
-    const detailVisitNum = matchedItems.reduce((sum: number, item: any) => sum + toSafeNumber(item?.detailVisitNum), 0);
-    const addToCartUserNum = matchedItems.reduce((sum: number, item: any) => sum + toSafeNumber(item?.addToCartUserNum), 0);
-    const buyerNum = matchedItems.reduce((sum: number, item: any) => sum + toSafeNumber(item?.buyerNum), 0);
-    const payGoodsNum = matchedItems.reduce((sum: number, item: any) => sum + toSafeNumber(item?.payGoodsNum), 0);
-
-    return {
-      sourceKind: "flux",
-      syncedAt: fluxStoreSyncedAt,
-      exposeNum,
-      exposeNumChange: primary?.exposeNumChange,
-      clickNum,
-      clickNumChange: primary?.clickNumChange,
-      detailVisitNum,
-      addToCartUserNum,
-      buyerNum,
-      payGoodsNum,
-      exposeClickRate: exposeNum > 0 ? clickNum / exposeNum : toSafeNumber(primary?.exposeClickRate),
-      clickPayRate: clickNum > 0 ? buyerNum / clickNum : toSafeNumber(primary?.clickPayRate),
-      growDataText: matchedItems.map((item: any) => firstTextValue(item?.growDataText)).find(Boolean) || "",
-      primaryLabel: "曝光",
-      secondaryLabel: "点击",
-      clickRateLabel: "曝光点击率",
-      conversionRateLabel: "点击支付转化率",
-      detailLabel: "详情访问",
-      supportLabel: "加购人数",
-    };
-  }, [fluxStoreItems, fluxStoreSyncedAt, selectedProduct, selectedProductMeta?.goodsId, selectedProductMeta?.skcId, selectedProductMeta?.skuId, selectedProductMeta?.spuId, selectedRawProduct]);
   const selectedTrafficMatchContext = useMemo(() => {
     if (!selectedProduct) return null;
     return {
@@ -1823,34 +1996,64 @@ export default function CompetitorProductWorkbench({
     });
   }, [fluxSiteDatasets, selectedTrafficMatchContext, trafficRangeLabel]);
   const selectedTrafficDetailBySite = useMemo(() => {
-    return selectedTrafficBySite.map((site) => ({
-      ...site,
-      detailLoading: false,
-      trendSeries: normalizeFluxTrendSeries(site.siteSummary?.trendList),
-      recentTrendSeries: normalizeFluxTrendSeries(site.siteSummary?.trendList).slice(-7),
-      trendRangeText: formatFluxTrendRange(normalizeFluxTrendSeries(site.siteSummary?.trendList)),
-      latestTrendPoint: normalizeFluxTrendSeries(site.siteSummary?.trendList).slice(-1)[0] || null,
-      detailSummary: site.summary ? {
-        dataDate: site.summary.dataDate,
-        updateTime: site.summary.updateTime,
-        detailVisitorNum: site.summary.detailVisitorNum,
-        collectUserNum: site.summary.collectUserNum,
-        payOrderNum: site.summary.payOrderNum,
-        payGoodsNum: site.summary.payGoodsNum,
-        searchExposeNum: site.summary.searchExposeNum,
-        searchClickNum: site.summary.searchClickNum,
-        searchPayGoodsNum: site.summary.searchPayGoodsNum,
-        recommendExposeNum: site.summary.recommendExposeNum,
-        recommendClickNum: site.summary.recommendClickNum,
-        recommendPayGoodsNum: site.summary.recommendPayGoodsNum,
-        trendExposeNum: site.summary.trendExposeNum,
-        trendPayOrderNum: site.summary.trendPayOrderNum,
-      } : null,
-    }));
-  }, [selectedTrafficBySite]);
-  const selectedTrafficSummary = useMemo<ProductTrafficSummary | null>(() => {
-    return selectedTrafficBySite.find((item) => item.summary)?.summary || null;
-  }, [selectedTrafficBySite]);
+    const labelMap: Record<FluxSiteDataset["siteKey"], string> = {
+      global: "全球",
+      us: "美国",
+      eu: "欧区",
+    };
+    return selectedTrafficBySite.map((site) => {
+      // 与 ProductList → TrafficDriverPanel 商品分析对齐：
+      // 1) summary 始终用商品级匹配出的 site.summary，不做合成
+      // 2) trendList 优先用商品级日缓存（粒度更细），> 1 条才用，否则回退到站点级 siteSummary.trendList
+      let cacheDaily: any[] | null = null;
+      if (selectedTrafficMatchContext) {
+        const stationLabel = labelMap[site.siteKey];
+        for (const id of selectedTrafficMatchContext.candidateIds) {
+          const daily = productHistoryCache?.[id]?.stations?.[stationLabel]?.daily;
+          if (Array.isArray(daily) && daily.length > 0) {
+            cacheDaily = daily;
+            break;
+          }
+        }
+      }
+      const trendList = cacheDaily && cacheDaily.length > 1
+        ? cacheDaily
+        : (site.siteSummary?.trendList || []);
+      const trendSeries = normalizeFluxTrendSeries(trendList);
+
+      // 三站点统一：只要日级缓存存在，就用 30 天累加 summary（与 trendList 同口径）；
+      // 缓存缺失时才回退到 fluxStoreItems 匹配出的 site.summary
+      const effectiveSummary = (cacheDaily
+        ? buildSummaryFromDailyCache(cacheDaily, site.siteKey, labelMap[site.siteKey], site.syncedAt || "")
+        : null) || site.summary;
+
+      return {
+        ...site,
+        summary: effectiveSummary,
+        detailLoading: false,
+        trendSeries,
+        recentTrendSeries: trendSeries.slice(-7),
+        trendRangeText: formatFluxTrendRange(trendSeries),
+        latestTrendPoint: trendSeries.slice(-1)[0] || null,
+        detailSummary: effectiveSummary ? {
+          dataDate: effectiveSummary.dataDate,
+          updateTime: effectiveSummary.updateTime,
+          detailVisitorNum: effectiveSummary.detailVisitorNum,
+          collectUserNum: effectiveSummary.collectUserNum,
+          payOrderNum: effectiveSummary.payOrderNum,
+          payGoodsNum: effectiveSummary.payGoodsNum,
+          searchExposeNum: effectiveSummary.searchExposeNum,
+          searchClickNum: effectiveSummary.searchClickNum,
+          searchPayGoodsNum: effectiveSummary.searchPayGoodsNum,
+          recommendExposeNum: effectiveSummary.recommendExposeNum,
+          recommendClickNum: effectiveSummary.recommendClickNum,
+          recommendPayGoodsNum: effectiveSummary.recommendPayGoodsNum,
+          trendExposeNum: effectiveSummary.trendExposeNum,
+          trendPayOrderNum: effectiveSummary.trendPayOrderNum,
+        } : null,
+      };
+    });
+  }, [selectedTrafficBySite, selectedTrafficMatchContext, productHistoryCache]);
   const trafficOverviewSyncedAt = useMemo(() => {
     return selectedTrafficDetailBySite
       .map((item) => item.summary?.syncedAt || item.summary?.updateTime || item.syncedAt)
@@ -2061,7 +2264,10 @@ export default function CompetitorProductWorkbench({
     setYunqiProductDetailError("");
     onYunqiRequestStart?.();
 
-    competitor.track({ goodsId: selectedGoodsId, allowNotMatched: true }).then((detail: any) => {
+    withRetry(
+      () => competitor.track({ goodsId: selectedGoodsId, allowNotMatched: true }),
+      { label: "detail-track" },
+    ).then((detail: any) => {
       if (!alive) return;
       setYunqiProductDetails((current) => ({ ...current, [selectedGoodsId]: detail }));
       if (detail?.matchStatus === "not_matched") {
@@ -2115,17 +2321,41 @@ export default function CompetitorProductWorkbench({
 
   const persistWorkspace = useCallback(async (productId: string, patch: Partial<ProductWorkspaceState>) => {
     const current = workspaces[productId];
+    const nextSelectedUrls = patch.selectedUrls ?? current?.selectedUrls ?? [];
+    // P1.3：把 tracked 里对应 url 的最新 snapshot 冗余进 workspace
+    const nowIso = new Date().toISOString();
+    const previousSnapshots = current?.selectedSampleSnapshots ?? [];
+    const prevByUrl = new Map(previousSnapshots.map((item) => [item.url, item]));
+    const nextSnapshots: ProductWorkspaceSnapshotCache[] = nextSelectedUrls.map((url) => {
+      const trackedItem = tracked.find((item) => item.url === url);
+      const latest = trackedItem ? getLatestSnapshot(trackedItem) : null;
+      if (latest) {
+        return {
+          url,
+          title: trackedItem?.title,
+          sourceKeyword: trackedItem?.sourceKeyword,
+          goodsId: trackedItem?.goodsId,
+          addedAt: trackedItem?.addedAt,
+          snapshot: latest,
+          updatedAt: nowIso,
+        };
+      }
+      // 没有新 snapshot 就沿用上一份缓存，避免断网时丢失
+      return prevByUrl.get(url) || { url, snapshot: null, updatedAt: nowIso };
+    }).filter((item) => item.snapshot);
     const nextWorkspace: ProductWorkspaceState = {
       productId,
       keyword: patch.keyword ?? current?.keyword ?? "",
       wareHouseType: patch.wareHouseType ?? current?.wareHouseType ?? 0,
-      selectedUrls: patch.selectedUrls ?? current?.selectedUrls ?? [],
-      updatedAt: new Date().toISOString(),
+      selectedUrls: nextSelectedUrls,
+      selectedSampleSnapshots: nextSnapshots,
+      actionStates: patch.actionStates ?? current?.actionStates ?? {},
+      updatedAt: nowIso,
     };
     const next = { ...workspaces, [productId]: nextWorkspace };
     setWorkspaces(next);
     await store?.set(PRODUCT_WORKSPACE_STORE_KEY, next);
-  }, [workspaces]);
+  }, [workspaces, tracked]);
 
   const selectedUrls = (selectedMy && workspaces[selectedMy]?.selectedUrls) || [];
 
@@ -2175,10 +2405,33 @@ export default function CompetitorProductWorkbench({
     });
   }, [searchRows, searchTableSort]);
 
+  const workspaceSnapshotCache = useMemo(() => {
+    if (!selectedMy) return [] as ProductWorkspaceSnapshotCache[];
+    return workspaces[selectedMy]?.selectedSampleSnapshots ?? [];
+  }, [selectedMy, workspaces]);
+
   const selectedSampleRows = useMemo(() => {
-    const selectedItems = tracked.filter((item) => selectedUrls.includes(item.url));
-    const peerSnapshots = selectedItems.map((item) => getLatestSnapshot(item)).filter(Boolean);
-    return selectedItems.map((item) => {
+    const trackedByUrl = new Map(tracked.map((item) => [item.url, item]));
+    // P1.3：tracked store 没来得及加载 / 被清空时，fallback 到 workspace 冗余的 snapshot
+    const merged: TrackedProduct[] = selectedUrls.map((url) => {
+      const hit = trackedByUrl.get(url);
+      if (hit && hit.snapshots && hit.snapshots.length > 0) return hit;
+      const cached = workspaceSnapshotCache.find((item) => item.url === url);
+      if (cached && cached.snapshot) {
+        return {
+          url,
+          title: cached.title,
+          sourceKeyword: cached.sourceKeyword,
+          goodsId: cached.goodsId,
+          addedAt: cached.addedAt || cached.updatedAt,
+          snapshots: [cached.snapshot],
+        };
+      }
+      return null as unknown as TrackedProduct;
+    }).filter(Boolean) as TrackedProduct[];
+
+    const peerSnapshots = merged.map((item) => getLatestSnapshot(item)).filter(Boolean);
+    return merged.map((item) => {
       const latest = getLatestSnapshot(item);
       return {
         ...item,
@@ -2191,7 +2444,7 @@ export default function CompetitorProductWorkbench({
       if (priorityDiff !== 0) return priorityDiff;
       return toSafeNumber(right.latest?.monthlySales) - toSafeNumber(left.latest?.monthlySales);
     });
-  }, [selectedProduct, selectedUrls, tracked]);
+  }, [selectedProduct, selectedUrls, tracked, workspaceSnapshotCache]);
 
   const selectedSnapshots = useMemo(() => selectedSampleRows.map((item) => item.latest).filter(Boolean), [selectedSampleRows]);
 
@@ -2316,6 +2569,15 @@ export default function CompetitorProductWorkbench({
       { title: "素材对比", value: materialText },
     ];
   }, [analysis, marketInsight, selectedProduct, selectedYunqiDisplay]);
+  // 汇聚所有可见的英文标题并批量翻译
+  useEffect(() => {
+    if (!titleTranslateHydratedRef.current) return;
+    const pool: string[] = [];
+    resultSnapshots.forEach((s: any) => pool.push(s?.title, s?.titleEn, s?.originalTitle));
+    (analysis?.comparisonRows || []).forEach((row) => pool.push(row.competitorTitle));
+    if (selectedProduct) pool.push(selectedProduct.title, (selectedProduct as any).titleEn);
+    requestTitleTranslations(pool);
+  }, [resultSnapshots, analysis?.comparisonRows, selectedProduct, requestTitleTranslations]);
   const reviewTrustSections = useMemo(() => {
     if (!marketInsight) return [];
 
@@ -2415,7 +2677,20 @@ export default function CompetitorProductWorkbench({
     }
     const nextMessage = stripWorkerErrorCode(getErrorMessage(error)) || fallbackMessage;
     message.error(nextMessage);
+    // 网络 / 接口层非鉴权失败：落入"看本地缓存"降级提示
+    if (!isUnsupportedCompetitorTrackError(error)) {
+      setDegradedReason(nextMessage);
+    }
   }, [onYunqiAuthInvalid]);
+
+  const handleRetryToast = useCallback((label: string) => (error: unknown, attempt: number) => {
+    const reason = stripWorkerErrorCode(getErrorMessage(error)) || "网络不稳定";
+    message.warning(`${label} 正在重试 (${attempt})：${reason}`);
+  }, []);
+
+  const scrollToSamples = useCallback(() => {
+    sampleCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
 
   const handleSearch = async () => {
     if (!selectedMy || !selectedProduct) return message.warning("请先选择你的商品");
@@ -2424,14 +2699,15 @@ export default function CompetitorProductWorkbench({
     setLoading(true);
     onYunqiRequestStart?.();
     try {
-      const response = await competitor.search({
+      const response = await withRetry(() => competitor.search({
         keyword: keyword.trim(),
         maxResults: 50,
         wareHouseType,
         sortField: DEFAULT_SORT_FIELD,
         sortOrder: DEFAULT_SORT_ORDER,
-      } as any);
+      } as any), { onRetry: handleRetryToast("搜索"), label: "search" });
       onYunqiRequestSuccess?.();
+      setDegradedReason("");
       setResults(response);
       setSelectedResultKeys([]);
       setSearchTableSort({ columnKey: "", order: null });
@@ -2457,8 +2733,9 @@ export default function CompetitorProductWorkbench({
     onYunqiRequestStart?.();
     try {
       const existingTracked = await readArrayStoreValue("temu_competitor_tracked");
-      const batch = await competitor.batchTrack({ urls });
+      const batch = await withRetry(() => competitor.batchTrack({ urls }), { onRetry: handleRetryToast("加入对比"), label: "batchTrack" });
       onYunqiRequestSuccess?.();
+      setDegradedReason("");
       const lookup = new Map(validItems.map((item) => [item.productUrl, item]));
       const additions: TrackedProduct[] = urls.map((url) => {
         const matched = batch.results.find((result: any) => result.url === url);
@@ -2487,6 +2764,70 @@ export default function CompetitorProductWorkbench({
     }
   };
 
+  // 云启参考信息「无匹配」自救 · 用标题搜一次，列出候选
+  const handleYunqiRescueSearch = async () => {
+    if (!selectedProduct) return message.warning("请先选择你的商品");
+    if (!competitor) return message.error("当前竞品分析功能暂时不可用，请稍后再试");
+    const title = String(selectedProduct.title || "").trim();
+    if (!title) return message.warning("当前商品没有标题，无法自动搜索");
+    setYunqiRescueLoading(true);
+    onYunqiRequestStart?.();
+    try {
+      const resp = await withRetry(
+        () => competitor.search({
+          keyword: title.slice(0, 60),
+          maxResults: 5,
+          wareHouseType,
+          sortField: DEFAULT_SORT_FIELD,
+          sortOrder: DEFAULT_SORT_ORDER,
+        } as any),
+        { onRetry: handleRetryToast("候选搜索"), label: "yunqi-rescue-search" },
+      );
+      onYunqiRequestSuccess?.();
+      setDegradedReason("");
+      const list = Array.isArray(resp?.products) ? resp.products.slice(0, 5) : [];
+      setYunqiRescueCandidates(list);
+      if (list.length === 0) message.warning("云启按标题没有搜到候选，可以手动贴链接。");
+    } catch (error) {
+      handleRequestError(error, "候选搜索失败");
+    } finally {
+      onYunqiRequestFinish?.();
+      setYunqiRescueLoading(false);
+    }
+  };
+
+  // 应用某个候选 / 手动链接：track 一次，结果写回 yunqiProductDetails，让详情卡片直接亮
+  const applyYunqiRescueCandidate = async (url: string) => {
+    if (!url || !/temu\.com/i.test(url)) return message.warning("请输入有效的 Temu 商品链接");
+    if (!competitor) return message.error("当前竞品分析功能暂时不可用，请稍后再试");
+    if (!selectedGoodsId) return message.warning("当前商品缺少 goodsId，无法绑定云启详情");
+    setYunqiRescueLoading(true);
+    onYunqiRequestStart?.();
+    try {
+      const detail: any = await withRetry(
+        () => competitor.track({ url }),
+        { onRetry: handleRetryToast("绑定云启"), label: "yunqi-rescue-track" },
+      );
+      onYunqiRequestSuccess?.();
+      setDegradedReason("");
+      if (!detail || detail?.matchStatus === "not_matched") {
+        message.warning("这个候选暂时也拿不到匹配详情，换一个再试。");
+        return;
+      }
+      // 覆盖 goodsId 保证 isSelectedYunqiExactMatch 命中
+      const patched = { ...detail, goodsId: selectedGoodsId };
+      setYunqiProductDetails((current) => ({ ...current, [selectedGoodsId]: patched }));
+      setYunqiRescueCandidates([]);
+      setYunqiRescueUrl("");
+      message.success("已把云启详情绑定到当前商品");
+    } catch (error) {
+      handleRequestError(error, "绑定云启详情失败");
+    } finally {
+      onYunqiRequestFinish?.();
+      setYunqiRescueLoading(false);
+    }
+  };
+
   const handleManualAdd = async () => {
     if (!selectedMy || !selectedProduct) return message.warning("请先选择你的商品");
     const url = manualUrl.trim();
@@ -2500,8 +2841,9 @@ export default function CompetitorProductWorkbench({
       const existingItem = (existingTracked as TrackedProduct[]).find((item) => item.url === url);
       if (!existingItem) {
         onYunqiRequestStart?.();
-        const snapshot = await competitor.track({ url });
+        const snapshot = await withRetry(() => competitor.track({ url }), { onRetry: handleRetryToast("手动加入"), label: "track" });
         onYunqiRequestSuccess?.();
+        setDegradedReason("");
         const merged = mergeTrackedProducts(existingTracked as TrackedProduct[], [{
           url,
           title: snapshot.title,
@@ -2530,8 +2872,9 @@ export default function CompetitorProductWorkbench({
     setRefreshingSamples(true);
     onYunqiRequestStart?.();
     try {
-      const response = await competitor.batchTrack({ urls: selectedUrls });
+      const response = await withRetry(() => competitor.batchTrack({ urls: selectedUrls }), { onRetry: handleRetryToast("刷新样本"), label: "refreshSamples" });
       onYunqiRequestSuccess?.();
+      setDegradedReason("");
       const existingTracked = await readArrayStoreValue("temu_competitor_tracked");
       const updated = (existingTracked as TrackedProduct[]).map((item) => {
         if (!selectedUrls.includes(item.url)) return item;
@@ -2599,7 +2942,7 @@ export default function CompetitorProductWorkbench({
               ellipsis={{ rows: 2, tooltip: record.title }}
               style={{ maxWidth: 250, marginBottom: 0, lineHeight: 1.35 }}
             >
-              {record.title}
+              {displayTitle(record.title, record.titleZh)}
             </Paragraph>
             <Space wrap size={[4, 4]}>
               {selectedUrls.includes(record.productUrl) ? <Tag color="green">已加入当前商品</Tag> : null}
@@ -2687,7 +3030,7 @@ export default function CompetitorProductWorkbench({
             preview={false}
           />
           <Space direction="vertical" size={2}>
-            <Tooltip title={record.title || record.url}><Text ellipsis style={{ maxWidth: 220 }}>{record.title || record.url}</Text></Tooltip>
+            <Tooltip title={record.title || record.url}><Text ellipsis style={{ maxWidth: 220 }}>{displayTitle(record.title, record.titleZh) || record.url}</Text></Tooltip>
             <Space wrap size={[4, 4]}>
               {record.sourceKeyword ? <Tag color="blue">{record.sourceKeyword}</Tag> : null}
               {record.signal?.priority ? <Tag color={record.signal.priority === "P0" ? "red" : record.signal.priority === "P1" ? "orange" : "default"}>{record.signal.priority}</Tag> : null}
@@ -2736,7 +3079,7 @@ export default function CompetitorProductWorkbench({
       ellipsis: true,
       render: (value: string, record: ComparisonRow) => (
         <Space direction="vertical" size={0}>
-          <Tooltip title={value}><Text ellipsis style={{ maxWidth: 200 }}>{value}</Text></Tooltip>
+          <Tooltip title={value}><Text ellipsis style={{ maxWidth: 200 }}>{displayTitle(value)}</Text></Tooltip>
           <Text type="secondary" style={{ fontSize: 13 }}>{record.goodsId || record.competitorUrl || "-"}</Text>
         </Space>
       ),
@@ -2748,6 +3091,7 @@ export default function CompetitorProductWorkbench({
     { title: "优先动作", dataIndex: "responseAction", key: "responseAction", ellipsis: true, render: (value: string) => <Tooltip title={value}><Text ellipsis style={{ maxWidth: 220 }}>{value}</Text></Tooltip> },
     { title: "优先级", dataIndex: "priority", key: "priority", width: 90, render: (value: string) => <Tag color={value === "P0" ? "red" : value === "P1" ? "orange" : "default"}>{value}</Tag> },
   ];
+  void comparisonColumns; // 保留给未来比较面板使用
 
   const hasSearchContext = searchRows.length > 0 || selectedSampleRows.length > 0 || Boolean(analysis);
   const hasSampleContext = selectedSampleRows.length > 0 || Boolean(analysis);
@@ -2957,6 +3301,115 @@ export default function CompetitorProductWorkbench({
       </Space>
     </Card>
   );
+  // 云启「无匹配」自救面板：说明原因 + 两条自救路径
+  const renderYunqiRescuePanel = () => {
+    if (yunqiProductDetailLoading) return null;
+    if (isSelectedYunqiExactMatch) return null;
+    const hasGoodsId = Boolean(selectedGoodsId);
+    const returnedMatch = selectedYunqiMatchStatus || "unknown";
+    const reasonText = !hasGoodsId
+      ? "当前商品还没有 Temu goodsId（可能是只拿到了 SKC / 货号），云启没法直接匹配到数据。"
+      : selectedYunqiMatchStatus === "not_matched"
+        ? "云启已经回应但 matchStatus = not_matched，数据库里暂时没有这件商品的精确记录。"
+        : selectedYunqiDetail
+          ? `云启返回的 goodsId（${selectedYunqiGoodsId || "空"}）和本地 goodsId（${selectedGoodsId}）对不上。`
+          : "云启当前还没有返回这件商品的精确详情。";
+    return (
+      <div
+        style={{
+          borderRadius: 12,
+          border: "1px dashed rgba(229,91,0,0.4)",
+          background: "rgba(255,247,240,0.5)",
+          padding: 14,
+        }}
+      >
+        <Space direction="vertical" size={10} style={{ width: "100%" }}>
+          <div>
+            <Text strong>无法自动匹配云启详情</Text>
+            <div style={{ marginTop: 4, color: "#8c8c8c", fontSize: 13, lineHeight: 1.7 }}>
+              {reasonText}下面两条路径任选一条，把云启详情手动绑到当前商品上：
+            </div>
+          </div>
+
+          <div>
+            <Space size={8} wrap>
+              <Button
+                size="small"
+                type="primary"
+                loading={yunqiRescueLoading}
+                onClick={handleYunqiRescueSearch}
+                style={{ background: TEMU_ORANGE, borderColor: TEMU_ORANGE }}
+              >
+                用标题搜一次候选
+              </Button>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                按"{String(selectedProduct?.title || "").slice(0, 28)}..." 搜最多 5 个候选
+              </Text>
+            </Space>
+
+            {yunqiRescueCandidates.length > 0 ? (
+              <div style={{ marginTop: 10 }}>
+                <List
+                  size="small"
+                  dataSource={yunqiRescueCandidates}
+                  renderItem={(item: any) => (
+                    <List.Item
+                      actions={[
+                        <Button
+                          key="apply"
+                          size="small"
+                          loading={yunqiRescueLoading}
+                          onClick={() => void applyYunqiRescueCandidate(item.productUrl)}
+                        >
+                          选这个
+                        </Button>,
+                      ]}
+                    >
+                      <Space size={8} style={{ width: "100%" }}>
+                        {item.thumbUrl ? <Image src={item.thumbUrl} width={36} height={36} preview={false} style={{ borderRadius: 6 }} /> : null}
+                        <div style={{ minWidth: 0 }}>
+                          <Text ellipsis style={{ maxWidth: 360 }}>{item.title}</Text>
+                          <div style={{ fontSize: 12, color: "#8c8c8c" }}>
+                            ${toSafeNumber(item.price).toFixed(2)} · 月销 {toSafeNumber(item.monthlySales).toLocaleString() || "-"} · 评分 {toSafeNumber(item.score) || "-"}
+                          </div>
+                        </div>
+                      </Space>
+                    </List.Item>
+                  )}
+                />
+              </div>
+            ) : null}
+          </div>
+
+          <div>
+            <Space.Compact style={{ width: "100%", maxWidth: 520 }}>
+              <Input
+                prefix={<LinkOutlined />}
+                placeholder="或者直接粘贴 Temu 商品链接"
+                value={yunqiRescueUrl}
+                onChange={(event) => setYunqiRescueUrl(event.target.value)}
+                onPressEnter={() => void applyYunqiRescueCandidate(yunqiRescueUrl.trim())}
+                allowClear
+              />
+              <Button
+                type="primary"
+                loading={yunqiRescueLoading}
+                onClick={() => void applyYunqiRescueCandidate(yunqiRescueUrl.trim())}
+                style={{ background: TEMU_ORANGE, borderColor: TEMU_ORANGE }}
+              >
+                绑定
+              </Button>
+            </Space.Compact>
+          </div>
+
+          <div style={{ fontSize: 11, color: "#bfbfbf" }}>
+            调试：本地 goodsId={selectedGoodsId || "空"} · 返回 matchStatus={returnedMatch}
+          </div>
+        </Space>
+      </div>
+    );
+  };
+
   const renderStepOne = () => (
     <Card style={CARD_STYLE}>
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>
@@ -3157,8 +3610,8 @@ export default function CompetitorProductWorkbench({
                       </Row>
                     ) : null}
                   </Space>
-                ) : (!yunqiProductDetailLoading && !yunqiProductDetailError) ? (
-                  <Text type="secondary">当前这件商品还没有匹配到可直接使用的云启补充信息。</Text>
+                ) : !yunqiProductDetailLoading ? (
+                  renderYunqiRescuePanel()
                 ) : null}
               </Space>
             </Card>
@@ -3346,6 +3799,7 @@ export default function CompetitorProductWorkbench({
       </Space>
     </Card>
   );
+  void renderStepOne; // 旧版单卡布局，已被 renderStepOneDashboard 取代，保留备用
 
   const renderStepOneDashboard = () => (
     <Card style={CARD_STYLE}>
@@ -3622,8 +4076,8 @@ export default function CompetitorProductWorkbench({
                       </Row>
                     ) : null}
                   </Space>
-                ) : (!yunqiProductDetailLoading && !yunqiProductDetailError) ? (
-                  <Text type="secondary">当前这件商品还没有匹配到可直接使用的云启补充信息。</Text>
+                ) : !yunqiProductDetailLoading ? (
+                  renderYunqiRescuePanel()
                 ) : null}
               </Space>
             </Card>
@@ -3977,6 +4431,7 @@ export default function CompetitorProductWorkbench({
   );
 
   const renderSampleCard = () => (
+    <div ref={sampleCardRef}>
     <Card
       title={`当前商品的对比样本 (${selectedSampleRows.length})`}
       size="small"
@@ -4003,10 +4458,83 @@ export default function CompetitorProductWorkbench({
         <Table dataSource={selectedSampleRows} columns={sampleColumns} rowKey="url" size="small" pagination={false} scroll={{ x: 960 }} />
       )}
     </Card>
+    </div>
   );
+
+  const renderSelectedPreviewBar = () => {
+    if (selectedSampleRows.length === 0) return null;
+    return (
+      <div
+        style={{
+          position: "sticky",
+          top: 0,
+          zIndex: 9,
+          background: "linear-gradient(180deg, rgba(255,247,240,0.98) 0%, rgba(255,255,255,0.98) 100%)",
+          borderRadius: 12,
+          border: "1px solid rgba(229,91,0,0.18)",
+          padding: "10px 14px",
+          boxShadow: "0 2px 8px rgba(229,91,0,0.08)",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 8 }}>
+          <Text strong style={{ color: TEMU_ORANGE }}>
+            已选样本 {selectedSampleRows.length} 个 · 关键 5 列快览
+          </Text>
+          <Button
+            size="small"
+            type="primary"
+            onClick={() => setActiveStep(3)}
+            style={{ background: TEMU_ORANGE, borderColor: TEMU_ORANGE }}
+          >
+            去看动作建议
+          </Button>
+        </div>
+        <div style={{ maxHeight: 180, overflowY: "auto" }}>
+          <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ color: "#8c8c8c", textAlign: "left" }}>
+                <th style={{ padding: "4px 8px", width: "34%" }}>标题</th>
+                <th style={{ padding: "4px 8px", width: "14%" }}>价格</th>
+                <th style={{ padding: "4px 8px", width: "14%" }}>月销</th>
+                <th style={{ padding: "4px 8px", width: "14%" }}>评分</th>
+                <th style={{ padding: "4px 8px", width: "24%" }}>视频 / 标签</th>
+              </tr>
+            </thead>
+            <tbody>
+              {selectedSampleRows.map((row: any) => {
+                const latest = row.latest || {};
+                const priorityTagColor = row.signal?.priority === "P0" ? "red" : row.signal?.priority === "P1" ? "orange" : "default";
+                const tagList: string[] = Array.isArray(row.signal?.tags) ? row.signal.tags.slice(0, 2) : [];
+                return (
+                  <tr key={row.url} style={{ borderTop: "1px solid #f4f4f4" }}>
+                    <td style={{ padding: "6px 8px" }}>
+                      <Space size={6} wrap>
+                        {row.signal?.priority ? <Tag color={priorityTagColor} style={{ marginInlineEnd: 0 }}>{row.signal.priority}</Tag> : null}
+                        <Text ellipsis style={{ maxWidth: 280 }}>{latest.title || row.title || row.url}</Text>
+                      </Space>
+                    </td>
+                    <td style={{ padding: "6px 8px" }}>{latest.price ? `$${toSafeNumber(latest.price).toFixed(2)}` : "-"}</td>
+                    <td style={{ padding: "6px 8px" }}>{toSafeNumber(latest.monthlySales).toLocaleString() || "-"}</td>
+                    <td style={{ padding: "6px 8px" }}>{toSafeNumber(latest.score) || "-"} / {getSearchResultReviewCount(latest) || "-"}</td>
+                    <td style={{ padding: "6px 8px" }}>
+                      <Space size={4} wrap>
+                        {latest.hasVideo ? <Tag color="blue" style={{ marginInlineEnd: 0 }}>视频</Tag> : null}
+                        {tagList.map((tag) => <Tag key={tag} style={{ marginInlineEnd: 0 }}>{tag}</Tag>)}
+                      </Space>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  };
 
   const renderStepTwo = () => (
     <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+      {renderSelectedPreviewBar()}
       <Card style={CARD_STYLE}>
         <Space direction="vertical" size="middle" style={{ width: "100%" }}>
           <div>
@@ -4025,7 +4553,49 @@ export default function CompetitorProductWorkbench({
 
       {searchRows.length > 0 ? renderSearchResultCard() : (
         <Card style={CARD_STYLE}>
-          <Empty description="先完成关键词搜索，再来挑样本。" />
+          {results && (results.totalFound === 0 || (Array.isArray(results.products) && results.products.length === 0)) ? (
+            (() => {
+              const suggestions = buildKeywordSuggestions(
+                keyword,
+                selectedProduct?.title,
+                (selectedProduct as any)?.category || (selectedProduct as any)?.categoryName,
+              );
+              return (
+                <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+                  <Empty description={`关键词"${results.keyword || keyword}"暂无可比样本。换个词再试试：`} />
+                  {suggestions.length > 0 ? (
+                    <div style={{ textAlign: "center" }}>
+                      <Space size={[8, 8]} wrap style={{ justifyContent: "center" }}>
+                        {suggestions.map((word) => (
+                          <Tag
+                            key={word}
+                            color="orange"
+                            style={{ cursor: "pointer", padding: "4px 10px", fontSize: 13 }}
+                            onClick={() => {
+                              setKeyword(word);
+                              // 自动再搜一次
+                              setTimeout(() => void handleSearch(), 0);
+                            }}
+                          >
+                            {word}
+                          </Tag>
+                        ))}
+                      </Space>
+                      <div style={{ marginTop: 8, color: "#8c8c8c", fontSize: 12 }}>
+                        点击标签可以直接替换关键词并重新搜索。
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ textAlign: "center", color: "#8c8c8c" }}>
+                      可以试着去掉修饰词，或用英文核心名词再搜一次。
+                    </div>
+                  )}
+                </Space>
+              );
+            })()
+          ) : (
+            <Empty description="先完成关键词搜索，再来挑样本。" />
+          )}
         </Card>
       )}
 
@@ -4074,6 +4644,7 @@ export default function CompetitorProductWorkbench({
       background: "#fff",
       border: "1px solid rgba(229,91,0,0.12)",
     };
+    void outlinePanelStyle; // 保留备用样式
     const sectionTitleStyle: React.CSSProperties = { fontSize: 13, color: "#8c8c8c" };
     const comparisonRows = analysis?.comparisonRows || [];
     const marketPanels = marketInsight ? [
@@ -4084,14 +4655,14 @@ export default function CompetitorProductWorkbench({
       { label: "履约判断", value: marketInsight.warehouseInsight },
       { label: "下一步", value: marketInsight.nextAction },
     ] : [];
-    const actionSections = analysis ? [
-      { title: "为什么别人卖得更快", items: analysis.whyCompetitorsWin },
-      { title: "今天先改", items: analysis.immediateActions },
-      { title: "本周验证", items: analysis.weeklyActions },
-      { title: "下批开发", items: analysis.sourcingActions },
+    const actionSections: Array<{ title: string; items: string[]; key: "why" | "today" | "week" | "sourcing" }> = analysis ? [
+      { title: "为什么别人卖得更快", items: analysis.whyCompetitorsWin, key: "why" },
+      { title: "今天先改", items: analysis.immediateActions, key: "today" },
+      { title: "本周验证", items: analysis.weeklyActions, key: "week" },
+      { title: "下批开发", items: analysis.sourcingActions, key: "sourcing" },
     ] : [];
-    const whyWinSection = actionSections.find((section) => section.title === "为什么别人卖得更快");
-    const executionSections = actionSections.filter((section) => section.title !== "为什么别人卖得更快");
+    const whyWinSection = actionSections.find((section) => section.key === "why");
+    const executionSections = actionSections.filter((section) => section.key !== "why");
     const trafficDiagnosisSummary = (() => {
       if (!activeTrafficSite) return "当前还没有可用的流量体检数据，先补齐商品流量采集。";
       if (activeTrafficSite.summary) {
@@ -4117,10 +4688,10 @@ export default function CompetitorProductWorkbench({
       { title: "标题诊断", value: `${titleDiagnosis.status}：${titleDiagnosis.summary}` },
       { title: "主图诊断", value: `${imageDiagnosis.status}：${imageDiagnosis.summary}` },
     ];
-    const monitorSections = analysis ? [
-      { title: "每天盯什么", items: analysis.dailyChecklist },
-      { title: "每周复盘什么", items: analysis.weeklyChecklist },
-      { title: "每月调整什么", items: analysis.monthlyChecklist },
+    const monitorSections: Array<{ title: string; items: string[]; key: "daily" | "weekly" | "monthly" }> = analysis ? [
+      { title: "每天盯什么", items: analysis.dailyChecklist, key: "daily" },
+      { title: "每周复盘什么", items: analysis.weeklyChecklist, key: "weekly" },
+      { title: "每月调整什么", items: analysis.monthlyChecklist, key: "monthly" },
     ] : [];
     const overviewStats = [
       { label: "机会分", value: marketInsight ? `${marketInsight.opportunityScore}/100` : "-" },
@@ -4129,6 +4700,507 @@ export default function CompetitorProductWorkbench({
       { label: "下一批扩款", value: analysis?.summary.nextProductDirection || "-" },
     ];
     const diagnosticSections = [...productCheckSections, ...productDataCompareSections];
+
+    // Phase2·定位力升级：机会分拆解 / 价格带热力图 / 定位散点
+    const opportunityBreakdown = marketInsight?.opportunityBreakdown ?? [];
+    const priceBandMatrix = marketInsight?.priceBandMatrix ?? [];
+    const maxBandSalesShare = Math.max(0.001, ...priceBandMatrix.map((b) => b.salesShare));
+    const scatterSourceSnapshots = selectedSnapshots.length > 0 ? selectedSnapshots : resultSnapshots;
+    const scatterPoints = scatterSourceSnapshots
+      .map((snapshot: any) => {
+        const price = toSafeNumber(snapshot?.price);
+        const sales = toSafeNumber(snapshot?.monthlySales);
+        if (price <= 0) return null;
+        return {
+          price,
+          sales,
+          title: String(snapshot?.title || "").slice(0, 60),
+          hasVideo: Boolean(snapshot?.videoUrl || snapshot?.hasVideo),
+        };
+      })
+      .filter(Boolean) as Array<{ price: number; sales: number; title: string; hasVideo: boolean }>;
+    const myScatterPoint = selectedProduct
+      ? {
+          price: toSafeNumber(selectedProduct.price),
+          sales: toSafeNumber(selectedProduct.monthlySales),
+          title: selectedProduct.title || "我的商品",
+        }
+      : null;
+    const recommendedBandCell = priceBandMatrix.find((b) => b.isRecommended);
+    // 机会分拆解：负向项汇总、正向项汇总、基线 100
+    const negativeSum = opportunityBreakdown.filter((f) => f.direction === "negative").reduce((sum, f) => sum + f.contribution, 0);
+    const positiveSum = opportunityBreakdown.filter((f) => f.direction === "positive").reduce((sum, f) => sum + f.contribution, 0);
+    const OPP_FACTOR_COLORS: Record<string, string> = {
+      crowd: "#eb2f96",
+      concentration: "#cf1322",
+      score: "#fa8c16",
+      video: "#d48806",
+      review: "#faad14",
+      priceBand: "#52c41a",
+    };
+
+    const renderOpportunityBreakdown = () => {
+      if (!marketInsight || opportunityBreakdown.length === 0) return null;
+      return (
+        <Card title="机会分拆解 · 为什么是这个分数" size="small" style={CARD_STYLE}>
+          <Row gutter={[16, 16]}>
+            <Col xs={24} md={8}>
+              <div style={{ ...accentPanelStyle, textAlign: "center" }}>
+                <Text type="secondary" style={sectionTitleStyle}>机会分</Text>
+                <div style={{ fontSize: 44, fontWeight: 700, color: TEMU_ORANGE, lineHeight: 1.2, marginTop: 6 }}>
+                  {marketInsight.opportunityScore}
+                  <span style={{ fontSize: 16, color: "#8c8c8c", marginLeft: 4 }}>/100</span>
+                </div>
+                <div style={{ marginTop: 6, color: "#8c8c8c", fontSize: 12 }}>
+                  基线 100，扣 {Math.round(negativeSum)}，加 {Math.round(positiveSum)}
+                </div>
+                <div style={{ marginTop: 12, fontSize: 12, color: "#595959", lineHeight: 1.7, textAlign: "left" }}>
+                  {marketInsight.marketVerdict}，切入建议：{marketInsight.entryFocus}。
+                </div>
+              </div>
+            </Col>
+            <Col xs={24} md={16}>
+              <Space direction="vertical" size={10} style={{ width: "100%" }}>
+                {opportunityBreakdown.map((factor) => {
+                  const denom = factor.direction === "negative" ? 38 : 18; // 最大扣分 38（拥挤度），最大加分 ~18
+                  const widthPct = Math.min(100, (factor.contribution / denom) * 100);
+                  const color = OPP_FACTOR_COLORS[factor.key] || "#1677ff";
+                  return (
+                    <div key={factor.key}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, fontSize: 12, marginBottom: 4 }}>
+                        <Space size={6}>
+                          <Tag color={factor.direction === "positive" ? "green" : "red"} style={{ marginInlineEnd: 0 }}>
+                            {factor.direction === "positive" ? "+" : "-"}{Math.round(factor.contribution)}
+                          </Tag>
+                          <Text strong>{factor.label}</Text>
+                          <Text type="secondary">{factor.rawLabel}</Text>
+                        </Space>
+                      </div>
+                      <div style={{ background: "#f5f5f5", borderRadius: 4, height: 8, overflow: "hidden" }}>
+                        <div style={{ width: `${widthPct}%`, height: "100%", background: color, opacity: factor.contribution > 0 ? 1 : 0.25 }} />
+                      </div>
+                      <div style={{ marginTop: 4, fontSize: 12, color: "#8c8c8c", lineHeight: 1.6 }}>
+                        {factor.note}
+                      </div>
+                    </div>
+                  );
+                })}
+              </Space>
+            </Col>
+          </Row>
+        </Card>
+      );
+    };
+
+    const renderPriceBandHeatmap = () => {
+      if (!marketInsight || priceBandMatrix.length === 0) return null;
+      return (
+        <Card title="价格带热力图 · 哪里有供需缺口" size="small" style={CARD_STYLE}>
+          <Row gutter={[12, 12]}>
+            {priceBandMatrix.map((band) => {
+              const heat = maxBandSalesShare > 0 ? band.salesShare / maxBandSalesShare : 0;
+              // 热力：销量占比越高颜色越橙；商品占比越高边框越重
+              const bg = band.isRecommended
+                ? `rgba(82,196,26,${0.12 + heat * 0.35})`
+                : `rgba(229,91,0,${0.06 + heat * 0.4})`;
+              const borderColor = band.isRecommended ? "#52c41a" : "rgba(229,91,0,0.4)";
+              // 商品占比与销量占比的差：正数 = 供给过剩，负数 = 蓝海
+              const gap = band.countShare - band.salesShare;
+              const gapText = gap > 0.08
+                ? "供给过剩：商品多但销量没跟上"
+                : gap < -0.08
+                  ? "需求缺口：销量大但商品数少"
+                  : "供需基本匹配";
+              return (
+                <Col xs={24} md={8} key={band.key}>
+                  <div style={{ border: `1px solid ${borderColor}`, borderRadius: 12, padding: 14, background: bg, height: "100%" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                      <Text strong>{band.key === "low" ? "低价带" : band.key === "mid" ? "中价带" : "高价带"}</Text>
+                      {band.isRecommended ? <Tag color="green" style={{ marginInlineEnd: 0 }}>推荐切入</Tag> : null}
+                    </div>
+                    <div style={{ fontSize: 16, fontWeight: 600, marginTop: 6 }}>{band.label}</div>
+                    <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
+                      <div>
+                        <Text type="secondary" style={{ fontSize: 12 }}>商品占比</Text>
+                        <div style={{ fontSize: 18, fontWeight: 600 }}>{Math.round(band.countShare * 100)}%</div>
+                        <Text type="secondary" style={{ fontSize: 11 }}>{band.count} 个样本</Text>
+                      </div>
+                      <div>
+                        <Text type="secondary" style={{ fontSize: 12 }}>销量占比</Text>
+                        <div style={{ fontSize: 18, fontWeight: 600, color: TEMU_ORANGE }}>{Math.round(band.salesShare * 100)}%</div>
+                        <Text type="secondary" style={{ fontSize: 11 }}>累计 {Math.round(band.sales).toLocaleString()}</Text>
+                      </div>
+                    </div>
+                    <div style={{ marginTop: 10, fontSize: 12, color: "#595959", lineHeight: 1.6 }}>
+                      {gapText}。
+                    </div>
+                  </div>
+                </Col>
+              );
+            })}
+          </Row>
+          {recommendedBandCell ? (
+            <div style={{ marginTop: 12, fontSize: 12, color: "#8c8c8c" }}>
+              推荐 <Text strong style={{ color: "#52c41a" }}>{recommendedBandCell.label}</Text>：销量占比 {Math.round(recommendedBandCell.salesShare * 100)}%，商品占比 {Math.round(recommendedBandCell.countShare * 100)}%，供需缝隙 {Math.round((recommendedBandCell.salesShare - recommendedBandCell.countShare) * 100)}pt。
+            </div>
+          ) : null}
+        </Card>
+      );
+    };
+
+    // ================= Phase 3 · 差距力升级 =================
+    // 统一的工具：中位数 & 安全百分比差
+    const medianOf = (nums: number[]) => {
+      const valid = nums.filter((n) => Number.isFinite(n) && n > 0).sort((a, b) => a - b);
+      if (valid.length === 0) return 0;
+      const mid = Math.floor(valid.length / 2);
+      return valid.length % 2 === 0 ? (valid[mid - 1] + valid[mid]) / 2 : valid[mid];
+    };
+    // 样本 snapshot 源：优先已选样本，降级到搜索样本
+    const peerSnapshots = selectedSnapshots.length > 0 ? selectedSnapshots : resultSnapshots;
+    const myStat = selectedYunqiDisplay || selectedProduct;
+    const myPrice = toSafeNumber(myStat?.price);
+    const myMonthly = toSafeNumber(myStat?.monthlySales);
+    const myScore = toSafeNumber(myStat?.score);
+    const myReview = toSafeNumber(myStat?.reviewCount);
+    const myHasVideo = Boolean(myStat?.hasVideo);
+    const myTitle = String(myStat?.title || selectedProduct?.title || "").toLowerCase();
+
+    // P3.3：样本标题高频词
+    const TITLE_STOP = new Set([
+      "for", "with", "and", "the", "a", "an", "of", "to", "in", "on", "by", "at", "or", "new",
+      "pcs", "pack", "set", "pieces", "piece", "size", "color", "style", "hot", "top",
+      "2024", "2025", "2026", "free", "shipping", "us", "usa",
+    ]);
+    const tokenize = (text: string) => String(text || "").toLowerCase().split(/[^a-z0-9\u4e00-\u9fff]+/).filter((w) => w.length >= 3 && !TITLE_STOP.has(w));
+    const keywordCoverage = (() => {
+      if (peerSnapshots.length === 0) return [] as Array<{ word: string; freq: number; coverRate: number; myHas: boolean }>;
+      const freqMap = new Map<string, number>();
+      const docCount = peerSnapshots.length;
+      peerSnapshots.forEach((snap: any) => {
+        const words = new Set(tokenize(snap?.title));
+        words.forEach((w) => freqMap.set(w, (freqMap.get(w) || 0) + 1));
+      });
+      const myWords = new Set(tokenize(myTitle));
+      return [...freqMap.entries()]
+        .map(([word, freq]) => ({ word, freq, coverRate: freq / docCount, myHas: myWords.has(word) }))
+        .filter((item) => item.coverRate >= 0.3) // 至少 30% 样本覆盖
+        .sort((a, b) => b.coverRate - a.coverRate)
+        .slice(0, 12);
+    })();
+    const missingKeywords = keywordCoverage.filter((item) => !item.myHas);
+
+    // P3.1：对位矩阵 — 每个已选样本一行
+    const comparisonMatrix = selectedSampleRows.slice(0, 10).map((row: any) => {
+      const peer = row.latest || {};
+      const peerPrice = toSafeNumber(peer.price);
+      const peerMonthly = toSafeNumber(peer.monthlySales);
+      const peerScore = toSafeNumber(peer.score);
+      const peerReview = toSafeNumber(peer.reviewCount) || parseReviewCountText(peer.commentNumTips);
+      const peerHasVideo = Boolean(peer.videoUrl || peer.hasVideo);
+      const peerWords = new Set(tokenize(peer.title));
+      const myWords = new Set(tokenize(myTitle));
+      const coveredByMe = [...peerWords].filter((w) => myWords.has(w)).length;
+      const coverRate = peerWords.size > 0 ? coveredByMe / peerWords.size : 0;
+      return {
+        key: row.url,
+        title: peer.title || row.title || row.url,
+        priority: row.signal?.priority || "P2",
+        trafficSource: row.signal?.trafficSource || "-",
+        priceDelta: myPrice > 0 && peerPrice > 0 ? (myPrice - peerPrice) / peerPrice : 0,
+        monthlyDelta: peerMonthly > 0 ? (myMonthly - peerMonthly) / peerMonthly : 0,
+        scoreDelta: peerScore > 0 ? myScore - peerScore : 0, // 绝对值差
+        reviewDelta: peerReview > 0 ? (myReview - peerReview) / peerReview : 0,
+        videoDelta: myHasVideo ? (peerHasVideo ? 0 : 1) : (peerHasVideo ? -1 : 0),
+        keywordCoverage: coverRate,
+        weakness: row.signal?.weakness || "",
+      };
+    });
+
+    // 差距颜色：我赢绿、我输红、基本打平灰
+    const deltaCellStyle = (delta: number, winIfPositive = true, threshold = 0.08): React.CSSProperties => {
+      if (!Number.isFinite(delta)) return {};
+      const abs = Math.abs(delta);
+      if (abs < threshold) return { color: "#8c8c8c" };
+      const isPositive = delta > 0;
+      const iWin = winIfPositive ? isPositive : !isPositive;
+      return { color: iWin ? "#389e0d" : "#cf1322", fontWeight: 600 };
+    };
+    const formatPct = (value: number, withSign = true) => {
+      const pct = Math.round(value * 100);
+      return `${withSign && pct > 0 ? "+" : ""}${pct}%`;
+    };
+
+    const renderGapMatrix = () => {
+      if (comparisonMatrix.length === 0) return null;
+      return (
+        <Card title="差距对位矩阵 · 每个样本在哪里赢我" size="small" style={CARD_STYLE}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse", minWidth: 880 }}>
+              <thead>
+                <tr style={{ color: "#8c8c8c", background: "#fafafa" }}>
+                  <th style={{ padding: "8px 10px", textAlign: "left" }}>样本</th>
+                  <th style={{ padding: "8px 10px" }}>价格差</th>
+                  <th style={{ padding: "8px 10px" }}>月销差</th>
+                  <th style={{ padding: "8px 10px" }}>评分差</th>
+                  <th style={{ padding: "8px 10px" }}>评价差</th>
+                  <th style={{ padding: "8px 10px" }}>素材</th>
+                  <th style={{ padding: "8px 10px" }}>标题词覆盖</th>
+                  <th style={{ padding: "8px 10px", textAlign: "left" }}>流量来源 / 弱点</th>
+                </tr>
+              </thead>
+              <tbody>
+                {comparisonMatrix.map((row) => (
+                  <tr key={row.key} style={{ borderTop: "1px solid #f4f4f4" }}>
+                    <td style={{ padding: "8px 10px" }}>
+                      <Space size={6} wrap>
+                        <Tag color={row.priority === "P0" ? "red" : row.priority === "P1" ? "orange" : "default"} style={{ marginInlineEnd: 0 }}>{row.priority}</Tag>
+                        <Text ellipsis style={{ maxWidth: 240 }}>{row.title}</Text>
+                      </Space>
+                    </td>
+                    <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.priceDelta, false) }}>
+                      {row.priceDelta === 0 ? "-" : formatPct(row.priceDelta)}
+                    </td>
+                    <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.monthlyDelta, true) }}>
+                      {row.monthlyDelta === 0 ? "-" : formatPct(row.monthlyDelta)}
+                    </td>
+                    <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.scoreDelta, true, 0.1) }}>
+                      {row.scoreDelta === 0 ? "-" : `${row.scoreDelta > 0 ? "+" : ""}${row.scoreDelta.toFixed(2)}`}
+                    </td>
+                    <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.reviewDelta, true) }}>
+                      {row.reviewDelta === 0 ? "-" : formatPct(row.reviewDelta)}
+                    </td>
+                    <td style={{ padding: "8px 10px", textAlign: "center" }}>
+                      {row.videoDelta === 0 ? <Tag style={{ marginInlineEnd: 0 }}>平</Tag> : row.videoDelta > 0 ? <Tag color="green" style={{ marginInlineEnd: 0 }}>我有</Tag> : <Tag color="red" style={{ marginInlineEnd: 0 }}>缺</Tag>}
+                    </td>
+                    <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.keywordCoverage - 0.7, true, 0.1) }}>
+                      {Math.round(row.keywordCoverage * 100)}%
+                    </td>
+                    <td style={{ padding: "8px 10px", color: "#595959" }}>
+                      <div><Tag color="geekblue" style={{ marginInlineEnd: 0 }}>{row.trafficSource}</Tag></div>
+                      {row.weakness ? <div style={{ marginTop: 4, fontSize: 11, color: "#8c8c8c" }}>{row.weakness}</div> : null}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ marginTop: 8, fontSize: 12, color: "#8c8c8c", lineHeight: 1.7 }}>
+            红色 = 我输、绿色 = 我赢、灰色 = 基本打平（阈值 8% 或 0.1 分）。价格低 / 月销高 / 评分高 / 评价多 / 有视频 / 标题词覆盖高 都算赢。
+          </div>
+        </Card>
+      );
+    };
+
+    // P3.2：差距雷达图（归一化到 0-100，我的 vs 竞品中位数）
+    const radarData = (() => {
+      if (peerSnapshots.length === 0) return [];
+      const peerPrices = peerSnapshots.map((s: any) => toSafeNumber(s.price)).filter((v: number) => v > 0);
+      const peerMonthly = peerSnapshots.map((s: any) => toSafeNumber(s.monthlySales));
+      const peerScores = peerSnapshots.map((s: any) => toSafeNumber(s.score));
+      const peerReviews = peerSnapshots.map((s: any) => toSafeNumber(s.reviewCount) || parseReviewCountText(s.commentNumTips));
+      const peerVideoRate = peerSnapshots.filter((s: any) => Boolean(s.videoUrl || s.hasVideo)).length / peerSnapshots.length;
+      const peerPriceMed = medianOf(peerPrices);
+      const peerMonthlyMed = medianOf(peerMonthly);
+      const peerScoreMed = medianOf(peerScores);
+      const peerReviewMed = medianOf(peerReviews);
+      // 标题词匹配：我 vs 竞品（以样本内高频词集为基准，竞品"完全覆盖" = 100）
+      const hotWords = keywordCoverage.map((k) => k.word);
+      const myWordSet = new Set(tokenize(myTitle));
+      const myHotCoverRate = hotWords.length > 0 ? hotWords.filter((w) => myWordSet.has(w)).length / hotWords.length : 0;
+      // 归一化：我的 / 峰值 * 100，其中"价格力"取倒数（价格低 = 力强）
+      const normalize = (value: number, peak: number, invert = false) => {
+        if (peak <= 0) return 0;
+        const raw = invert ? peak / Math.max(value, 0.01) : value / peak;
+        return Math.max(0, Math.min(100, Math.round(raw * 100)));
+      };
+      const peak = {
+        price: Math.max(peerPriceMed, myPrice),
+        monthly: Math.max(peerMonthlyMed, myMonthly, 1),
+        score: 5,
+        review: Math.max(peerReviewMed, myReview, 1),
+        video: 1,
+        keyword: 1,
+      };
+      return [
+        { axis: "价格力", me: normalize(myPrice || peerPriceMed, peak.price, true), peer: normalize(peerPriceMed, peak.price, true) },
+        { axis: "销量规模", me: normalize(myMonthly, peak.monthly), peer: normalize(peerMonthlyMed, peak.monthly) },
+        { axis: "评分", me: normalize(myScore, peak.score), peer: normalize(peerScoreMed, peak.score) },
+        { axis: "评价壁垒", me: normalize(myReview, peak.review), peer: normalize(peerReviewMed, peak.review) },
+        { axis: "素材", me: myHasVideo ? 100 : 20, peer: Math.round(peerVideoRate * 100) },
+        { axis: "标题匹配", me: Math.round(myHotCoverRate * 100), peer: 100 },
+      ];
+    })();
+
+    const biggestGap = (() => {
+      if (radarData.length === 0) return null;
+      const sorted = [...radarData].sort((a, b) => (a.me - a.peer) - (b.me - b.peer));
+      const worst = sorted[0];
+      if (!worst || worst.me >= worst.peer) return null;
+      return worst;
+    })();
+
+    const renderGapRadar = () => {
+      if (radarData.length === 0) return null;
+      return (
+        <Card title="差距雷达 · 我 vs 竞品中位数" size="small" style={CARD_STYLE}>
+          <Row gutter={[12, 12]}>
+            <Col xs={24} md={14}>
+              <div style={{ height: 320 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <RadarChart data={radarData} outerRadius="72%">
+                    <PolarGrid />
+                    <PolarAngleAxis dataKey="axis" tick={{ fontSize: 12 }} />
+                    <PolarRadiusAxis angle={90} domain={[0, 100]} tick={{ fontSize: 10 }} />
+                    <Radar name="竞品中位数" dataKey="peer" stroke="#ff8a1f" fill="#ff8a1f" fillOpacity={0.25} />
+                    <Radar name="我" dataKey="me" stroke="#1677ff" fill="#1677ff" fillOpacity={0.35} />
+                    <Legend />
+                    <RTooltip />
+                  </RadarChart>
+                </ResponsiveContainer>
+              </div>
+            </Col>
+            <Col xs={24} md={10}>
+              <Space direction="vertical" size={10} style={{ width: "100%" }}>
+                <div style={accentPanelStyle}>
+                  <Text type="secondary" style={sectionTitleStyle}>最大差距</Text>
+                  <div style={{ marginTop: 6, fontSize: 16, fontWeight: 600, color: TEMU_ORANGE }}>
+                    {biggestGap ? `${biggestGap.axis}（差 ${biggestGap.peer - biggestGap.me} 分）` : "当前所有维度都不落下风"}
+                  </div>
+                  <div style={{ marginTop: 6, fontSize: 12, color: "#595959", lineHeight: 1.7 }}>
+                    {biggestGap
+                      ? `先把「${biggestGap.axis}」补到竞品中位水平，再谈做加法。`
+                      : "继续放大现有优势词路和素材即可。"}
+                  </div>
+                </div>
+                {radarData.map((row) => {
+                  const gap = row.me - row.peer;
+                  const iWin = gap >= 0;
+                  return (
+                    <div key={row.axis} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13 }}>
+                      <Text>{row.axis}</Text>
+                      <Space size={6}>
+                        <Text type="secondary" style={{ fontSize: 12 }}>{row.me} / {row.peer}</Text>
+                        <Tag color={iWin ? "green" : "red"} style={{ marginInlineEnd: 0 }}>
+                          {iWin ? `+${gap}` : gap}
+                        </Tag>
+                      </Space>
+                    </div>
+                  );
+                })}
+              </Space>
+            </Col>
+          </Row>
+        </Card>
+      );
+    };
+
+    // P3.3：标题关键词覆盖差距
+    const renderKeywordCoverage = () => {
+      if (keywordCoverage.length === 0) return null;
+      return (
+        <Card
+          title="标题关键词覆盖 · 头部普遍打但我没打的词"
+          size="small"
+          style={CARD_STYLE}
+          extra={<Text type="secondary" style={{ fontSize: 12 }}>只看至少 30% 样本覆盖的高频词</Text>}
+        >
+          <Space direction="vertical" size={12} style={{ width: "100%" }}>
+            <div>
+              <Text type="secondary" style={{ fontSize: 12 }}>我缺的高频词（{missingKeywords.length}）</Text>
+              <div style={{ marginTop: 8 }}>
+                {missingKeywords.length === 0 ? (
+                  <Text type="secondary">头部高频词已经都在你的标题里了。</Text>
+                ) : (
+                  <Space wrap size={[8, 8]}>
+                    {missingKeywords.map((item) => (
+                      <Tooltip key={item.word} title={`${Math.round(item.coverRate * 100)}% 样本标题里有这个词，点击加入当前关键词`}>
+                        <Tag
+                          color="red"
+                          style={{ cursor: "pointer", padding: "4px 10px", fontSize: 13 }}
+                          onClick={() => {
+                            const nextKeyword = keyword.trim() ? `${keyword.trim()} ${item.word}` : item.word;
+                            setKeyword(nextKeyword);
+                            message.success(`已把"${item.word}"加入关键词，回到步骤 2 重新搜索`);
+                            setActiveStep(1);
+                          }}
+                        >
+                          {item.word} <Text type="secondary" style={{ fontSize: 11, marginLeft: 4 }}>{Math.round(item.coverRate * 100)}%</Text>
+                        </Tag>
+                      </Tooltip>
+                    ))}
+                  </Space>
+                )}
+              </div>
+            </div>
+            <div>
+              <Text type="secondary" style={{ fontSize: 12 }}>我已覆盖的高频词（{keywordCoverage.length - missingKeywords.length}）</Text>
+              <div style={{ marginTop: 8 }}>
+                <Space wrap size={[8, 8]}>
+                  {keywordCoverage.filter((k) => k.myHas).map((item) => (
+                    <Tag key={item.word} color="green" style={{ marginInlineEnd: 0 }}>
+                      {item.word} <Text type="secondary" style={{ fontSize: 11, marginLeft: 4 }}>{Math.round(item.coverRate * 100)}%</Text>
+                    </Tag>
+                  ))}
+                </Space>
+              </div>
+            </div>
+          </Space>
+        </Card>
+      );
+    };
+
+    const renderPositioningScatter = () => {
+      if (!marketInsight || scatterPoints.length === 0) return null;
+      return (
+        <Card title="定位散点 · 我在市场里的位置" size="small" style={CARD_STYLE}>
+          <div style={{ height: 300 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <ScatterChart margin={{ top: 12, right: 24, bottom: 12, left: 12 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis type="number" dataKey="price" name="价格" unit="$" fontSize={11} />
+                <YAxis type="number" dataKey="sales" name="月销" fontSize={11} />
+                <ZAxis type="number" range={[60, 60]} />
+                <RTooltip
+                  cursor={{ strokeDasharray: "3 3" }}
+                  formatter={(value: any, name: string) => {
+                    if (name === "价格") return [`$${Number(value).toFixed(2)}`, name];
+                    if (name === "月销") return [Number(value).toLocaleString(), name];
+                    return [value, name];
+                  }}
+                  content={({ active, payload }: any) => {
+                    if (!active || !payload || !payload.length) return null;
+                    const p = payload[0].payload;
+                    return (
+                      <div style={{ background: "#fff", border: "1px solid #e5e5e5", borderRadius: 8, padding: 8, fontSize: 12, maxWidth: 260 }}>
+                        <div style={{ fontWeight: 600, marginBottom: 4 }}>{p.title || "-"}</div>
+                        <div>价格：${Number(p.price || 0).toFixed(2)}</div>
+                        <div>月销：{Number(p.sales || 0).toLocaleString()}</div>
+                        {p.hasVideo ? <div style={{ color: "#1677ff" }}>含视频素材</div> : null}
+                      </div>
+                    );
+                  }}
+                />
+                {recommendedBandCell ? (
+                  <>
+                    <ReferenceLine x={recommendedBandCell.min} stroke="#52c41a" strokeDasharray="4 4" label={{ value: `推荐带下限 $${recommendedBandCell.min.toFixed(2)}`, position: "insideTopLeft", fontSize: 10, fill: "#52c41a" }} />
+                    <ReferenceLine x={recommendedBandCell.max} stroke="#52c41a" strokeDasharray="4 4" label={{ value: `推荐带上限 $${recommendedBandCell.max.toFixed(2)}`, position: "insideTopRight", fontSize: 10, fill: "#52c41a" }} />
+                  </>
+                ) : null}
+                <Scatter name="样本" data={scatterPoints} fill="#ff8a1f" fillOpacity={0.65} />
+                {myScatterPoint && myScatterPoint.price > 0 ? (
+                  <Scatter name="我的商品" data={[myScatterPoint]} fill="#1677ff" shape="star" />
+                ) : null}
+                <Legend />
+              </ScatterChart>
+            </ResponsiveContainer>
+          </div>
+          <div style={{ marginTop: 8, fontSize: 12, color: "#8c8c8c", lineHeight: 1.7 }}>
+            绿色虚线框住的是推荐价格带，橙色点是样本，蓝色星是你的商品。如果蓝星远离绿框或远离橙色密集区，就是定位错配。
+          </div>
+        </Card>
+      );
+    };
 
     const renderInsightPanel = (
       title: string,
@@ -4146,24 +5218,76 @@ export default function CompetitorProductWorkbench({
       </div>
     );
 
-    const renderActionBoard = (title: string, items: string[], accent?: boolean) => (
+    // 动作清单：纯文本列表
+    const renderActionBoard = (
+      title: string,
+      items: string[],
+      accent?: boolean,
+      _sectionKey: string = "misc",
+    ) => (
       <div style={accent ? accentPanelStyle : softPanelStyle}>
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <Text strong>{title}</Text>
-          <Tag color={accent ? "orange" : "default"}>{items.length} 条</Tag>
+          <Text type="secondary" style={{ fontSize: 12 }}>共 {items.length} 条</Text>
         </div>
         <List
           size="small"
           dataSource={items}
           locale={{ emptyText: "暂无动作" }}
           renderItem={(item) => (
-            <List.Item style={{ paddingInline: 0, paddingBlock: 10, alignItems: "flex-start" }}>
-              <Text style={{ lineHeight: 1.7 }}>{item}</Text>
+            <List.Item style={{ paddingInline: 0, paddingBlock: 8, alignItems: "flex-start", borderBottom: "1px solid #f4f4f4" }}>
+              <Text style={{ lineHeight: 1.75, color: "#262626" }}>{item}</Text>
             </List.Item>
           )}
         />
       </div>
     );
+
+    // 今日清单：生成 Markdown 并复制（纯文本）
+    const collectAllActions = (): Array<{ section: string; text: string }> => {
+      if (!analysis) return [];
+      const sections = [
+        { title: "今天先改", items: analysis.immediateActions },
+        { title: "本周验证", items: analysis.weeklyActions },
+        { title: "下批开发", items: analysis.sourcingActions },
+      ];
+      const out: Array<{ section: string; text: string }> = [];
+      sections.forEach((section) => {
+        section.items.forEach((text) => out.push({ section: section.title, text }));
+      });
+      return out;
+    };
+    const copyTodayChecklist = () => {
+      if (!analysis || !selectedProduct) return message.warning("还没有动作可以复制");
+      const allActions = collectAllActions();
+      if (allActions.length === 0) return message.warning("还没有动作可以复制");
+      const lines: string[] = [];
+      lines.push(`# 今日运营清单 · ${selectedProduct.title}`);
+      lines.push(`> 生成时间：${new Date().toLocaleString()} · 共 ${allActions.length} 条`);
+      lines.push("");
+      const bySection = allActions.reduce((acc, item) => {
+        (acc[item.section] ||= []).push(item);
+        return acc;
+      }, {} as Record<string, typeof allActions>);
+      Object.entries(bySection).forEach(([title, list]) => {
+        lines.push(`## ${title}`);
+        list.forEach((item) => lines.push(`- ${item.text}`));
+        lines.push("");
+      });
+      const md = lines.join("\n");
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(md).then(() => message.success("今日清单已复制，粘到群里或文档里")).catch(() => message.error("复制失败，请手动选中"));
+      } else {
+        message.info("浏览器不支持剪贴板，请手动选中下方文本");
+      }
+      console.log(md);
+    };
+    const actionProgress = (() => {
+      if (!analysis) return null;
+      const all = collectAllActions();
+      if (all.length === 0) return null;
+      return { total: all.length };
+    })();
 
     const renderComparisonEvidence = (item: ComparisonRow) => {
       const tagList = String(item.tags || "")
@@ -4176,7 +5300,7 @@ export default function CompetitorProductWorkbench({
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
             <div style={{ minWidth: 0, flex: 1 }}>
               <Paragraph ellipsis={{ rows: 2, tooltip: item.competitorTitle }} style={{ marginBottom: 8, fontWeight: 600, lineHeight: 1.5 }}>
-                {item.competitorTitle}
+                {displayTitle(item.competitorTitle)}
               </Paragraph>
               <Space wrap size={[6, 6]}>
                 <Tag color={item.priority === "P0" ? "red" : item.priority === "P1" ? "orange" : "default"}>{item.priority}</Tag>
@@ -4235,186 +5359,212 @@ export default function CompetitorProductWorkbench({
       );
     };
 
-    return (
-      <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-        <Card style={CARD_STYLE}>
-          <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-            <div>
-              <Text strong style={{ fontSize: 20 }}>步骤 4：决策总览与行动方案</Text>
-              <div style={{ marginTop: 6, color: "#8c8c8c" }}>
-                先看结论，再看证据，最后只保留今天就能执行的动作。
-              </div>
+    // ========== 精简版头部结论条：一句话 + 4 列 Stat ==========
+    const renderHeroSummary = () => (
+      <Card style={{ ...CARD_STYLE, background: "linear-gradient(135deg, rgba(255,247,240,0.98) 0%, rgba(255,255,255,1) 100%)" }}>
+        <Space direction="vertical" size={14} style={{ width: "100%" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
+            <div style={{ flex: 1, minWidth: 260 }}>
+              <Text strong style={{ fontSize: 20 }}>步骤 4 · 决策总览</Text>
+              {analysis ? (
+                <div style={{ marginTop: 8, fontSize: 14, color: "#262626", lineHeight: 1.8 }}>
+                  <Tag color="orange" style={{ marginRight: 6 }}>{analysis.summary.canCompete}</Tag>
+                  关键词判断：<Text strong>{analysis.summary.keywordDecision}</Text>
+                </div>
+              ) : (
+                <div style={{ marginTop: 6, color: "#8c8c8c" }}>
+                  先选好样本，再生成当前商品的动作判断。
+                </div>
+              )}
             </div>
-
-            {!analysis ? (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="先选好样本，再生成当前商品的动作判断。" />
-            ) : (
-              <Row gutter={[12, 12]}>
-                <Col xs={24} xl={10}>
-                  <div style={accentPanelStyle}>
-                    <Text strong style={{ fontSize: 16, color: TEMU_ORANGE }}>当前结论</Text>
-                    <Paragraph style={{ marginTop: 10, marginBottom: 0, lineHeight: 1.8 }}>
-                      {analysis.summary.canCompete}。关键词判断：{analysis.summary.keywordDecision}
-                    </Paragraph>
-                    <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid rgba(229,91,0,0.12)" }}>
-                      <Text type="secondary" style={sectionTitleStyle}>为什么还能赢</Text>
-                      <Paragraph style={{ marginTop: 6, marginBottom: 0, lineHeight: 1.7 }}>
-                        {analysis.summary.winAngle}
-                      </Paragraph>
+            {marketInsight ? (
+              <Space size={6} wrap>
+                <Tag color="orange">{marketInsight.marketVerdict}</Tag>
+                <Tag color="gold">价格带 {marketInsight.recommendedPriceBand}</Tag>
+                <Tag color="blue">样本 {results?.totalFound || resultSnapshots.length}</Tag>
+              </Space>
+            ) : null}
+          </div>
+          {analysis ? (
+            <Row gutter={[12, 12]}>
+              {overviewStats.map((item, idx) => (
+                <Col xs={12} md={6} key={item.label}>
+                  <div style={{ background: "#fff", border: "1px solid rgba(229,91,0,0.12)", borderRadius: 12, padding: 14, height: "100%" }}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>{item.label}</Text>
+                    <div style={{ marginTop: 6, fontSize: idx === 0 ? 22 : 15, fontWeight: 600, color: idx === 0 ? TEMU_ORANGE : "#262626", lineHeight: 1.4 }}>
+                      {item.value}
                     </div>
                   </div>
                 </Col>
-                <Col xs={24} xl={14}>
-                  <Row gutter={[12, 12]}>
-                    {overviewStats.map((item) => (
-                      <Col xs={24} md={12} key={item.label}>
-                        <div style={outlinePanelStyle}>
-                          <Text type="secondary">{item.label}</Text>
-                          <Paragraph style={{ marginTop: 8, marginBottom: 0, lineHeight: 1.7, fontWeight: 600 }}>
-                            {item.value}
-                          </Paragraph>
-                        </div>
-                      </Col>
-                    ))}
-                  </Row>
-                </Col>
-              </Row>
-            )}
-          </Space>
-        </Card>
+              ))}
+            </Row>
+          ) : null}
+          {analysis ? (
+            <div style={{ fontSize: 13, color: "#595959", lineHeight: 1.7, padding: "10px 12px", background: "rgba(255,255,255,0.6)", borderRadius: 8 }}>
+              <Text type="secondary" style={{ fontSize: 12, marginRight: 8 }}>为什么还能赢</Text>
+              {analysis.summary.winAngle}
+            </div>
+          ) : null}
+        </Space>
+      </Card>
+    );
 
-        {analysis ? (
+    // ========== Tab 1 · 结论与动作 ==========
+    const renderConclusionTab = () => {
+      if (!analysis) return <Empty description="先选好样本，再生成动作建议。" />;
+      return (
+        <Space direction="vertical" size="middle" style={{ width: "100%" }}>
           <Row gutter={[16, 16]}>
-            <Col xs={24} xl={14}>
-              <Card title="我的商品诊断" size="small" style={CARD_STYLE}>
-                <Row gutter={[12, 12]}>
-                  {diagnosticSections.map((item) => (
-                    <Col xs={24} md={12} key={item.title}>
-                      {renderInsightPanel(item.title, item.value, { rows: 4 })}
-                    </Col>
-                  ))}
-                </Row>
-              </Card>
-            </Col>
-            <Col xs={24} xl={10}>
-              <Card title="市场与竞品判断" size="small" style={CARD_STYLE}>
-                <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-                  {marketInsight ? (
-                    <div style={accentPanelStyle}>
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-                        <Text strong>市场盘面</Text>
-                        <Space wrap size={[6, 6]}>
-                          <Tag color="orange">{marketInsight.marketVerdict}</Tag>
-                          <Tag color="gold">价格带 {marketInsight.recommendedPriceBand}</Tag>
-                        </Space>
-                      </div>
-                      <Paragraph style={{ marginTop: 8, marginBottom: 0, lineHeight: 1.8 }}>
-                        当前词更看重 {marketInsight.primaryNeed}，建议从 {marketInsight.entryFocus} 切入。Top10 集中度 {formatPercentText(marketInsight.top10SalesShare)}，视频覆盖 {formatPercentText(marketInsight.videoRate)}。
-                      </Paragraph>
-                    </div>
-                  ) : null}
-
-                  <Row gutter={[12, 12]}>
-                    {[...reviewTrustSections, ...fulfillmentSections].map((item) => (
-                      <Col xs={24} md={12} key={item.title}>
-                        {renderInsightPanel(item.title, item.value, { rows: 4 })}
-                      </Col>
-                    ))}
-                  </Row>
-                </Space>
-              </Card>
-            </Col>
-          </Row>
-        ) : null}
-
-        {analysis ? (
-          <Row gutter={[16, 16]}>
-            <Col xs={24} xl={10}>
-              <Card title="动作待办" size="small" style={CARD_STYLE}>
-                <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-                  {whyWinSection ? renderActionBoard(whyWinSection.title, whyWinSection.items, true) : null}
-                  {executionSections.map((section) => (
-                    <div key={section.title}>
-                      {renderActionBoard(section.title, section.items)}
-                    </div>
-                  ))}
-                </Space>
-              </Card>
-            </Col>
             <Col xs={24} xl={14}>
               <Card
-                title={`证据样本与对比结论 (${selectedSampleRows.length})`}
+                title="动作待办 · 按优先级排"
                 size="small"
                 style={CARD_STYLE}
-                extra={<Text type="secondary">对比字段：价格、销量、流量来源、差距、动作</Text>}
+                extra={
+                  actionProgress ? (
+                    <Space size={8}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        共 {actionProgress.total} 条
+                      </Text>
+                      <Button size="small" icon={<CopyOutlined />} onClick={copyTodayChecklist}>
+                        复制今日清单
+                      </Button>
+                    </Space>
+                  ) : null
+                }
               >
-                {comparisonRows.length === 0 ? (
-                  <Empty description="先从第三步挑 3-5 个真正可比的样本。" />
-                ) : (
-                  <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-                    {comparisonRows.slice(0, 3).map((item) => renderComparisonEvidence(item))}
-                  </Space>
-                )}
-              </Card>
-            </Col>
-          </Row>
-        ) : null}
-
-        {marketInsight ? (
-          <Row gutter={[16, 16]}>
-            <Col xs={24} xl={14}>
-              <Card title="市场证据" size="small" style={CARD_STYLE}>
                 <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-                  <Row gutter={[12, 12]}>
-                    {marketPanels.map((item) => (
-                      <Col xs={24} md={12} xl={8} key={item.label}>
-                        {renderInsightPanel(item.label, item.value, { rows: 4 })}
-                      </Col>
-                    ))}
-                  </Row>
-                  <div style={{ ...outlinePanelStyle, padding: 18 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-                      <Text strong>价格分布</Text>
-                      <Space wrap size={[8, 8]}>
-                        <Tag color="blue">搜索样本 {results?.totalFound || resultSnapshots.length}</Tag>
-                        <Tag color="gold">均价 ${avgPrice.toFixed(2)}</Tag>
-                        <Tag color="orange">机会分 {marketInsight.opportunityScore}/100</Tag>
-                      </Space>
-                    </div>
-                    <div style={{ marginTop: 14 }}>
-                      {priceDistribution.length === 0 ? (
-                        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="先搜索这个商品的核心关键词" />
-                      ) : (
-                        <ResponsiveContainer width="100%" height={240}>
-                          <BarChart data={priceDistribution}>
-                            <CartesianGrid strokeDasharray="3 3" />
-                            <XAxis dataKey="range" fontSize={11} />
-                            <YAxis fontSize={11} />
-                            <RTooltip />
-                            <Bar dataKey="count" name="商品数" radius={[6, 6, 0, 0]}>
-                              {priceDistribution.map((_: any, index: number) => <Cell key={index} fill={PRICE_COLORS[index % PRICE_COLORS.length]} />)}
-                            </Bar>
-                          </BarChart>
-                        </ResponsiveContainer>
-                      )}
-                    </div>
-                  </div>
+                  {whyWinSection ? renderActionBoard(whyWinSection.title, whyWinSection.items, true, whyWinSection.key) : null}
+                  {executionSections.map((section) => (
+                    <div key={section.key}>{renderActionBoard(section.title, section.items, false, section.key)}</div>
+                  ))}
                 </Space>
               </Card>
             </Col>
             <Col xs={24} xl={10}>
-              <Card title="持续监控" size="small" style={CARD_STYLE}>
+              <Card title="持续监控 · 盯什么指标" size="small" style={CARD_STYLE}>
                 <Space direction="vertical" size="middle" style={{ width: "100%" }}>
                   {monitorSections.map((section) => (
-                    <div key={section.title}>
-                      {renderActionBoard(section.title, section.items)}
-                    </div>
+                    <div key={section.key}>{renderActionBoard(section.title, section.items, false, section.key)}</div>
                   ))}
                 </Space>
               </Card>
             </Col>
           </Row>
-        ) : null}
+          <Card
+            title={`证据样本 · Top ${Math.min(3, comparisonRows.length)}`}
+            size="small"
+            style={CARD_STYLE}
+            extra={<Text type="secondary" style={{ fontSize: 12 }}>价格、销量、流量来源、差距、动作</Text>}
+          >
+            {comparisonRows.length === 0 ? (
+              <Empty description="先从步骤 3 挑 3-5 个真正可比的样本。" />
+            ) : (
+              <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+                {comparisonRows.slice(0, 3).map((item) => renderComparisonEvidence(item))}
+              </Space>
+            )}
+          </Card>
+        </Space>
+      );
+    };
+
+    // ========== Tab 2 · 市场定位 ==========
+    const renderMarketTab = () => {
+      if (!marketInsight) return <Empty description="先完成搜索，再看市场定位。" />;
+      return (
+        <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+          {renderOpportunityBreakdown()}
+          {renderPriceBandHeatmap()}
+          {scatterPoints.length > 0 ? renderPositioningScatter() : null}
+          <Card title="价格分布" size="small" style={CARD_STYLE}
+            extra={(
+              <Space size={6}>
+                <Tag color="gold">均价 ${avgPrice.toFixed(2)}</Tag>
+                <Tag color="orange">机会分 {marketInsight.opportunityScore}/100</Tag>
+              </Space>
+            )}>
+            {priceDistribution.length === 0 ? (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="先搜索这个商品的核心关键词" />
+            ) : (
+              <ResponsiveContainer width="100%" height={240}>
+                <BarChart data={priceDistribution}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="range" fontSize={11} />
+                  <YAxis fontSize={11} />
+                  <RTooltip />
+                  <Bar dataKey="count" name="商品数" radius={[6, 6, 0, 0]}>
+                    {priceDistribution.map((_: any, index: number) => <Cell key={index} fill={PRICE_COLORS[index % PRICE_COLORS.length]} />)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          </Card>
+        </Space>
+      );
+    };
+
+    // ========== Tab 3 · 竞品差距 ==========
+    const renderGapTab = () => {
+      if (comparisonMatrix.length === 0 && radarData.length === 0 && keywordCoverage.length === 0) {
+        return <Empty description="先选 3-5 个竞品样本，再看差距分析。" />;
+      }
+      return (
+        <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+          {comparisonMatrix.length > 0 ? renderGapMatrix() : null}
+          {radarData.length > 0 ? renderGapRadar() : null}
+          {keywordCoverage.length > 0 ? renderKeywordCoverage() : null}
+        </Space>
+      );
+    };
+
+    // ========== 诊断详情（扁平展开） ==========
+    const renderDiagnosticsSection = () => (
+      <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+        <Card title="我的商品诊断（价格 / 流量 / 标题 / 主图 等）" size="small" style={CARD_STYLE}>
+          <Row gutter={[12, 12]}>
+            {diagnosticSections.map((item) => (
+              <Col xs={24} md={12} key={item.title}>
+                {renderInsightPanel(item.title, item.value, { rows: 4 })}
+              </Col>
+            ))}
+          </Row>
+        </Card>
+        <Card title="市场与竞品判断（评价 / 履约 / 六格说明）" size="small" style={CARD_STYLE}>
+          <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+            <div style={accentPanelStyle}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+                <Text strong>市场盘面</Text>
+                <Space wrap size={[6, 6]}>
+                  <Tag color="orange">{marketInsight?.marketVerdict}</Tag>
+                  <Tag color="gold">价格带 {marketInsight?.recommendedPriceBand}</Tag>
+                </Space>
+              </div>
+              {marketInsight ? (
+                <Paragraph style={{ marginTop: 8, marginBottom: 0, lineHeight: 1.8 }}>
+                  当前词更看重 {marketInsight.primaryNeed}，建议从 {marketInsight.entryFocus} 切入。Top10 集中度 {formatPercentText(marketInsight.top10SalesShare)}，视频覆盖 {formatPercentText(marketInsight.videoRate)}。
+                </Paragraph>
+              ) : null}
+            </div>
+            <Row gutter={[12, 12]}>
+              {[...reviewTrustSections, ...fulfillmentSections, ...marketPanels].map((item: any) => (
+                <Col xs={24} md={12} xl={8} key={item.title || item.label}>
+                  {renderInsightPanel((item.title || item.label) as string, item.value, { rows: 4 })}
+                </Col>
+              ))}
+            </Row>
+          </Space>
+        </Card>
+      </Space>
+    );
+
+    return (
+      <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+        {renderHeroSummary()}
+        {renderConclusionTab()}
+        {renderMarketTab()}
+        {renderGapTab()}
+        {renderDiagnosticsSection()}
       </Space>
     );
   };
@@ -4432,6 +5582,21 @@ export default function CompetitorProductWorkbench({
 
   return (
     <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+      {degradedReason ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="云启接口暂时不可用，已切换到本地缓存模式"
+          description={`最近一次失败原因：${degradedReason}。你仍然可以查看已采集的样本和流量历史，做离线决策。`}
+          action={(
+            <Space>
+              <Button size="small" onClick={scrollToSamples}>看本地缓存</Button>
+              <Button size="small" type="text" onClick={() => setDegradedReason("")}>关闭</Button>
+            </Space>
+          )}
+          style={{ borderRadius: 12 }}
+        />
+      ) : null}
       {!hideStepShell ? (
         <Card
           style={{

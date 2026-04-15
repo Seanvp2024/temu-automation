@@ -163,8 +163,9 @@ export default function AccountManager() {
         diagnostics: diag,
       };
       setAccountStats((prev) => ({ ...prev, [targetAccountId]: stats }));
-    } catch {
-      // ignore
+    } catch (error) {
+      // 统计读取失败只影响该账号卡片展示，不阻塞其他账号加载
+      console.warn("[AccountManager] loadAccountStats failed", error);
     }
   };
 
@@ -276,8 +277,9 @@ export default function AccountManager() {
       setModalOpen(false);
       form.resetFields();
       message.success("账号添加成功");
-    } catch {
-      // validation failed
+    } catch (error) {
+      // AntD form.validateFields 校验失败时抛错，错误提示已由表单组件展示
+      console.warn("[AccountManager] add account validation failed", error);
     }
   };
 
@@ -364,7 +366,7 @@ export default function AccountManager() {
 
   const handleLogout = async (id: string) => {
     if (api) {
-      try { await api.close(); } catch {}
+      try { await api.close(); } catch { /* 浏览器窗口关闭可容错忽略 */ }
     }
     const nextAccounts = accounts.map((a) => (a.id === id ? { ...a, status: "offline" as const } : a));
     setAccounts(nextAccounts);
@@ -378,7 +380,7 @@ export default function AccountManager() {
   const handleDelete = async (id: string) => {
     const target = accounts.find((account) => account.id === id);
     if (target?.status === "online" && api) {
-      try { await api.close(); } catch {}
+      try { await api.close(); } catch { /* 浏览器窗口关闭可容错忽略 */ }
     }
     const nextAccounts = accounts.filter((a) => a.id !== id);
     setAccounts(nextAccounts);

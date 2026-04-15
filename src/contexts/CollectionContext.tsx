@@ -259,7 +259,10 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
           const completedTasks = Number(snapshot.completedTasks) || 0;
           setProgress(Math.min(95, Math.round((completedTasks / Math.max(1, totalTasks)) * 100)));
         }
-      } catch {}
+      } catch (error) {
+        // 进度轮询失败不影响主流程，下一次 tick 会重试；只记录便于排查
+        console.warn("[CollectionContext] syncProgress failed", error);
+      }
 
       if (!cancelled && collectionRunRef.current === runId) {
         timeoutId = setTimeout(syncProgress, 1000);
@@ -545,7 +548,10 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
             errorCount: errorTotal,
           },
         });
-      } catch {}
+      } catch (error) {
+        // 诊断信息持久化失败不阻塞采集主流程
+        console.warn("[CollectionContext] persist diagnostics failed", error);
+      }
     }
 
     if (isCancelled()) return;
@@ -605,7 +611,10 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
               }).filter((task) => task.status === "error").length,
             },
           });
-        } catch {}
+        } catch (error) {
+          // 诊断信息写入失败不影响 dashboard 同步
+          console.warn("[CollectionContext] dashboard diagnostics write failed", error);
+        }
       }
       setTaskStates((prev) => ({
         ...prev,
@@ -640,7 +649,10 @@ export function CollectionProvider({ children }: { children: React.ReactNode }) 
               errorCount: Object.values(nextTasks).filter((task) => task.status === "error").length,
             },
           });
-        } catch {}
+        } catch (persistError) {
+          // 错误诊断信息写入失败：原始错误已在外层捕获并反馈给用户
+          console.warn("[CollectionContext] error diagnostics write failed", persistError);
+        }
       }
       setTaskStates((prev) => ({
         ...prev,

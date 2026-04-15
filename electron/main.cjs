@@ -7,6 +7,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const XLSX = require("xlsx");
 const { autoUpdater } = require("electron-updater");
+const { getDefaultCredentials } = require("./default-credentials.cjs");
 
 // 全局捕获未处理异常，防止 EPIPE 等 pipe 错误崩溃 Electron
 process.on("uncaughtException", (err) => {
@@ -1309,6 +1310,40 @@ let imageStudioProcess = null;
 let imageStudioPort = AUTO_IMAGE_DEFAULT_PORT;
 let imageStudioStartupPromise = null;
 let imageStudioRuntimeConfigOverrides = {};
+
+// 用户自定义 AI 凭证持久化到 userData/ai-credentials.json
+function getAiCredentialsStorePath() {
+  try {
+    return path.join(app.getPath("userData"), "ai-credentials.json");
+  } catch (_err) {
+    return "";
+  }
+}
+
+function loadPersistedAiOverrides() {
+  const p = getAiCredentialsStorePath();
+  if (!p) return {};
+  try {
+    if (!fs.existsSync(p)) return {};
+    const raw = fs.readFileSync(p, "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (err) {
+    console.warn("[Main] load ai-credentials.json failed:", err.message);
+    return {};
+  }
+}
+
+function savePersistedAiOverrides(data) {
+  const p = getAiCredentialsStorePath();
+  if (!p) return;
+  try {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(data || {}, null, 2), "utf8");
+  } catch (err) {
+    console.warn("[Main] save ai-credentials.json failed:", err.message);
+  }
+}
 let imageStudioStatus = {
   status: "idle",
   message: "AI 出图服务未启动",
@@ -1572,7 +1607,31 @@ async function ensureImageStudioServiceInternal() {
     console.log(`[Main] Loaded ${Object.keys(envLocalVars).length} vars from ${envLocalPath}`);
   }
 
-  const env = { ...process.env, ...envLocalVars, PORT: String(nextPort), HOSTNAME: AUTO_IMAGE_HOST, NODE_ENV: "production" };
+  // 注入内置默认 AI 凭证 + 用户覆盖，保证打包后 image-studio 子进程直接可用
+  const baked = getDefaultCredentials();
+  const bakedEnv = {
+    ANALYZE_API_KEY: baked.analyzeApiKey,
+    ANALYZE_BASE_URL: baked.analyzeBaseUrl,
+    ANALYZE_MODEL: baked.analyzeModel,
+    GENERATE_API_KEY: baked.generateApiKey,
+    GENERATE_BASE_URL: baked.generateBaseUrl,
+    GENERATE_MODEL: baked.generateModel,
+  };
+  const overrideEnv = {};
+  const overrideKeyMap = {
+    analyzeApiKey: "ANALYZE_API_KEY",
+    analyzeBaseUrl: "ANALYZE_BASE_URL",
+    analyzeModel: "ANALYZE_MODEL",
+    generateApiKey: "GENERATE_API_KEY",
+    generateBaseUrl: "GENERATE_BASE_URL",
+    generateModel: "GENERATE_MODEL",
+  };
+  for (const [k, envKey] of Object.entries(overrideKeyMap)) {
+    const v = imageStudioRuntimeConfigOverrides[k];
+    if (typeof v === "string" && v.trim()) overrideEnv[envKey] = v;
+  }
+  // 优先级：process.env (系统) < 内置 baked < .env.local (开发) < 用户 override
+  const env = { ...process.env, ...bakedEnv, ...envLocalVars, ...overrideEnv, PORT: String(nextPort), HOSTNAME: AUTO_IMAGE_HOST, NODE_ENV: "production" };
 
   const spawnArgs = projectInfo.mode === "packaged-runtime"
     ? [projectInfo.serverPath]
@@ -1670,13 +1729,15 @@ function resolveImageStudioRuntimeConfigValue(key, ...candidates) {
 
 function readImageStudioRuntimeConfig(projectInfo = getImageStudioProjectInfo()) {
   const envLocalVars = readEnvKeyValueFile(projectInfo?.envLocalPath);
+  const baked = getDefaultCredentials();
+  // 优先级：内存 override (用户在 UI 修改) → .env.local (开发) → process.env → 内置默认凭证 → 静态兜底
   return {
-    analyzeModel: resolveImageStudioRuntimeConfigValue("analyzeModel", envLocalVars.ANALYZE_MODEL, process.env.ANALYZE_MODEL, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.analyzeModel),
-    analyzeApiKey: resolveImageStudioRuntimeConfigValue("analyzeApiKey", envLocalVars.ANALYZE_API_KEY, process.env.ANALYZE_API_KEY, ""),
-    analyzeBaseUrl: resolveImageStudioRuntimeConfigValue("analyzeBaseUrl", envLocalVars.ANALYZE_BASE_URL, process.env.ANALYZE_BASE_URL, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.analyzeBaseUrl),
-    generateModel: resolveImageStudioRuntimeConfigValue("generateModel", envLocalVars.GENERATE_MODEL, process.env.GENERATE_MODEL, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.generateModel),
-    generateApiKey: resolveImageStudioRuntimeConfigValue("generateApiKey", envLocalVars.GENERATE_API_KEY, process.env.GENERATE_API_KEY, ""),
-    generateBaseUrl: resolveImageStudioRuntimeConfigValue("generateBaseUrl", envLocalVars.GENERATE_BASE_URL, process.env.GENERATE_BASE_URL, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.generateBaseUrl),
+    analyzeModel: resolveImageStudioRuntimeConfigValue("analyzeModel", envLocalVars.ANALYZE_MODEL, process.env.ANALYZE_MODEL, baked.analyzeModel, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.analyzeModel),
+    analyzeApiKey: resolveImageStudioRuntimeConfigValue("analyzeApiKey", envLocalVars.ANALYZE_API_KEY, process.env.ANALYZE_API_KEY, baked.analyzeApiKey, ""),
+    analyzeBaseUrl: resolveImageStudioRuntimeConfigValue("analyzeBaseUrl", envLocalVars.ANALYZE_BASE_URL, process.env.ANALYZE_BASE_URL, baked.analyzeBaseUrl, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.analyzeBaseUrl),
+    generateModel: resolveImageStudioRuntimeConfigValue("generateModel", envLocalVars.GENERATE_MODEL, process.env.GENERATE_MODEL, baked.generateModel, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.generateModel),
+    generateApiKey: resolveImageStudioRuntimeConfigValue("generateApiKey", envLocalVars.GENERATE_API_KEY, process.env.GENERATE_API_KEY, baked.generateApiKey, ""),
+    generateBaseUrl: resolveImageStudioRuntimeConfigValue("generateBaseUrl", envLocalVars.GENERATE_BASE_URL, process.env.GENERATE_BASE_URL, baked.generateBaseUrl, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.generateBaseUrl),
   };
 }
 
@@ -1698,7 +1759,22 @@ function updateImageStudioRuntimeConfigOverrides(patch = {}) {
     ...imageStudioRuntimeConfigOverrides,
     ...normalizedPatch,
   };
+  // 持久化：只保存非空字段，空字符串视为"恢复默认"
+  const toPersist = {};
+  for (const [k, v] of Object.entries(imageStudioRuntimeConfigOverrides)) {
+    if (typeof v === "string" && v.trim()) toPersist[k] = v;
+  }
+  savePersistedAiOverrides(toPersist);
   return readImageStudioRuntimeConfig();
+}
+
+function hydrateImageStudioRuntimeConfigFromDisk() {
+  const persisted = loadPersistedAiOverrides();
+  const normalized = normalizeImageStudioRuntimeConfigPatch(persisted);
+  if (Object.keys(normalized).length > 0) {
+    imageStudioRuntimeConfigOverrides = { ...imageStudioRuntimeConfigOverrides, ...normalized };
+    console.log(`[Main] hydrated ${Object.keys(normalized).length} AI credential overrides from disk`);
+  }
 }
 
 function getImageStudioRuntimeConfigSignature(payload) {
@@ -2570,6 +2646,9 @@ function migrateScopedStoreFilesForAccountIdChange() {
 app.whenReady().then(async () => {
   // 启动时先做 scoped 数据 id 迁移，避免账号重建后旧数据孤立
   migrateScopedStoreFilesForAccountIdChange();
+
+  // 载入持久化的 AI 凭证覆盖 (用户在 Settings 中设置的 Key)
+  hydrateImageStudioRuntimeConfigFromDisk();
 
   const imageStudioStartupPromise = ensureImageStudioService()
     .then((status) => {

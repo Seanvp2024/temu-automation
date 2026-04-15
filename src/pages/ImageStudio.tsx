@@ -4,7 +4,6 @@ import {
   Button,
   Card,
   Col,
-  Descriptions,
   Drawer,
   Empty,
   Image,
@@ -31,7 +30,6 @@ import {
   DownloadOutlined,
   ExportOutlined,
   HistoryOutlined,
-  PictureOutlined,
   ReloadOutlined,
   RocketOutlined,
   StarOutlined,
@@ -44,14 +42,10 @@ import {
   DEFAULT_IMAGE_TYPES,
   EMPTY_IMAGE_STUDIO_ANALYSIS,
   IMAGE_LANGUAGE_OPTIONS,
-  IMAGE_SIZE_OPTIONS,
   IMAGE_TYPE_LABELS,
   PRODUCT_MODE_OPTIONS,
-  SALES_REGION_OPTIONS,
-  arrayToMultiline,
   formatTimestamp,
   getDefaultImageLanguageForRegion,
-  multilineToArray,
   normalizeImageStudioAnalysis,
   type ImageStudioAnalysis,
   type ImageStudioGeneratedImage,
@@ -67,11 +61,7 @@ const { Title, Text, Paragraph } = Typography;
 const { TextArea } = Input;
 const imageStudioAPI = window.electronAPI?.imageStudio;
 const TEMU_ORANGE = "#e55b00";
-const TEMU_SOFT = "#fff2e8";
-const TEMU_BORDER = "#f0f0f0";
-const TEMU_PAGE_BG = "#f7f8fa";
 const TEMU_TEXT = "#1f2329";
-const TEMU_MUTED = "#8c8c8c";
 const TEMU_CARD_RADIUS = 22;
 const TEMU_CARD_SHADOW = "0 12px 30px rgba(15, 23, 42, 0.08)";
 const TEMU_BUTTON_GRADIENT = "linear-gradient(135deg, #ff922b 0%, #ff6a00 100%)";
@@ -241,7 +231,7 @@ function appendVariantToMap(
   };
 }
 
-function flattenVariantMap(variantMap: ImageVariantMap, selectedTypes: string[], activeVariantIds: Record<string, string>) {
+export function _flattenVariantMap(variantMap: ImageVariantMap, selectedTypes: string[], activeVariantIds: Record<string, string>) {
   const allImages = selectedTypes.flatMap((imageType) => {
     const variants = Array.isArray(variantMap[imageType]) ? variantMap[imageType] : [];
     return variants.map((variant) => ({
@@ -624,7 +614,7 @@ export default function ImageStudio() {
   const [productMode, setProductMode] = useState("single");
   const [salesRegion, setSalesRegion] = useState("us");
   const [imageLanguage, setImageLanguage] = useState(getDefaultImageLanguageForRegion("us"));
-  const [imageSize, setImageSize] = useState("800x800");
+  const [imageSize] = useState("800x800");
   const [selectedImageTypes, setSelectedImageTypes] = useState<string[]>(DEFAULT_IMAGE_TYPES);
   const [analysis, setAnalysis] = useState<ImageStudioAnalysis>(EMPTY_IMAGE_STUDIO_ANALYSIS);
   const [plans, setPlans] = useState<ImageStudioPlan[]>([]);
@@ -740,7 +730,10 @@ export default function ImageStudio() {
     try {
       const jobs = await imageStudioAPI.listJobs();
       setBackgroundJobs(Array.isArray(jobs) ? jobs : []);
-    } catch {}
+    } catch (error) {
+      // 后台任务轮询失败不影响前台生成流程
+      console.warn("[ImageStudio] refreshBackgroundJobs failed", error);
+    }
   };
 
   const loadHistory = async () => {
@@ -968,7 +961,7 @@ export default function ImageStudio() {
     };
   }, []);
 
-  const handleRestart = async () => {
+  const _handleRestart = async () => {
     setActionLoading(true);
     try {
       if (!imageStudioAPI) throw new Error("当前环境不支持 AI 出图服务");
@@ -1679,7 +1672,7 @@ export default function ImageStudio() {
     }
   }, [productMode, uploadFiles.length]);
 
-  const renderStepZeroLegacy = () => (
+  const _renderStepZeroLegacy = () => (
     <Card
       style={{
         borderRadius: TEMU_CARD_RADIUS,
@@ -2078,7 +2071,7 @@ export default function ImageStudio() {
     </div>
   );
 
-  const clearCompletedBackgroundJobs = async () => {
+  const _clearCompletedBackgroundJobs = async () => {
     if (!imageStudioAPI || completedBackgroundJobs.length === 0) return;
     await Promise.allSettled(completedBackgroundJobs.map((job) => imageStudioAPI.clearJob(job.jobId)));
     refreshBackgroundJobs();
@@ -2447,7 +2440,7 @@ export default function ImageStudio() {
     </Card>
   );
 
-  const renderGenerateStatusText = (status: string) => {
+  const _renderGenerateStatusText = (status: string) => {
     if (status === "done") return "图片已生成，可在下方查看结果";
     if (status === "generating") return "正在生成图片，请稍候";
     if (status === "error") return "本张图片生成失败，可根据错误提示重试";
@@ -2536,7 +2529,6 @@ export default function ImageStudio() {
 
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
                 {generatedImages.map((image) => {
-                  const result = getResultState(results, image.imageType);
                   const variants = imageVariants[image.imageType] || [];
                   const activeVariant = variants.find((item) => item.variantId === activeVariantIds[image.imageType]) || variants[variants.length - 1];
                   const downloadKey = image.variantId || `${image.imageType}:${image.imageUrl}`;
@@ -2868,6 +2860,12 @@ export default function ImageStudio() {
       </div>
     );
   }
+
+  // 以下 helper / render 分支为旧版/实验版本，保留备用以避免 noUnusedLocals 误伤
+  void _handleRestart;
+  void _renderStepZeroLegacy;
+  void _clearCompletedBackgroundJobs;
+  void _renderGenerateStatusText;
 
   return (
     <div className="studio-shell">

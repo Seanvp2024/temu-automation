@@ -27,7 +27,8 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
           colorBgContainer: "#ffffff",
           colorBgLayout: "#f7f8fa",
           colorText: "#1a1a2e",
-          colorTextSecondary: "#8c8c8c",
+          colorTextSecondary: "#595959",
+          colorTextTertiary: "#8c8c8c",
           controlHeight: 42,
         },
         components: {
@@ -37,9 +38,11 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
           },
           Table: {
             borderRadiusLG: 10,
-            headerBg: "#fafafa",
-            headerColor: "#595959",
+            headerBg: "#f5f7fa",
+            headerColor: "#262626",
             fontSize: 15,
+            cellPaddingBlock: 14,
+            cellPaddingInline: 12,
           },
           Tag: {
             borderRadiusSM: 4,

@@ -268,8 +268,9 @@ function BatchCreate() {
       if (preferredTask.running) {
         pollProgress(preferredTask.taskId, true);
       }
-    } catch {
-      // ignore
+    } catch (error) {
+      // 任务历史加载失败降级为空列表，不阻塞创建流程
+      console.warn("[ProductCreate] refreshTaskHistory failed", error);
     } finally {
       setHistoryLoading(false);
     }
@@ -304,8 +305,9 @@ function BatchCreate() {
         } else {
           message.error(normalizeBatchReason(snapshot.message || "本批商品未完成处理"));
         }
-      } catch {
-        // ignore
+      } catch (error) {
+        // 轮询某次拉取失败不要中断定时器，下一次 tick 自然重试
+        console.warn("[ProductCreate] pollProgress tick failed", error);
       }
     }, 2200);
   };
@@ -442,8 +444,9 @@ function BatchCreate() {
       if (snapshot.running) {
         pollProgress(snapshot.taskId, true);
       }
-    } catch {
-      // ignore
+    } catch (error) {
+      // 恢复任务视图失败时静默退出，不自动重试以免扰乱用户
+      console.warn("[ProductCreate] restoreTaskView failed", error);
     }
   };
 

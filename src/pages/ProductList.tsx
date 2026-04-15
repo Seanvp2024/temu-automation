@@ -1,10 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, Card, Checkbox, Col, Divider, Drawer, Empty, Image, Input, Modal, Popover, Progress, Radio, Row, Segmented, Space, Spin, Statistic, Table, Tabs, Tag, Tooltip, Typography, message } from "antd";
+import { Alert, Button, Card, Checkbox, Col, Drawer, Empty, Image, Input, Modal, Radio, Row, Segmented, Space, Spin, Statistic, Table, Tag, Tooltip, Typography, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
   AppstoreOutlined,
-  DownOutlined,
-  EyeOutlined,
   FireOutlined,
   PictureOutlined,
   SearchOutlined,
@@ -12,21 +10,12 @@ import {
   ShoppingCartOutlined,
   StopOutlined,
   SyncOutlined,
-  UpOutlined,
   WarningOutlined,
 } from "@ant-design/icons";
 import {
   Area,
   AreaChart,
-  Bar,
-  BarChart,
   CartesianGrid,
-  Cell,
-  Legend,
-  Line,
-  LineChart,
-  Pie,
-  PieChart,
   ResponsiveContainer,
   Tooltip as ReTooltip,
   XAxis,
@@ -51,6 +40,7 @@ import {
 import { getStoreValue } from "../utils/storeCompat";
 import { ACTIVE_ACCOUNT_CHANGED_EVENT, STORE_VALUE_UPDATED_EVENT } from "../utils/multiStore";
 import { TrafficDriverPanel, buildTrafficDriverSitesFromProduct, type TrafficSiteKey } from "../components/TrafficDriverPanel";
+import ProductFluxOperatorCard from "../components/ProductFluxOperatorCard";
 
 const store = window.electronAPI?.store;
 const automation = window.electronAPI?.automation;
@@ -74,7 +64,7 @@ type ProductSkuSummary = {
 
 type FluxSiteKey = "global" | "us" | "eu";
 
-const FLUX_SITE_LABELS: Record<FluxSiteKey, string> = {
+export const FLUX_SITE_LABELS: Record<FluxSiteKey, string> = {
   global: "全球",
   us: "美国",
   eu: "欧区",
@@ -118,7 +108,7 @@ interface ProductTrafficSummary {
   trendPayOrderNum: number;
   exposeClickRate: number;
   clickPayRate: number;
-  dataOrigin?: "flux" | "gp" | "mall";
+  dataOrigin?: "flux" | "gp" | "mall" | "cache";
   rangeTotal?: number;
   changeRate?: number;
   coveredRegions?: number;
@@ -224,7 +214,7 @@ const PRODUCT_ID_LOOKUP_FIELDS = [
 const EMPTY_IMAGE_FALLBACK =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mN8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
 
-const PRODUCT_FLUX_SITE_OPTIONS: Array<{ key: FluxSiteKey; label: string }> = [
+export const PRODUCT_FLUX_SITE_OPTIONS: Array<{ key: FluxSiteKey; label: string }> = [
   { key: "global", label: "全球" },
   { key: "us", label: "美国" },
   { key: "eu", label: "欧区" },
@@ -486,7 +476,7 @@ function buildSearchIndex(product: ProductItem) {
     .join(" ");
 }
 
-function renderStatusTag(text: string, color: "default" | "success" | "warning" | "error" = "default") {
+export function renderStatusTag(text: string, color: "default" | "success" | "warning" | "error" = "default") {
   if (!text) return <Tag>待同步</Tag>;
   return <Tag color={color}>{text}</Tag>;
 }
@@ -515,7 +505,7 @@ function mapGpRangeLabel(range: string) {
   }
 }
 
-function getRangeDaysByLabel(label: string) {
+export function getRangeDaysByLabel(label: string) {
   switch (label) {
     case "昨日":
       return 1;
@@ -759,6 +749,154 @@ function mergeFluxProductHistoryCaches(...sources: Array<Record<string, any> | n
   return merged;
 }
 
+function normalizeFluxHistoryDailyRows(rows: any[] = []) {
+  return (Array.isArray(rows) ? rows : [])
+    .map((item: any) => ({
+      date: normalizeText(item?.date || item?.statDate || item?.day),
+      exposeNum: toNumberValue(item?.exposeNum),
+      clickNum: toNumberValue(item?.clickNum),
+      detailVisitNum: toNumberValue(item?.detailVisitNum || item?.detailVisitorNum),
+      detailVisitorNum: toNumberValue(item?.detailVisitorNum || item?.detailVisitNum),
+      addToCartUserNum: toNumberValue(item?.addToCartUserNum),
+      collectUserNum: toNumberValue(item?.collectUserNum),
+      buyerNum: toNumberValue(item?.buyerNum),
+      payGoodsNum: toNumberValue(item?.payGoodsNum),
+      payOrderNum: toNumberValue(item?.payOrderNum || item?.payGoodsNum),
+      searchExposeNum: toNumberValue(item?.searchExposeNum),
+      searchClickNum: toNumberValue(item?.searchClickNum),
+      searchPayGoodsNum: toNumberValue(item?.searchPayGoodsNum),
+      recommendExposeNum: toNumberValue(item?.recommendExposeNum),
+      recommendClickNum: toNumberValue(item?.recommendClickNum),
+      recommendPayGoodsNum: toNumberValue(item?.recommendPayGoodsNum),
+    }))
+    .filter((item) => Boolean(item.date))
+    .sort((left, right) => String(left.date).localeCompare(String(right.date)));
+}
+
+function buildFluxHistoryFallbackSite(
+  productHistoryCache: Record<string, any>,
+  idCandidates: string[],
+  siteKey: FluxSiteKey,
+  siteLabel: string,
+  syncedAt = "",
+): ProductFluxSiteData | null {
+  if (!productHistoryCache || typeof productHistoryCache !== "object") return null;
+  const ids = Array.from(new Set((Array.isArray(idCandidates) ? idCandidates : []).map((value) => String(value || "").trim()).filter(Boolean)));
+  if (ids.length === 0) return null;
+
+  let cachedDaily: any[] = [];
+  let cacheSyncedAt = normalizeText(syncedAt);
+  for (const id of ids) {
+    const station = productHistoryCache[id]?.stations?.[siteLabel];
+    const rows = normalizeFluxHistoryDailyRows(station?.daily);
+    if (!rows.length) continue;
+    cachedDaily = rows;
+    const rawCachedAt = station?.cachedAt ?? productHistoryCache[id]?.cachedAt ?? "";
+    cacheSyncedAt = normalizeText(
+      typeof rawCachedAt === "number" && Number.isFinite(rawCachedAt)
+        ? new Date(rawCachedAt).toISOString()
+        : rawCachedAt,
+    ) || cacheSyncedAt;
+    break;
+  }
+
+  if (!cachedDaily.length) return null;
+
+  const latestRow = cachedDaily[cachedDaily.length - 1];
+  const latestMonth = String(latestRow?.date || "").slice(0, 7);
+  const rangeRowsMap: Record<string, any[]> = {
+    今日: latestRow ? [latestRow] : [],
+    近7日: cachedDaily.slice(-7),
+    近30日: cachedDaily.slice(-30),
+  };
+
+  if (cachedDaily.length > 1) {
+    rangeRowsMap.昨日 = [cachedDaily[cachedDaily.length - 2]];
+  }
+
+  if (latestMonth) {
+    const monthRows = cachedDaily.filter((item) => String(item?.date || "").startsWith(latestMonth));
+    if (monthRows.length) {
+      rangeRowsMap.本月 = monthRows;
+    }
+  }
+
+  const buildSummary = (rangeRows: any[]): ProductTrafficSummary => {
+    const aggregate = rangeRows.reduce((accumulator, item) => ({
+      exposeNum: accumulator.exposeNum + toNumberValue(item?.exposeNum),
+      clickNum: accumulator.clickNum + toNumberValue(item?.clickNum),
+      detailVisitNum: accumulator.detailVisitNum + toNumberValue(item?.detailVisitNum || item?.detailVisitorNum),
+      detailVisitorNum: accumulator.detailVisitorNum + toNumberValue(item?.detailVisitorNum || item?.detailVisitNum),
+      addToCartUserNum: accumulator.addToCartUserNum + toNumberValue(item?.addToCartUserNum),
+      collectUserNum: accumulator.collectUserNum + toNumberValue(item?.collectUserNum),
+      buyerNum: accumulator.buyerNum + toNumberValue(item?.buyerNum),
+      payGoodsNum: accumulator.payGoodsNum + toNumberValue(item?.payGoodsNum),
+      payOrderNum: accumulator.payOrderNum + toNumberValue(item?.payOrderNum || item?.payGoodsNum),
+      searchExposeNum: accumulator.searchExposeNum + toNumberValue(item?.searchExposeNum),
+      searchClickNum: accumulator.searchClickNum + toNumberValue(item?.searchClickNum),
+      searchPayGoodsNum: accumulator.searchPayGoodsNum + toNumberValue(item?.searchPayGoodsNum),
+      recommendExposeNum: accumulator.recommendExposeNum + toNumberValue(item?.recommendExposeNum),
+      recommendClickNum: accumulator.recommendClickNum + toNumberValue(item?.recommendClickNum),
+      recommendPayGoodsNum: accumulator.recommendPayGoodsNum + toNumberValue(item?.recommendPayGoodsNum),
+      trendExposeNum: accumulator.trendExposeNum + toNumberValue(item?.exposeNum),
+      trendPayOrderNum: accumulator.trendPayOrderNum + toNumberValue(item?.payOrderNum || item?.payGoodsNum),
+      dataDate: normalizeText(item?.date) || accumulator.dataDate,
+    }), {
+      exposeNum: 0,
+      clickNum: 0,
+      detailVisitNum: 0,
+      detailVisitorNum: 0,
+      addToCartUserNum: 0,
+      collectUserNum: 0,
+      buyerNum: 0,
+      payGoodsNum: 0,
+      payOrderNum: 0,
+      searchExposeNum: 0,
+      searchClickNum: 0,
+      searchPayGoodsNum: 0,
+      recommendExposeNum: 0,
+      recommendClickNum: 0,
+      recommendPayGoodsNum: 0,
+      trendExposeNum: 0,
+      trendPayOrderNum: 0,
+      dataDate: "",
+    });
+
+    return {
+      ...buildTrafficSummary(aggregate, siteKey, siteLabel, cacheSyncedAt),
+      dataDate: normalizeText(rangeRows[rangeRows.length - 1]?.date || latestRow?.date),
+      updateTime: cacheSyncedAt || normalizeText(latestRow?.date),
+      growDataText: "已采集商品级日趋势",
+      dataOrigin: "cache",
+    };
+  };
+
+  const summaryByRange = Object.fromEntries(
+    Object.entries(rangeRowsMap)
+      .filter(([, rows]) => Array.isArray(rows) && rows.length > 0)
+      .map(([label, rows]) => [label, buildSummary(rows)]),
+  ) as Record<string, ProductTrafficSummary>;
+
+  const availableRanges = sortFluxRangeLabels(Object.keys(summaryByRange));
+  if (!availableRanges.length) return null;
+
+  const primaryRangeLabel = availableRanges.includes("近30日")
+    ? "近30日"
+    : (availableRanges.includes("近7日") ? "近7日" : availableRanges[0]);
+
+  return {
+    siteKey,
+    siteLabel,
+    syncedAt: cacheSyncedAt,
+    summary: summaryByRange[primaryRangeLabel] || null,
+    summaryByRange,
+    items: [],
+    itemsByRange: {},
+    availableRanges,
+    primaryRangeLabel,
+  };
+}
+
 function matchesFluxRecord(record: any, idCandidates: Set<string>) {
   const idMatched = PRODUCT_ID_LOOKUP_FIELDS.some((field) => {
     const text = normalizeText(record?.[field]);
@@ -963,6 +1101,7 @@ export default function ProductList() {
   const [gpDetailData, setGpDetailData] = useState<any>(null);
   const [gpDetailRange, setGpDetailRange] = useState<"1d" | "7d" | "30d">("7d");
   const fluxDetailFetchStateRef = useRef<Map<string, "loading" | "done" | "empty">>(new Map());
+  void fluxDetailFetchStateRef; // 保留
   const gpDetailRangeOptions: Array<"1d" | "7d" | "30d"> = ["30d", "7d", "1d"];
   const gpDetailCacheMissingMessage = "该商品的动销详情还没有进入缓存，请先到数据采集运行“动销详情 / 地区明细”。";
 
@@ -1087,82 +1226,30 @@ export default function ProductList() {
     }
   }, [activeFluxSiteKey, activeFluxRangeLabel, selectedProduct]);
 
-  useEffect(() => {
-    const record = selectedProduct;
-    if (!record || !automation?.scrapeFluxProductDetail) return;
-
-    const sites = Array.isArray(record.fluxSites) ? record.fluxSites : [];
-    const activeSite = sites.find((item) => item.siteKey === activeFluxSiteKey) || sites[0] || null;
-    const siteLabel = activeSite?.siteLabel || FLUX_SITE_LABELS[activeFluxSiteKey];
-    const goodsId = normalizeText(record.goodsId);
-    if (!goodsId || !siteLabel) return;
-    const stationTrend = siteTrendListBySite[activeFluxSiteKey] || [];
-
-    const idCandidates = [record.goodsId, record.skcId, record.spuId, record.skuId]
-      .map((value) => normalizeText(value))
+  // 从 productHistoryCache 抽取当前商品在三个站点的日趋势 (温缓存,不触发现采)
+  const productDailyTrendBySite = useMemo<Record<string, any[]>>(() => {
+    if (!selectedProduct || !productHistoryCache) return {};
+    const ids = [selectedProduct.goodsId, selectedProduct.skcId, selectedProduct.spuId, selectedProduct.skuId]
+      .map((value) => String(value || "").trim())
       .filter(Boolean);
-    const hasCachedDaily = idCandidates.some((id) => {
-      const daily = productHistoryCache[id]?.stations?.[siteLabel]?.daily;
-      return Array.isArray(daily) && daily.length > 1;
-    });
-    if (hasCachedDaily || stationTrend.length > 1) {
-      if (hasCachedDaily) {
-        fluxDetailFetchStateRef.current.set(`${siteLabel}:${goodsId}`, "done");
+    if (ids.length === 0) return {};
+    const siteToLabel: Array<{ key: FluxSiteKey; label: string }> = [
+      { key: "global", label: "全球" },
+      { key: "us", label: "美国" },
+      { key: "eu", label: "欧区" },
+    ];
+    const result: Record<string, any[]> = {};
+    for (const { key, label } of siteToLabel) {
+      for (const id of ids) {
+        const daily = productHistoryCache[id]?.stations?.[label]?.daily;
+        if (Array.isArray(daily) && daily.length > 0) {
+          result[key] = daily;
+          break;
+        }
       }
-      return;
     }
-    const requestKey = `${siteLabel}:${goodsId}`;
-    if (fluxDetailFetchStateRef.current.has(requestKey)) return;
-
-    fluxDetailFetchStateRef.current.set(requestKey, "loading");
-    let cancelled = false;
-
-    void (async () => {
-      try {
-        const result = await automation.scrapeFluxProductDetail({
-          siteLabel,
-          goodsId,
-          spuId: record.spuId,
-          skcId: record.skcId,
-          skuId: record.skuId,
-          title: record.title,
-          rangeLabel: activeSite?.primaryRangeLabel || activeFluxRangeLabel || "",
-        });
-        const cachePatch = result?.cache && typeof result.cache === "object"
-          ? result.cache as Record<string, any>
-          : {};
-        const hasFetchedDaily = Object.values(cachePatch).some((entry: any) => {
-          const daily = entry?.stations?.[siteLabel]?.daily;
-          return Array.isArray(daily) && daily.length > 0;
-        });
-        fluxDetailFetchStateRef.current.set(requestKey, hasFetchedDaily ? "done" : "empty");
-        if (cancelled || !hasFetchedDaily) return;
-
-        setProductHistoryCache((current) => {
-          const merged = mergeFluxProductHistoryCaches(current, cachePatch);
-          void store?.set("temu_flux_product_history_cache", merged).catch(() => {});
-          return merged;
-        });
-      } catch (error) {
-        fluxDetailFetchStateRef.current.delete(requestKey);
-        console.warn("[ProductList] scrapeFluxProductDetail failed:", error);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    selectedProduct?.goodsId,
-    selectedProduct?.skcId,
-    selectedProduct?.spuId,
-    selectedProduct?.skuId,
-    selectedProduct?.title,
-    activeFluxSiteKey,
-    activeFluxRangeLabel,
-    productHistoryCache,
-    siteTrendListBySite,
-  ]);
+    return result;
+  }, [selectedProduct, productHistoryCache]);
 
   const loadProducts = async () => {
     setLoading(true);
@@ -1382,6 +1469,7 @@ export default function ProductList() {
       const productCounts = parseProductCountSummary(rawProducts);
       const salesItems = Array.isArray(parsedSales?.items) ? parsedSales.items : [];
       const fluxItems = Array.isArray(parsedFlux?.items) ? parsedFlux.items : [];
+      void fluxItems; // 保留
 
       setSalesSummary(parsedSales?.summary || null);
       setCountSummary(productCounts);
@@ -1754,8 +1842,11 @@ export default function ProductList() {
         || mallFallbackSources.some((item) => Boolean(item.raw))
       ) {
         for (const product of mergedProducts) {
+          const historyIdCandidates = [product.goodsId, product.skcId, product.spuId, product.skuId]
+            .map((value) => String(value || "").trim())
+            .filter(Boolean);
           const idCandidates = new Set(
-            [product.skcId, product.spuId, product.skuId, product.sku, product.extCode]
+            [...historyIdCandidates, product.sku, product.extCode]
               .map((value) => normalizeText(value))
               .filter(Boolean),
           );
@@ -1790,21 +1881,35 @@ export default function ProductList() {
                 primaryRangeLabel,
               } satisfies ProductFluxSiteData;
             })
-            .map((site: ProductFluxSiteData | null) => {
-              if (!site) return null;
-              const fallback = buildMallFallbackFluxSite(
-                mallFallbackSources.find((item) => item.siteKey === site.siteKey)?.raw,
-                site.siteKey,
-                site.siteLabel,
+            .map((site: ProductFluxSiteData | null, index) => {
+              const { siteKey, siteLabel, parsed } = fluxSources[index];
+              const cacheFallback = buildFluxHistoryFallbackSite(
+                mergedFluxProductCache,
+                historyIdCandidates,
+                siteKey,
+                siteLabel,
+                site?.syncedAt || parsed?.syncedAt || "",
               );
-              return mergeFluxSiteData(site, fallback);
+              const mallFallback = buildMallFallbackFluxSite(
+                mallFallbackSources.find((item) => item.siteKey === siteKey)?.raw,
+                siteKey,
+                siteLabel,
+              );
+              return mergeFluxSiteData(mergeFluxSiteData(site, cacheFallback), mallFallback);
             })
             .filter((site): site is ProductFluxSiteData => Boolean(site));
 
           for (const fallbackSource of mallFallbackSources) {
             if (fluxSites.some((site) => site.siteKey === fallbackSource.siteKey)) continue;
+            const cacheFallback = buildFluxHistoryFallbackSite(
+              mergedFluxProductCache,
+              historyIdCandidates,
+              fallbackSource.siteKey,
+              fallbackSource.siteLabel,
+            );
             const fallback = buildMallFallbackFluxSite(fallbackSource.raw, fallbackSource.siteKey, fallbackSource.siteLabel);
-            if (fallback) fluxSites.push(fallback);
+            const mergedFallback = mergeFluxSiteData(cacheFallback, fallback);
+            if (mergedFallback) fluxSites.push(mergedFallback);
           }
 
           if (fluxSites.length > 0) {
@@ -1880,7 +1985,9 @@ export default function ProductList() {
   // 优先用合并后的真实 products 数（含 sales-only 条目），countSummary 仅作 fallback
   const totalProducts = Math.max(products.length, countSummary.totalCount || 0);
   const total7dSales = products.reduce((sum, product) => sum + (product.last7DaysSales || 0), 0);
+  void total7dSales; // 保留
   const totalSales = products.reduce((sum, product) => sum + (product.totalSales || 0), 0);
+  void totalSales; // 保留
   const onSaleCount = salesSummary?.addedToSiteSkcNum || products.filter((product) => product.hasSalesSnapshot).length;
   const latestSyncedAt = getLatestSyncedAt(products, diagnostics);
   const salesAttachedCount = products.filter((product) => product.hasSalesSnapshot).length;
@@ -1891,116 +1998,108 @@ export default function ProductList() {
     getCollectionDataIssue(diagnostics, "orders", "备货单数据", sourceState.orders),
   ].filter((issue): issue is string => Boolean(issue));
 
-  const numColor = (val: number, base = "#52c41a") => ({ color: val > 0 ? base : "#999", fontWeight: val > 0 ? 500 : 400 });
+  const numColor = (val: number, base = "#389e0d") => ({ color: val > 0 ? base : "#bfbfbf", fontWeight: val > 0 ? 600 : 400 });
 
-  // 扁平化数据：每个 SKU 一行 + 合计行，商品信息用 rowSpan 跨行
-  const flatRows = useMemo(() => {
-    const rows: any[] = [];
-    for (const product of filteredProducts) {
+  // 一个商品一行；每行内部把 SKU 列表作为 _skuRows 保留，供列渲染时纵向堆叠。
+  // 第一条永远是 "合计" 汇总行。
+  const tableRows = useMemo(() => {
+    return filteredProducts.map((product, productIdx) => {
       const skuList: any[] = Array.isArray(product.salesRaw?.skuQuantityDetailList)
         ? product.salesRaw.skuQuantityDetailList
         : [];
-      if (skuList.length > 1) {
-        // 多 SKU：每个 SKU 一行 + 合计行
-        const spanCount = skuList.length + 1; // +1 for 合计 row
-        skuList.forEach((sku: any, idx: number) => {
-          rows.push({
-            ...product,
-            _flatKey: `${product.skcId || product.goodsId || product.spuId}-sku-${idx}`,
-            _rowSpan: idx === 0 ? spanCount : 0,
-            _isTotal: false,
-            _skuId: sku.productSkuId,
-            _skuSpec: sku.className,
-            _skuExtCode: sku.skuExtCode,
-            _skuPrice: sku.supplierPrice != null ? (Number(sku.supplierPrice) / 100).toFixed(2) : null,
-            _skuTodaySales: sku.todaySaleVolume ?? 0,
-            _sku7dSales: sku.lastSevenDaysSaleVolume ?? 0,
-            _sku30dSales: sku.lastThirtyDaysSaleVolume ?? 0,
-            _skuLack: sku.lackQuantity ?? 0,
-            _skuAdvice: sku.adviceQuantity ?? 0,
-            _skuStock: sku.sellerWhStock ?? 0,
-            _skuOccupy: sku.inventoryNumInfo?.expectedOccupiedInventoryNum ?? 0,
-            _skuUnavail: sku.inventoryNumInfo?.unavailableWarehouseInventoryNum ?? 0,
-            _skuInTransit: sku.inventoryNumInfo?.waitReceiveNum ?? 0,
-          });
-        });
-        // 合计行
-        const tToday = skuList.reduce((s: number, k: any) => s + (k.todaySaleVolume || 0), 0);
-        const t7d = skuList.reduce((s: number, k: any) => s + (k.lastSevenDaysSaleVolume || 0), 0);
-        const t30d = skuList.reduce((s: number, k: any) => s + (k.lastThirtyDaysSaleVolume || 0), 0);
-        const tLack = skuList.reduce((s: number, k: any) => s + (k.lackQuantity || 0), 0);
-        const tAdvice = skuList.reduce((s: number, k: any) => s + (k.adviceQuantity || 0), 0);
-        const tStock = skuList.reduce((s: number, k: any) => s + (k.sellerWhStock || 0), 0);
-        const tOccupy = skuList.reduce((s: number, k: any) => s + (k.inventoryNumInfo?.expectedOccupiedInventoryNum || 0), 0);
-        const tUnavail = skuList.reduce((s: number, k: any) => s + (k.inventoryNumInfo?.unavailableWarehouseInventoryNum || 0), 0);
-        const tInTransit = skuList.reduce((s: number, k: any) => s + (k.inventoryNumInfo?.waitReceiveNum || 0), 0);
-        rows.push({
-          ...product,
-          _flatKey: `${product.skcId || product.goodsId || product.spuId}-total`,
-          _rowSpan: 0,
-          _isTotal: true,
-          _skuTodaySales: tToday,
-          _sku7dSales: t7d,
-          _sku30dSales: t30d,
-          _skuLack: tLack,
-          _skuAdvice: tAdvice,
-          _skuStock: tStock,
-          _skuOccupy: tOccupy,
-          _skuUnavail: tUnavail,
-          _skuInTransit: tInTransit,
-        });
-      } else if (skuList.length === 1) {
-        // 单 SKU：一行，带 SKU 信息
-        const sku = skuList[0];
-        rows.push({
-          ...product,
-          _flatKey: `${product.skcId || product.goodsId || product.spuId}-single`,
-          _rowSpan: 1,
-          _isTotal: false,
-          _skuId: sku.productSkuId,
-          _skuSpec: sku.className,
-          _skuExtCode: sku.skuExtCode,
-          _skuPrice: sku.supplierPrice != null ? (Number(sku.supplierPrice) / 100).toFixed(2) : null,
-          _skuTodaySales: sku.todaySaleVolume ?? 0,
-          _sku7dSales: sku.lastSevenDaysSaleVolume ?? 0,
-          _sku30dSales: sku.lastThirtyDaysSaleVolume ?? 0,
-          _skuLack: sku.lackQuantity ?? 0,
-          _skuAdvice: sku.adviceQuantity ?? 0,
-          _skuStock: sku.sellerWhStock ?? 0,
-          _skuOccupy: sku.inventoryNumInfo?.expectedOccupiedInventoryNum ?? 0,
-          _skuUnavail: sku.inventoryNumInfo?.unavailableWarehouseInventoryNum ?? 0,
-          _skuInTransit: sku.inventoryNumInfo?.waitReceiveNum ?? 0,
-        });
-      } else {
-        // 无 SKU 明细：使用商品级聚合数据
-        rows.push({
-          ...product,
-          _flatKey: `${product.skcId || product.goodsId || product.spuId}-no-sku`,
-          _rowSpan: 1,
-          _isTotal: false,
-          _skuTodaySales: product.todaySales || 0,
-          _sku7dSales: product.last7DaysSales || 0,
-          _sku30dSales: product.last30DaysSales || 0,
-          _skuLack: product.lackQuantity || 0,
-          _skuOccupy: product.occupyStock || 0,
-          _skuUnavail: product.unavailableStock || 0,
-          _skuInTransit: 0,
-        });
-      }
-    }
-    return rows;
-  }, [filteredProducts]);
+      const groupKey = product.skcId || product.goodsId || product.spuId || product.title || `p${productIdx}`;
 
-  // 商品级列的 onCell：用 rowSpan 合并
-  const productCellSpan = (record: any) => ({ rowSpan: record._rowSpan, style: { verticalAlign: "top" as const } });
-  const productCellSpanMiddle = (record: any) => ({ rowSpan: record._rowSpan, style: { verticalAlign: "middle" as const } });
+      const isSingle = skuList.length === 1;
+      const realSkus = skuList.length > 0
+        ? skuList.map((sku: any, idx: number) => {
+            const skuToday = Number(sku?.todaySaleVolume || 0);
+            const sku7d = Number(sku?.lastSevenDaysSaleVolume || 0);
+            const sku30d = Number(sku?.lastThirtyDaysSaleVolume || 0);
+            const skuStock = Number(sku?.sellerWhStock || 0);
+            const skuOccupy = Number(sku?.inventoryNumInfo?.expectedOccupiedInventoryNum || 0);
+            const skuUnavail = Number(sku?.inventoryNumInfo?.unavailableWarehouseInventoryNum || 0);
+            const skuInTransit = Number(sku?.inventoryNumInfo?.waitReceiveNum || 0);
+            const skuLack = Number(sku?.lackQuantity || 0);
+            const skuAdvice = Number(sku?.adviceQuantity || 0);
+            // 单 SKU 商品：若 SKU 自身无数据则用商品级兜底
+            const fb = (skuVal: number, prodVal: any) => (isSingle && !skuVal ? Number(prodVal || 0) : skuVal);
+            return {
+              _skuKey: `${groupKey}-sku-${sku?.productSkuId || idx}`,
+              skuId: sku?.productSkuId || "",
+              skuSpec: sku?.className || "",
+              skuExtCode: sku?.skuExtCode || "",
+              skuPrice: sku?.supplierPrice != null
+                ? (Number(sku.supplierPrice) / 100).toFixed(2)
+                : product.price,
+              today: fb(skuToday, product.todaySales),
+              d7: fb(sku7d, product.last7DaysSales),
+              d30: fb(sku30d, product.last30DaysSales),
+              stock: fb(skuStock, product.warehouseStock),
+              occupy: fb(skuOccupy, product.occupyStock),
+              unavail: fb(skuUnavail, product.unavailableStock),
+              inTransit: skuInTransit,
+              lack: fb(skuLack, product.lackQuantity),
+              advice: skuAdvice,
+            };
+          })
+        : [{
+            _skuKey: `${groupKey}-product`,
+            skuId: product.skuId || "",
+            skuSpec: product.skuName || "",
+            skuExtCode: product.extCode || "",
+            skuPrice: product.price,
+            today: Number(product.todaySales || 0),
+            d7: Number(product.last7DaysSales || 0),
+            d30: Number(product.last30DaysSales || 0),
+            stock: Number(product.warehouseStock || 0),
+            occupy: Number(product.occupyStock || 0),
+            unavail: Number(product.unavailableStock || 0),
+            inTransit: 0,
+            lack: Number(product.lackQuantity || 0),
+            advice: 0,
+          }];
+
+      // 汇总行：优先用 SKU 加总，若 SKU 里该字段全为 0 则回退到商品级总值
+      const sum = (pick: (s: any) => number) => realSkus.reduce((acc, s) => acc + (Number(pick(s)) || 0), 0);
+      const sumOrFallback = (pick: (s: any) => number, fallback: number) => {
+        const v = sum(pick);
+        return v > 0 ? v : Number(fallback || 0);
+      };
+      const totalRow = {
+        _skuKey: `${groupKey}-total`,
+        _isTotal: true,
+        skuId: "",
+        skuSpec: "合计",
+        skuExtCode: "",
+        skuPrice: "",
+        today: sumOrFallback((s) => s.today, product.todaySales || 0),
+        d7: sumOrFallback((s) => s.d7, product.last7DaysSales || 0),
+        d30: sumOrFallback((s) => s.d30, product.last30DaysSales || 0),
+        stock: sumOrFallback((s) => s.stock, product.warehouseStock || 0),
+        occupy: sumOrFallback((s) => s.occupy, product.occupyStock || 0),
+        unavail: sumOrFallback((s) => s.unavail, product.unavailableStock || 0),
+        inTransit: sum((s) => s.inTransit),
+        lack: sumOrFallback((s) => s.lack, product.lackQuantity || 0),
+        advice: sum((s) => s.advice),
+      };
+
+      const skuRows = [...realSkus, totalRow];
+
+      return {
+        ...product,
+        _flatKey: groupKey,
+        _skuRows: skuRows,
+        _skuCount: skuRows.length,
+      };
+    });
+  }, [filteredProducts]);
 
   const columns: ColumnsType<ProductItem> = [
     {
       title: "商品图片",
       key: "imageUrl",
       width: 96,
-      onCell: productCellSpan,
+      fixed: "left",
       render: (_: any, record: ProductItem) => {
         const url = normalizeImageUrl(record.imageUrl);
         return url ? (
@@ -2018,7 +2117,6 @@ export default function ProductList() {
       key: "title",
       width: 420,
       fixed: "left",
-      onCell: productCellSpan,
       render: (text: string, record: any) => {
         const raw = record.salesRaw || {};
         const y = record.yundu;
@@ -2042,17 +2140,17 @@ export default function ProductList() {
                 {text || "-"}
               </div>
             </Tooltip>
-            {getPrimaryCategory(record) && <div style={{ color: "#999" }}>{getPrimaryCategory(record)}</div>}
+            {getPrimaryCategory(record) && <div style={{ color: "#8c8c8c" }}>{getPrimaryCategory(record)}</div>}
             {(score != null || comment != null) && (
               <div style={{ color: "#faad14" }}>
-                {score != null ? <span>★ {score}分</span> : <span style={{ color: "#999" }}>暂无评分</span>}
-                {comment != null && <span style={{ color: "#999" }}> · 评论 {comment}</span>}
+                {score != null ? <span>★ {score}分</span> : <span style={{ color: "#8c8c8c" }}>暂无评分</span>}
+                {comment != null && <span style={{ color: "#8c8c8c" }}> · 评论 {comment}</span>}
               </div>
             )}
-            {record.skcId && <div style={{ color: "#999" }}>SKC：<span style={{ fontFamily: "monospace" }}>{record.skcId}</span></div>}
-            {productDays != null && productDays !== "" && <div style={{ color: "#999" }}>加入站点时长：{productDays}天</div>}
-            {record.spuId && <div style={{ color: "#999" }}>SPU：<span style={{ fontFamily: "monospace" }}>{record.spuId}</span></div>}
-            {seasonTag && <div style={{ color: "#999" }}>节日/季节标签：{seasonTag}</div>}
+            {record.skcId && <div style={{ color: "#8c8c8c" }}>SKC：<span style={{ fontFamily: "monospace" }}>{record.skcId}</span></div>}
+            {productDays != null && productDays !== "" && <div style={{ color: "#8c8c8c" }}>加入站点时长：{productDays}天</div>}
+            {record.spuId && <div style={{ color: "#8c8c8c" }}>SPU：<span style={{ fontFamily: "monospace" }}>{record.spuId}</span></div>}
+            {seasonTag && <div style={{ color: "#8c8c8c" }}>节日/季节标签：{seasonTag}</div>}
 
             {/* 状态标签行 */}
             <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 3 }}>
@@ -2081,7 +2179,7 @@ export default function ProductList() {
                   <div><span style={{ color: "#888" }}>销售：</span><span style={{ color: "#1677ff" }}>{sites.slice(0, 3).map(siteName).join("，")}</span>{sites.length > 3 && <Tag color="blue" style={{ fontSize: 12, marginLeft: 4 }}>共 {sites.length} 站</Tag>}</div>
                 )}
                 {offSites.length > 0 && (
-                  <div><span style={{ color: "#888" }}>下架：</span><span style={{ color: "#999" }}>{offSites.slice(0, 3).map(siteName).join("，")}{offSites.length > 3 ? `…` : ""}</span></div>
+                  <div><span style={{ color: "#888" }}>下架：</span><span style={{ color: "#8c8c8c" }}>{offSites.slice(0, 3).map(siteName).join("，")}{offSites.length > 3 ? `…` : ""}</span></div>
                 )}
                 {gp && (
                   <div style={{ textAlign: "right" }}>
@@ -2095,153 +2193,224 @@ export default function ProductList() {
       },
     },
     {
-      title: "SKU/规格",
-      key: "skuInfo",
+      title: "SKU",
+      key: "skuId",
       width: 150,
-      render: (_: any, record: any) => {
-        if (record._isTotal) return <span style={{ fontWeight: 600, color: "#333" }}>合计</span>;
-        if (record._skuId) {
-          return (
-            <div style={{ fontSize: 14, lineHeight: 1.55 }}>
-              <div style={{ fontFamily: "monospace" }}>{record._skuId}</div>
-              {record._skuSpec && <div style={{ color: "#666" }}>{record._skuSpec}</div>}
-              {record._skuExtCode && <div style={{ color: "#999" }}>货号：{record._skuExtCode}</div>}
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey}>
+              {s._isTotal
+                ? <span style={{ fontSize: 14, fontWeight: 700, color: "#1a1a2e" }}>合计</span>
+                : s.skuId
+                  ? <span style={{ fontSize: 13, fontFamily: "monospace", color: "#262626" }}>{s.skuId}</span>
+                  : <span style={{ color: "#bfbfbf" }}>-</span>}
             </div>
-          );
-        }
-        return (
-          <div style={{ fontSize: 14, lineHeight: 1.55 }}>
-            <div style={{ fontFamily: "monospace" }}>{record.skuId || "-"}</div>
-            {record.skuName && <div style={{ color: "#666" }}>{record.skuName}</div>}
-            {record.extCode && <div style={{ color: "#999" }}>货号：{record.extCode}</div>}
-          </div>
-        );
-      },
+          ))}
+        </div>
+      ),
+    },
+    {
+      title: "规格",
+      key: "skuSpec",
+      width: 140,
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey}>
+              {s._isTotal
+                ? <span style={{ color: "#bfbfbf" }}>—</span>
+                : s.skuSpec
+                  ? <span style={{ fontSize: 14, color: "#262626" }}>{s.skuSpec}</span>
+                  : <span style={{ color: "#bfbfbf" }}>-</span>}
+            </div>
+          ))}
+        </div>
+      ),
+    },
+    {
+      title: "货号",
+      key: "skuExtCode",
+      width: 140,
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey}>
+              {s._isTotal
+                ? <span style={{ color: "#bfbfbf" }}>—</span>
+                : s.skuExtCode
+                  ? <span style={{ fontSize: 13, color: "#262626", fontFamily: "monospace" }}>{s.skuExtCode}</span>
+                  : <span style={{ color: "#bfbfbf" }}>-</span>}
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "申报价格",
       key: "price",
       width: 110,
-      align: "right",
-      render: (_: any, record: any) => {
-        if (record._isTotal) return <span style={{ color: "#999" }}>-</span>;
-        const p = record._skuPrice ?? record.price;
-        return <span style={{ fontSize: 14, color: "#fa541c", fontWeight: 500 }}>¥{formatTextValue(p)}</span>;
-      },
+      align: "center",
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey} style={{ justifyContent: "center" }}>
+              {s._isTotal
+                ? <span style={{ color: "#bfbfbf" }}>—</span>
+                : <span style={{ fontSize: 15, color: "#d4380d", fontWeight: 600 }}>¥{formatTextValue(s.skuPrice)}</span>}
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "今日销量",
       key: "todaySales",
       width: 95,
       align: "right",
-      sorter: (a: any, b: any) => (a._skuTodaySales || 0) - (b._skuTodaySales || 0),
-      render: (_: any, r: any) => {
-        const v = r._skuTodaySales || 0;
-        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: "#fa541c" } : numColor(v)) }}>{v}</span>;
-      },
+      sorter: (a: any, b: any) => (a.todaySales || 0) - (b.todaySales || 0),
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey} style={{ justifyContent: "center" }}>
+              <span style={{ fontSize: 15, ...numColor(s.today) }}>{s.today}</span>
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "7天销量",
       key: "last7DaysSales",
       width: 95,
       align: "right",
-      sorter: (a: any, b: any) => (a._sku7dSales || 0) - (b._sku7dSales || 0),
-      render: (_: any, r: any) => {
-        const v = r._sku7dSales || 0;
-        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: "#fa541c" } : numColor(v)) }}>{v}</span>;
-      },
+      sorter: (a: any, b: any) => (a.last7DaysSales || 0) - (b.last7DaysSales || 0),
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey} style={{ justifyContent: "center" }}>
+              <span style={{ fontSize: 15, ...numColor(s.d7) }}>{s.d7}</span>
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "30天销量",
       key: "last30DaysSales",
       width: 100,
       align: "right",
-      sorter: (a: any, b: any) => (a._sku30dSales || 0) - (b._sku30dSales || 0),
+      sorter: (a: any, b: any) => (a.last30DaysSales || 0) - (b.last30DaysSales || 0),
       defaultSortOrder: "descend",
-      render: (_: any, r: any) => {
-        const v = r._sku30dSales || 0;
-        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: "#fa541c" } : numColor(v)) }}>{v}</span>;
-      },
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey} style={{ justifyContent: "center" }}>
+              <span style={{ fontSize: 15, ...numColor(s.d30) }}>{s.d30}</span>
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "总销量",
       dataIndex: "totalSales",
       key: "totalSales",
-      width: 95,
-      align: "right",
-      sorter: (a, b) => (a.totalSales || 0) - (b.totalSales || 0),
-      render: (val: number, record: any) => {
-        // 商品级数据,只在"一行代表整个商品"的行展示:
-        //   - 多 SKU 的合计行 (_isTotal)
-        //   - 单 SKU / 无 SKU 明细的普通行 (_rowSpan === 1 && !_isTotal)
-        // SKU 明细行留空,避免 rowSpan 混在中列触发布局错位
-        const isProductRow = record._isTotal || record._rowSpan === 1;
-        if (!isProductRow) return null;
-        return <span style={{ fontSize: 14, ...numColor(val || 0, "#1890ff") }}>{val || 0}</span>;
-      },
+      width: 110,
+      align: "center",
+      sorter: (a: any, b: any) => (a.totalSales || 0) - (b.totalSales || 0),
+      render: (val: number) => <span style={{ fontSize: 18, fontWeight: 700, color: (val || 0) > 0 ? "#1677ff" : "#bfbfbf" }}>{val || 0}</span>,
     },
     {
       title: "仓内可用库存",
       key: "warehouseStock",
-      width: 120,
+      width: 140,
       align: "right",
-      sorter: (a, b) => (a.warehouseStock || 0) - (b.warehouseStock || 0),
-      render: (_: any, r: any) => {
-        const isProductRow = r._isTotal || r._rowSpan === 1;
-        if (!isProductRow) return null;
-        const v = r.warehouseStock || 0;
-        return <span style={{ fontSize: 14, color: v > 0 ? "#1890ff" : "#ff4d4f", fontWeight: 500 }}>{v}</span>;
-      },
+      sorter: (a: any, b: any) => (a.warehouseStock || 0) - (b.warehouseStock || 0),
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey} style={{ justifyContent: "center" }}>
+              <span style={{ fontSize: 15, color: s.stock > 0 ? "#1677ff" : "#ff4d4f", fontWeight: 600 }}>{s.stock}</span>
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "仓内预占用库存",
       key: "occupy",
-      width: 130,
-      align: "right",
-      render: (_: any, r: any) => {
-        const v = r._skuOccupy || 0;
-        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: v > 0 ? "#13c2c2" : "#999" } : { color: v > 0 ? "#13c2c2" : "#999" }) }}>{v}</span>;
-      },
+      width: 150,
+      align: "center",
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey} style={{ justifyContent: "center" }}>
+              <span style={{ fontSize: 15, color: s.occupy > 0 ? "#08979c" : "#bfbfbf", fontWeight: s.occupy > 0 ? 600 : 400 }}>{s.occupy}</span>
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "仓内暂不可用库存",
       key: "unavail",
-      width: 140,
-      align: "right",
-      render: (_: any, r: any) => {
-        const v = r._skuUnavail || 0;
-        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: v > 0 ? "#fa8c16" : "#999" } : { color: v > 0 ? "#fa8c16" : "#999" }) }}>{v}</span>;
-      },
+      width: 160,
+      align: "center",
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey} style={{ justifyContent: "center" }}>
+              <span style={{ fontSize: 15, color: s.unavail > 0 ? "#d46b08" : "#bfbfbf", fontWeight: s.unavail > 0 ? 600 : 400 }}>{s.unavail}</span>
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "已发货库存",
       key: "inTransit",
-      width: 110,
-      align: "right",
-      render: (_: any, r: any) => {
-        const v = r._skuInTransit || 0;
-        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: v > 0 ? "#1890ff" : "#999" } : { color: v > 0 ? "#1890ff" : "#999" }) }}>{v}</span>;
-      },
+      width: 130,
+      align: "center",
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey} style={{ justifyContent: "center" }}>
+              <span style={{ fontSize: 15, color: s.inTransit > 0 ? "#1677ff" : "#bfbfbf", fontWeight: s.inTransit > 0 ? 600 : 400 }}>{s.inTransit}</span>
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "缺货",
       key: "lackQuantity",
-      width: 85,
-      align: "right",
-      render: (_: any, r: any) => {
-        const v = r._skuLack || 0;
-        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: v > 0 ? "#ff4d4f" : "#999" } : { color: v > 0 ? "#ff4d4f" : "#999", fontWeight: v > 0 ? 500 : 400 }) }}>{v}</span>;
-      },
+      width: 100,
+      align: "center",
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey} style={{ justifyContent: "center" }}>
+              <span style={{ fontSize: 15, color: s.lack > 0 ? "#cf1322" : "#bfbfbf", fontWeight: s.lack > 0 ? 700 : 400 }}>{s.lack}</span>
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "建议备货",
       key: "advice",
-      width: 100,
-      align: "right",
-      render: (_: any, r: any) => {
-        const v = r._skuAdvice || 0;
-        return <span style={{ fontSize: 14, ...(r._isTotal ? { fontWeight: 600, color: v > 0 ? "#fa541c" : "#999" } : { color: v > 0 ? "#fa541c" : "#999", fontWeight: v > 0 ? 500 : 400 }) }}>{v || "-"}</span>;
-      },
+      width: 120,
+      align: "center",
+      render: (_: any, record: any) => (
+        <div className="sku-stack">
+          {(record._skuRows || []).map((s: any) => (
+            <div className={`sku-cell${s._isTotal ? " sku-cell-total" : ""}`} key={s._skuKey} style={{ justifyContent: "center" }}>
+              <span style={{ fontSize: 15, color: s.advice > 0 ? "#d4380d" : "#bfbfbf", fontWeight: s.advice > 0 ? 700 : 400 }}>{s.advice || "-"}</span>
+            </div>
+          ))}
+        </div>
+      ),
     },
     {
       title: "操作",
@@ -2249,15 +2418,12 @@ export default function ProductList() {
       width: 110,
       fixed: "right",
       render: (_: any, record: any) => {
-        // 只在"一行代表整个商品"的行渲染按钮,避免 fixed:right + rowSpan 破坏表格布局
-        const isProductRow = record._isTotal || record._rowSpan === 1;
-        if (!isProductRow) return null;
         return (
           <Space direction="vertical" size={2}>
             <Button
               type="link"
               size="small"
-              style={{ padding: 0, height: "auto", fontWeight: 600, fontSize: 14 }}
+              style={{ padding: 0, height: "auto", fontWeight: 600, fontSize: 15 }}
               onClick={(event) => {
                 event.stopPropagation();
                 openCompetitorAnalysis(record);
@@ -2268,7 +2434,7 @@ export default function ProductList() {
             <Button
               type="link"
               size="small"
-              style={{ padding: 0, height: "auto", fontWeight: 600, fontSize: 14 }}
+              style={{ padding: 0, height: "auto", fontWeight: 600, fontSize: 15 }}
               onClick={(event) => {
                 event.stopPropagation();
                 setSelectedProduct(record);
@@ -2280,7 +2446,7 @@ export default function ProductList() {
             <Button
               type="link"
               size="small"
-              style={{ padding: 0, height: "auto", fontWeight: 600, fontSize: 14 }}
+              style={{ padding: 0, height: "auto", fontWeight: 600, fontSize: 15 }}
               onClick={(event) => {
                 event.stopPropagation();
                 setSelectedProduct(record);
@@ -2302,7 +2468,7 @@ export default function ProductList() {
   // 列分组定义
   const columnGroups: Array<{ label: string; keys: string[] }> = [
     { label: "商品信息", keys: ["imageUrl", "title"] },
-    { label: "SKU信息", keys: ["skuInfo"] },
+    { label: "SKU信息", keys: ["skuId", "skuSpec", "skuExtCode"] },
     { label: "申报价格", keys: ["price"] },
     { label: "销售数据", keys: ["todaySales", "last7DaysSales", "last30DaysSales", "totalSales"] },
     { label: "缺货数量", keys: ["lackQuantity"] },
@@ -2314,8 +2480,32 @@ export default function ProductList() {
   const [columnConfig, setColumnConfig] = useState<{ order: string[]; hidden: string[] }>(() => {
     try {
       const saved = localStorage.getItem(COLUMN_STORAGE_KEY);
-      if (saved) return JSON.parse(saved);
-    } catch {}
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        // 迁移：旧版 skuInfo → 新版 skuId/skuSpec/skuExtCode
+        const migrate = (arr: string[] = []) => {
+          const out: string[] = [];
+          for (const k of arr) {
+            if (k === "skuInfo") {
+              out.push("skuId", "skuSpec", "skuExtCode");
+            } else {
+              out.push(k);
+            }
+          }
+          return out;
+        };
+        if (Array.isArray(parsed.order) && parsed.order.includes("skuInfo")) {
+          parsed.order = migrate(parsed.order);
+        }
+        if (Array.isArray(parsed.hidden) && parsed.hidden.includes("skuInfo")) {
+          parsed.hidden = migrate(parsed.hidden);
+        }
+        return parsed;
+      }
+    } catch (error) {
+      // localStorage 列配置解析失败时回落到默认值
+      console.warn("[ProductList] parse column settings failed", error);
+    }
     return { order: allColumnKeys, hidden: [] };
   });
   const [colSettingsOpen, setColSettingsOpen] = useState(false);
@@ -2371,6 +2561,7 @@ export default function ProductList() {
       return arr;
     });
   };
+  void tempMove; // 保留
 
   const confirmColSettings = () => {
     setColumnConfig({ order: tempOrder, hidden: tempHidden });
@@ -2443,6 +2634,7 @@ export default function ProductList() {
     const currentFluxItems = selectedFluxRange
       ? activeFluxSite?.itemsByRange?.[selectedFluxRange] || activeFluxSite?.items || []
       : activeFluxSite?.items || [];
+    void currentFluxItems; // 保留
     const isGpFallback = currentFluxSummary?.dataOrigin === "gp";
     const detailVisitorValue = currentFluxSummary?.detailVisitorNum || currentFluxSummary?.detailVisitNum || 0;
     const rangeComparisonData = activeFluxSite
@@ -2515,6 +2707,7 @@ export default function ProductList() {
       曝光点击率: item.曝光点击率,
       点击支付转化率: item.点击支付转化率,
     }));
+    void efficiencyComparisonData; // 保留
 
     // 日级流量趋势数据（优先从商品级 cache 读取，否则从 flux_history 日快照构建）
     let dailyTrendData: any[] = [];
@@ -2669,6 +2862,7 @@ export default function ProductList() {
           { label: "支付买家", value: currentFluxSummary.buyerNum },
         ]
       : [];
+    void funnelSteps; // 保留
 
     // 工作台风格的 30 天日趋势数据 — 仅用于"曝光与转化趋势" + "来源结构" 两个图表
     const fluxTrendChartData = dailyTrendData.map((d: any) => {
@@ -2683,6 +2877,7 @@ export default function ProductList() {
         clickPayRate: click > 0 ? Number(((buyers / click) * 100).toFixed(1)) : 0,
       };
     });
+    void fluxTrendChartData; // 保留
     const fluxSourceTimelineData = dailyTrendData.map((d: any) => {
       const expose = toNumberValue(d.曝光);
       const search = toNumberValue(d.搜索曝光);
@@ -2694,6 +2889,7 @@ export default function ProductList() {
         other: Math.max(expose - search - recommend, 0),
       };
     });
+    void fluxSourceTimelineData; // 保留
 
     const diagnosis = (() => {
       if (!currentFluxSummary) {
@@ -2731,6 +2927,7 @@ export default function ProductList() {
         desc: "可以继续放大有效站点和来源，把点击和支付节奏稳定住。",
       };
     })();
+    void diagnosis; // 保留
     const executionSignals = currentFluxSummary
       ? [
           { title: "详情承接率", value: formatTrafficPercent(toPercentValue(undefined, detailVisitorValue, currentFluxSummary.clickNum)), helper: "点击后进入详情页的比例", color: PRODUCT_TRAFFIC_COLORS.detail },
@@ -2739,6 +2936,7 @@ export default function ProductList() {
           { title: "订单买家比", value: formatTrafficPercent(toPercentValue(undefined, currentFluxSummary.payOrderNum, currentFluxSummary.buyerNum)), helper: "每个买家贡献的支付订单数", color: PRODUCT_TRAFFIC_COLORS.order },
         ]
       : [];
+    void executionSignals; // 保留
     const secondaryTrafficCards = currentFluxSummary
       ? [
           { label: "收藏人数", value: formatTrafficNumber(currentFluxSummary.collectUserNum), helper: "收藏沉淀", accent: PRODUCT_TRAFFIC_COLORS.collect },
@@ -2751,6 +2949,7 @@ export default function ProductList() {
           { label: "趋势支付订单", value: formatTrafficNumber(currentFluxSummary.trendPayOrderNum), helper: "趋势成交", accent: "#0f766e" },
         ]
       : [];
+    void secondaryTrafficCards; // 保留
     const sourceContributionData = currentFluxSummary
       ? sourceBreakdownData.map((item) => ({
           ...item,
@@ -2791,6 +2990,7 @@ export default function ProductList() {
         : trafficHealthScore >= 60
           ? { text: "稳定", color: "#f59e0b", tag: "主链路已经成型，继续补效率" }
           : { text: "待优化", color: "#e11d48", tag: "先解决点击或转化短板" };
+    void trafficHealthTone; // 保留
     const strongestSource = sourceContributionData
       .slice()
       .sort((left, right) => (right.支付件数 || 0) - (left.支付件数 || 0))[0];
@@ -2826,6 +3026,7 @@ export default function ProductList() {
           },
         ]
       : [];
+    void opportunityHighlights; // 保留
     const actionChecklist = currentFluxSummary
       ? [
           {
@@ -2853,6 +3054,7 @@ export default function ProductList() {
           },
         ]
       : [];
+    void actionChecklist; // 保留
 
     const renderMetric = (label: string, value: any, accent?: boolean) => (
       <div style={{ padding: "8px 12px", background: "var(--color-bg-1, #fafafa)", borderRadius: 8 }}>
@@ -2862,6 +3064,7 @@ export default function ProductList() {
         </div>
       </div>
     );
+    void renderMetric; // 保留
 
     const renderTrafficCard = (label: string, value: React.ReactNode, helper?: string, accent?: string) => (
       <Card
@@ -2876,6 +3079,7 @@ export default function ProductList() {
         </div>
       </Card>
     );
+    void renderTrafficCard; // 保留
 
     const overviewTab = (
       <div style={{ display: "grid", gap: 16 }}>
@@ -2912,12 +3116,23 @@ export default function ProductList() {
 
     const fluxTab = activeFluxSite && currentFluxSummary ? (
       <div>
+        <ProductFluxOperatorCard
+          productHistoryCache={productHistoryCache}
+          productIds={[record.goodsId, record.skcId, record.spuId, record.skuId]}
+          activeSiteLabel={activeFluxSite?.siteLabel}
+        />
         <TrafficDriverPanel
-          sites={buildTrafficDriverSitesFromProduct(fluxSites, siteTrendListBySite)}
+          sites={buildTrafficDriverSitesFromProduct(fluxSites, siteTrendListBySite, productDailyTrendBySite)}
           activeSiteKey={activeFluxSiteKey as TrafficSiteKey}
           onActiveSiteKeyChange={(key) => setActiveFluxSiteKey(key)}
           rangeLabel={selectedFluxRange}
           onRangeLabelChange={(label) => setActiveFluxRangeLabel(label)}
+          productContext={{
+            title: selectedProduct?.title,
+            category: selectedProduct?.category || selectedProduct?.categories,
+            imageUrl: selectedProduct?.imageUrl,
+            skcId: selectedProduct?.skcId,
+          }}
         />
       </div>
     ) : (
@@ -2966,6 +3181,7 @@ export default function ProductList() {
     ) : (
       <Alert type="info" showIcon message="暂无 SKU 明细" />
     );
+    void skuTab; // 保留
 
     // ----- 全部字段 Tab -----
     const groups: { title: string; fields: Array<{ label: string; value: any; accent?: boolean }> }[] = [
@@ -3084,6 +3300,7 @@ export default function ProductList() {
         })}
       </div>
     );
+    void allFieldsTab; // 保留
 
     // ----- 标签 Tab -----
     const labelGroups: { title: string; items: any }[] = [
@@ -3114,6 +3331,7 @@ export default function ProductList() {
     ) : (
       <Alert type="info" showIcon message="暂无标签数据" />
     );
+    void labelTab; // 保留
 
     return (
       <Drawer
@@ -3135,17 +3353,7 @@ export default function ProductList() {
         )}
         destroyOnClose
       >
-        <Tabs
-          activeKey={drawerTab}
-          onChange={setDrawerTab}
-          items={[
-            { key: "overview", label: "概览", children: overviewTab },
-            { key: "flux", label: "流量驾驶舱", children: fluxTab },
-            { key: "sku", label: "SKU 明细", children: skuTab },
-            { key: "fields", label: "全部字段", children: allFieldsTab },
-            { key: "labels", label: "标签", children: labelTab },
-          ]}
-        />
+        {drawerTab === "flux" ? fluxTab : overviewTab}
       </Drawer>
     );
   };
@@ -3283,11 +3491,11 @@ export default function ProductList() {
                 刷新数据
               </Button>
               <Button icon={<SettingOutlined />} onClick={openColSettings}>列设置</Button>
-              <span style={{ color: "#999", fontSize: 13 }}>
+              <span style={{ color: "#8c8c8c", fontSize: 13 }}>
                 共 {products.length} 条 · 已接销售 {salesAttachedCount}
               </span>
               {filteredProducts.length !== products.length && (
-                <span style={{ color: "#999", fontSize: 13 }}>
+                <span style={{ color: "#8c8c8c", fontSize: 13 }}>
                   显示 {filteredProducts.length} / {products.length}
                 </span>
               )}
@@ -3308,32 +3516,73 @@ export default function ProductList() {
                 )}
               />
             ) : (
+              <>
+              <style>{`
+                /* 一个商品一行；纯白底 */
+                .product-list-table .ant-table-tbody > tr > td {
+                  background: #ffffff;
+                  padding: 0 !important;
+                  border-bottom: 2px solid #e4e9f0 !important;
+                }
+                /* 含 sku-stack 的 td：高度 1px 触发 "子元素 100% 撑满真实行高" 技巧 */
+                .product-list-table .ant-table-tbody > tr > td:has(.sku-stack) {
+                  vertical-align: top;
+                  height: 1px;
+                }
+                /* 不含 sku-stack 的 td（图片/标题/总销量/操作）：垂直居中 + 正常 padding */
+                .product-list-table .ant-table-tbody > tr > td:not(:has(.sku-stack)) {
+                  padding: 12px 8px !important;
+                  vertical-align: middle;
+                }
+                /* SKU 堆叠容器：height:100% 在父 td height:1px 的 hack 下会解析为真实行高 */
+                .sku-stack {
+                  display: flex;
+                  flex-direction: column;
+                  width: 100%;
+                  height: 100%;
+                }
+                .sku-cell {
+                  flex: 1 1 auto;
+                  padding: 12px 10px;
+                  min-height: 54px;
+                  display: flex;
+                  align-items: center;
+                  border-bottom: 1px dashed #e8e8e8;
+                  color: #262626;
+                }
+                .sku-cell:last-child { border-bottom: none; }
+                /* 合计行样式：固定高度（不拉伸），浅灰底、加粗、顶边实线 */
+                .sku-cell-total {
+                  flex: 0 0 auto !important;
+                  background: #fafbfc;
+                  border-top: 1px solid #e4e9f0 !important;
+                  border-bottom: none !important;
+                  font-weight: 600;
+                  min-height: 40px;
+                }
+                .sku-cell-total span { font-weight: 600 !important; }
+                /* 行悬停淡蓝 */
+                .product-list-table .ant-table-tbody > tr:hover > td { background: #f5faff !important; }
+                .product-list-table .ant-table-tbody > tr:hover .sku-cell-total { background: #e6f4ff !important; }
+              `}</style>
               <Table
                 className="product-list-table"
                 rowKey={(record: any, index) => record._flatKey || `row-${index}`}
-                dataSource={flatRows}
+                dataSource={tableRows}
                 columns={configuredColumns as any}
                 size="small"
                 loading={loading}
-                onRow={(record: any) => ({
-                  style: {
-                    ...(record._isTotal ? { background: "#fff7e6" } : { cursor: "pointer" }),
-                  },
-                  onClick: () => {
-                    if (record?._isTotal) return;
-                    setSelectedProduct(record);
-                    setDrawerTab("overview");
-                  },
-                })}
+                rowClassName={() => "product-row"}
                 pagination={{
                   pageSize: 50,
                   showSizeChanger: true,
                   pageSizeOptions: [30, 50, 100, 200],
-                  showTotal: (total) => `共 ${total} 行（${filteredProducts.length} 个商品）`,
+                  showTotal: (total) => `共 ${total} 个商品`,
                 }}
-                scroll={{ x: 2100 }}
+                scroll={{ x: 2300 }}
                 locale={{ emptyText: "暂无商品数据" }}
               />
+              </>
             )}
           </div>
 
@@ -3353,7 +3602,7 @@ export default function ProductList() {
               <Button type="link" size="small" onClick={() => setColSettingsOpen(false)} style={{ fontSize: 18, padding: 0 }}>✕</Button>
             </div>
             <div style={{ padding: "8px 20px", borderBottom: "1px solid #f0f0f0", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <span style={{ color: "#999", fontSize: 13 }}>请勾选需要显示的字段，可拖换调整顺序</span>
+              <span style={{ color: "#8c8c8c", fontSize: 13 }}>请勾选需要显示的字段，可拖换调整顺序</span>
               <Button type="link" size="small" onClick={resetColSettings}>重置</Button>
             </div>
             <div style={{ padding: "8px 20px", borderBottom: "1px solid #f0f0f0", display: "flex", alignItems: "center", gap: 8 }}>
@@ -3366,7 +3615,7 @@ export default function ProductList() {
                 }}
               />
               <span style={{ fontWeight: 500 }}>全选</span>
-              <span style={{ color: "#999", marginLeft: "auto", fontSize: 13 }}>{visibleCount}/{allColumnKeys.length}</span>
+              <span style={{ color: "#8c8c8c", marginLeft: "auto", fontSize: 13 }}>{visibleCount}/{allColumnKeys.length}</span>
             </div>
             <div style={{ flex: 1, overflow: "auto", padding: "0 0 80px 0" }}>
               {columnGroups.map((group) => {
