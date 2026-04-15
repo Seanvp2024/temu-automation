@@ -102,6 +102,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
     getYunqiCredentials: () => ipcRenderer.invoke("competitor:get-yunqi-credentials"),
     deleteYunqiCredentials: () => ipcRenderer.invoke("competitor:delete-yunqi-credentials"),
     yunqiAutoLogin: () => ipcRenderer.invoke("competitor:yunqi-auto-login"),
+    visionCompare: (payload) => ipcRenderer.invoke("competitor:vision-compare", payload),
   },
 
   yunqiDb: {

@@ -9,6 +9,7 @@ import {
   Image,
   Input,
   List,
+  Modal,
   Row,
   Select,
   Space,
@@ -26,6 +27,7 @@ import {
   LinkOutlined,
   PlusOutlined,
   ReloadOutlined,
+  RobotOutlined,
   SearchOutlined,
 } from "@ant-design/icons";
 import {
@@ -2483,6 +2485,60 @@ export default function CompetitorProductWorkbench({
       referenceTags: diagnosisReferenceTags,
     });
   }, [diagnosisReferenceTags, marketInsight, selectedProductMeta?.imageUrl, selectedYunqiDisplay?.hasVideo, selectedYunqiDisplay?.imageUrl]);
+
+  // AI 视觉对比：主图级别的 Gemini 分析
+  const [visionModalOpen, setVisionModalOpen] = useState(false);
+  const [visionLoading, setVisionLoading] = useState(false);
+  const [visionResult, setVisionResult] = useState<Awaited<ReturnType<NonNullable<typeof window.electronAPI>["competitor"]["visionCompare"]>> | null>(null);
+  const [visionError, setVisionError] = useState<string | null>(null);
+
+  const runVisionCompare = useCallback(async () => {
+    const myImageUrl = firstTextValue(selectedYunqiDisplay?.imageUrl, selectedProductMeta?.imageUrl);
+    const competitorImageEntries = selectedSampleRows
+      .slice(0, 3)
+      .map((row) => {
+        const latest = row.latest as any;
+        const url = firstTextValue(latest?.imageUrl, latest?.imageUrls?.[0]);
+        if (!url) return null;
+        return {
+          url,
+          title: latest?.titleZh || latest?.title || row.title || "竞品",
+          priceText: latest?.priceText || "",
+          monthlySales: toSafeNumber(latest?.monthlySales),
+        };
+      })
+      .filter(Boolean) as Array<{ url: string; title: string; priceText: string; monthlySales: number }>;
+
+    if (!myImageUrl && competitorImageEntries.length === 0) {
+      message.warning("没有可分析的图片：请先关联我方主图或选择有主图的竞品样本");
+      return;
+    }
+
+    setVisionModalOpen(true);
+    setVisionLoading(true);
+    setVisionError(null);
+    setVisionResult(null);
+
+    try {
+      const result = await window.electronAPI?.competitor?.visionCompare({
+        myImage: myImageUrl ? { url: myImageUrl, title: selectedYunqiDisplay?.title || selectedProduct?.title || "我的主图" } : null,
+        competitorImages: competitorImageEntries,
+        context: {
+          keyword: results?.keyword || keyword.trim(),
+          primaryNeed: marketInsight?.primaryNeed,
+          videoRate: marketInsight?.videoRate,
+          category: selectedProductMeta?.category || selectedProduct?.category || "",
+        },
+      });
+      if (!result) throw new Error("AI 返回为空");
+      setVisionResult(result);
+    } catch (error) {
+      setVisionError(stripWorkerErrorCode(getErrorMessage(error)));
+    } finally {
+      setVisionLoading(false);
+    }
+  }, [keyword, marketInsight, results?.keyword, selectedProduct, selectedProductMeta, selectedSampleRows, selectedYunqiDisplay]);
+
   const productDataCompareSections = useMemo(() => {
     if (!selectedProduct || !analysis) return [];
 
@@ -3868,9 +3924,21 @@ export default function CompetitorProductWorkbench({
               <Col xs={24} xl={12}>
                 <Card size="small" style={{ borderRadius: 16, height: "100%" }}>
                   <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-                      <Text strong>主图诊断</Text>
-                      <Tag color={imageDiagnosis.statusColor}>{imageDiagnosis.status}</Tag>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                      <Space size={8}>
+                        <Text strong>主图诊断</Text>
+                        <Tag color={imageDiagnosis.statusColor}>{imageDiagnosis.status}</Tag>
+                      </Space>
+                      <Button
+                        size="small"
+                        type="primary"
+                        ghost
+                        icon={<RobotOutlined />}
+                        onClick={runVisionCompare}
+                        loading={visionLoading}
+                      >
+                        AI 视觉对比
+                      </Button>
                     </div>
 
                     <Paragraph style={{ marginBottom: 0, lineHeight: 1.7 }}>
@@ -5676,6 +5744,125 @@ export default function CompetitorProductWorkbench({
       ) : null}
 
       {renderStepContent()}
+
+      <Modal
+        open={visionModalOpen}
+        onCancel={() => setVisionModalOpen(false)}
+        title={<Space><RobotOutlined style={{ color: TEMU_ORANGE }} /><span>AI 视觉对比（Gemini）</span></Space>}
+        width={720}
+        footer={(
+          <Space>
+            <Button onClick={() => setVisionModalOpen(false)}>关闭</Button>
+            <Button type="primary" icon={<ReloadOutlined />} loading={visionLoading} onClick={runVisionCompare}>
+              重新分析
+            </Button>
+          </Space>
+        )}
+        destroyOnClose
+      >
+        {visionLoading ? (
+          <div style={{ padding: "40px 0", textAlign: "center", color: "#8c8c8c" }}>
+            正在把我方主图和竞品主图一起丢给 Gemini 做视觉对比，通常 10-30 秒…
+          </div>
+        ) : visionError ? (
+          <Alert
+            type="error"
+            showIcon
+            message="AI 视觉对比失败"
+            description={visionError}
+          />
+        ) : visionResult ? (
+          <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+            {Array.isArray(visionResult.imageErrors) && visionResult.imageErrors.length > 0 ? (
+              <Alert
+                type="warning"
+                showIcon
+                message={`${visionResult.imageErrors.length} 张图片拉取失败，已自动跳过`}
+                description={visionResult.imageErrors.map((item) => `${item.title}: ${item.error}`).join("；")}
+              />
+            ) : null}
+
+            {visionResult.rawText ? (
+              <Alert
+                type="info"
+                showIcon
+                message="AI 未按 JSON 格式返回，下方为原始文本"
+                description={<pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{visionResult.rawText}</pre>}
+              />
+            ) : null}
+
+            {visionResult.myStrengths.length > 0 ? (
+              <div>
+                <Text strong style={{ color: "#52c41a" }}>我方主图优势</Text>
+                <List
+                  size="small"
+                  dataSource={visionResult.myStrengths}
+                  renderItem={(item) => (
+                    <List.Item style={{ paddingInline: 0 }}>
+                      <Text>✓ {item}</Text>
+                    </List.Item>
+                  )}
+                />
+              </div>
+            ) : null}
+
+            {visionResult.myWeaknesses.length > 0 ? (
+              <div>
+                <Text strong style={{ color: "#fa541c" }}>我方主图短板</Text>
+                <List
+                  size="small"
+                  dataSource={visionResult.myWeaknesses}
+                  renderItem={(item) => (
+                    <List.Item style={{ paddingInline: 0 }}>
+                      <Text>▲ {item}</Text>
+                    </List.Item>
+                  )}
+                />
+              </div>
+            ) : null}
+
+            {visionResult.competitorTakeaways.length > 0 ? (
+              <div>
+                <Text strong>竞品可借鉴点</Text>
+                <List
+                  size="small"
+                  dataSource={visionResult.competitorTakeaways}
+                  renderItem={(item) => (
+                    <List.Item style={{ paddingInline: 0, flexDirection: "column", alignItems: "flex-start", gap: 4 }}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>{item.title || "竞品"}</Text>
+                      <Text>{item.takeaway || "-"}</Text>
+                    </List.Item>
+                  )}
+                />
+              </div>
+            ) : null}
+
+            {visionResult.improvements.length > 0 ? (
+              <div>
+                <Text strong>改图动作清单</Text>
+                <List
+                  size="small"
+                  dataSource={visionResult.improvements}
+                  renderItem={(item) => (
+                    <List.Item style={{ paddingInline: 0 }}>
+                      <Space align="start">
+                        <Tag color={item.priority === "P0" ? "red" : item.priority === "P1" ? "orange" : "default"}>
+                          {item.priority || "P2"}
+                        </Tag>
+                        <Text>{item.action || "-"}</Text>
+                      </Space>
+                    </List.Item>
+                  )}
+                />
+              </div>
+            ) : null}
+
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              模型：{visionResult.model || "gemini"} · 本次仅分析最多 1 张我方主图 + 3 张竞品主图
+            </Text>
+          </Space>
+        ) : null}
+      </Modal>
     </Space>
   );
 }

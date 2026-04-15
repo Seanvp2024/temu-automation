@@ -294,6 +294,20 @@ interface CompetitorAPI {
     autoLogin?: boolean;
     alreadyLoggedIn?: boolean;
   }>;
+  visionCompare: (payload: {
+    myImage: { url: string; title?: string } | null;
+    competitorImages: Array<{ url: string; title?: string; priceText?: string; monthlySales?: number }>;
+    context?: { keyword?: string; primaryNeed?: string; videoRate?: number; category?: string };
+  }) => Promise<{
+    success: boolean;
+    myStrengths: string[];
+    myWeaknesses: string[];
+    competitorTakeaways: Array<{ title?: string; takeaway?: string }>;
+    improvements: Array<{ priority?: "P0" | "P1" | "P2"; action?: string }>;
+    rawText?: string;
+    imageErrors?: Array<{ title: string; error: string }>;
+    model?: string;
+  }>;
 }
 
 interface YunqiDbAPI {

@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Temu 自动化运营工具更新源</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #fff7f0;
+      --panel: #ffffff;
+      --line: #ffd9bf;
+      --brand: #ff6a00;
+      --brand-deep: #d95500;
+      --text: #1f2329;
+      --muted: #6b7280;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: linear-gradient(180deg, #fff7f0 0%, #fff 100%);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 880px;
+      margin: 48px auto;
+      padding: 0 24px;
+    }
+    .hero {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 28px 32px;
+      box-shadow: 0 18px 48px rgba(255, 106, 0, 0.08);
+    }
+    .badge {
+      display: inline-block;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(255, 106, 0, 0.12);
+      color: var(--brand-deep);
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 14px;
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 34px;
+      line-height: 1.2;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.7;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-top: 24px;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 18px;
+    }
+    .label {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    .value {
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 24px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 180px;
+      padding: 12px 18px;
+      border-radius: 12px;
+      text-decoration: none;
+      font-weight: 700;
+    }
+    .btn-primary {
+      background: var(--brand);
+      color: #fff;
+    }
+    .btn-secondary {
+      background: #fff;
+      color: var(--brand-deep);
+      border: 1px solid var(--line);
+    }
+    .hint {
+      margin-top: 18px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    code {
+      background: #fff4eb;
+      border-radius: 8px;
+      padding: 2px 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <div class="badge">Temu Desktop Updates</div>
+      <h1>Temu 自动化运营工具更新源</h1>
+      <p>这是给桌面客户端使用的静态更新站点模板。客户端中的更新源地址应填写为 <code>https://your-domain.com/releases/</code> 这种目录地址。</p>
+
+      <div class="grid">
+        <div class="card">
+          <div class="label">当前版本</div>
+          <div class="value">0.1.69</div>
+        </div>
+        <div class="card">
+          <div class="label">安装包文件</div>
+          <div class="value" style="font-size:16px; word-break: break-all;">temu-automation-setup-0.1.69.exe</div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <a class="btn btn-primary" href="./releases/temu-automation-setup-0.1.69.exe">下载安装包</a>
+        <a class="btn btn-secondary" href="./releases/latest.yml">查看 latest.yml</a>
+      </div>
+
+      <div class="hint">
+        如果你要给客户端配置自动更新，设置中的更新源地址应指向 <code>/releases/</code> 目录，而不是当前这个首页。
+      </div>
+    </section>
+  </div>
+</body>
+</html>

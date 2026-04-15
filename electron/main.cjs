@@ -3000,6 +3000,171 @@ ipcMain.handle("competitor:get-yunqi-credentials", async () => sendCmd("yunqi_ge
 ipcMain.handle("competitor:delete-yunqi-credentials", async () => sendCmd("yunqi_delete_credentials", {}));
 ipcMain.handle("competitor:yunqi-auto-login", async () => sendCmd("yunqi_auto_login", {}, { timeoutMs: 2 * 60 * 1000 }));
 
+/**
+ * 把远程图片 URL 拉成 base64 data URL，供 multimodal 请求使用。
+ * 超时 15s，最大 5MB；失败抛错由上层捕获。
+ */
+async function fetchImageAsDataUrl(imageUrl, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(imageUrl, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0 temu-automation/vision-compare" },
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} while fetching ${imageUrl}`);
+    }
+    const contentType = response.headers.get("content-type") || "image/jpeg";
+    const arrayBuffer = await response.arrayBuffer();
+    const maxBytes = 5 * 1024 * 1024;
+    if (arrayBuffer.byteLength > maxBytes) {
+      throw new Error(`图片过大（${(arrayBuffer.byteLength / 1024 / 1024).toFixed(1)}MB > 5MB）`);
+    }
+    const base64 = Buffer.from(arrayBuffer).toString("base64");
+    return `data:${contentType};base64,${base64}`;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 竞品主图 AI 视觉对比：
+ * 把我方 + 竞品主图一起丢给 Gemini（走 OpenAI-compat 的 vectorengine.ai），
+ * 返回 { myStrengths, myWeaknesses, competitorTakeaways, improvements } 结构化建议。
+ */
+ipcMain.handle("competitor:vision-compare", async (_event, payload) => {
+  const myImage = payload?.myImage || null;
+  const competitorImages = Array.isArray(payload?.competitorImages) ? payload.competitorImages.slice(0, 3) : [];
+  const context = payload?.context || {};
+
+  if (!myImage?.url && competitorImages.length === 0) {
+    throw new Error("没有可分析的图片");
+  }
+
+  const runtimeConfig = readImageStudioRuntimeConfig();
+  const apiKey = runtimeConfig.analyzeApiKey;
+  const baseUrl = runtimeConfig.analyzeBaseUrl || "https://api.vectorengine.ai/v1";
+  const model = runtimeConfig.analyzeModel || "gemini-3.1-flash-lite-preview";
+
+  if (!apiKey) {
+    throw new Error("[ANALYZE_API_KEY_MISSING] 未配置分析用的 Gemini API Key，请到设置里填写");
+  }
+
+  // 并发拉取所有图片（我方 + 竞品）
+  const allImages = [
+    ...(myImage?.url ? [{ role: "my", title: myImage.title || "我的主图", url: myImage.url }] : []),
+    ...competitorImages.map((item, index) => ({
+      role: "competitor",
+      index: index + 1,
+      title: item.title || `竞品 #${index + 1}`,
+      priceText: item.priceText || "",
+      monthlySales: item.monthlySales || 0,
+      url: item.url,
+    })),
+  ];
+
+  const fetched = await Promise.all(allImages.map(async (item) => {
+    try {
+      const dataUrl = await fetchImageAsDataUrl(item.url);
+      return { ...item, dataUrl, error: null };
+    } catch (error) {
+      return { ...item, dataUrl: null, error: String(error?.message || error) };
+    }
+  }));
+
+  const usable = fetched.filter((item) => item.dataUrl);
+  if (usable.length === 0) {
+    throw new Error("所有图片都拉取失败：" + fetched.map((i) => i.error).filter(Boolean).join(" / "));
+  }
+
+  // 构造 OpenAI 多模态 messages
+  const systemPrompt = [
+    "你是 Temu 电商主图优化顾问。",
+    "用户会提供 1 张「我的主图」和若干张「竞品主图」，需要你做视觉对比。",
+    "请严格输出 JSON，格式为：",
+    `{`,
+    `  "myStrengths": ["我方主图的具体优势，2-3 条，每条 <25 字"],`,
+    `  "myWeaknesses": ["我方主图相对竞品的问题，2-3 条，每条 <25 字"],`,
+    `  "competitorTakeaways": [{"title":"竞品标题","takeaway":"值得借鉴的点，<30 字"}],`,
+    `  "improvements": [{"priority":"P0|P1|P2","action":"具体改图动作，<35 字"}]`,
+    `}`,
+    "- priority 规则：P0=明显拖后腿不改不行，P1=建议跟进，P2=锦上添花",
+    "- 只输出 JSON，不要解释，不要 markdown。",
+  ].join("\n");
+
+  const userContent = [
+    {
+      type: "text",
+      text: [
+        `关键词：${context.keyword || "（未提供）"}`,
+        `市场主需求：${context.primaryNeed || "（未判断）"}`,
+        `视频门槛：${Math.round((context.videoRate || 0) * 100)}%`,
+        `品类：${context.category || "（未提供）"}`,
+        "",
+        "图片顺序：",
+        ...usable.map((item, index) => {
+          if (item.role === "my") return `第 ${index + 1} 张：我的主图 - ${item.title}`;
+          const salesPart = item.monthlySales ? ` / 月销 ${item.monthlySales}` : "";
+          const pricePart = item.priceText ? ` / ${item.priceText}` : "";
+          return `第 ${index + 1} 张：竞品 - ${item.title}${pricePart}${salesPart}`;
+        }),
+      ].join("\n"),
+    },
+    ...usable.map((item) => ({
+      type: "image_url",
+      image_url: { url: item.dataUrl },
+    })),
+  ];
+
+  const endpoint = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const aiResponse = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      temperature: 0.4,
+      response_format: { type: "json_object" },
+    }),
+  });
+
+  if (!aiResponse.ok) {
+    const text = await aiResponse.text().catch(() => "");
+    throw new Error(`Gemini 请求失败 HTTP ${aiResponse.status}: ${text.slice(0, 300)}`);
+  }
+
+  const aiJson = await aiResponse.json();
+  const rawText = aiJson?.choices?.[0]?.message?.content || "";
+  let parsed = null;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    // 尝试从文本里提取 JSON 片段
+    const match = rawText.match(/\{[\s\S]*\}/);
+    if (match) {
+      try { parsed = JSON.parse(match[0]); } catch { /* ignore */ }
+    }
+  }
+
+  return {
+    success: true,
+    myStrengths: Array.isArray(parsed?.myStrengths) ? parsed.myStrengths.map(String) : [],
+    myWeaknesses: Array.isArray(parsed?.myWeaknesses) ? parsed.myWeaknesses.map(String) : [],
+    competitorTakeaways: Array.isArray(parsed?.competitorTakeaways) ? parsed.competitorTakeaways : [],
+    improvements: Array.isArray(parsed?.improvements) ? parsed.improvements : [],
+    rawText: parsed ? "" : rawText,
+    imageErrors: fetched.filter((item) => item.error).map((item) => ({ title: item.title, error: item.error })),
+    model,
+  };
+});
+
 // ============ 云启数据库 IPC ============
 ipcMain.handle("competitor:fetch-yunqi-token", async () => sendCmd("fetch_yunqi_token_from_browser", {}, { timeoutMs: 5 * 60 * 1000 }));
 ipcMain.handle("yunqi-db:import", async (_e, params) => sendCmd("yunqi_db_import", params || {}, { timeoutMs: 120000 }));
