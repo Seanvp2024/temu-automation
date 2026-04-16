@@ -2705,6 +2705,10 @@ export default function CompetitorProductWorkbench({
   }, [competitor, keyword, marketInsight, results?.keyword, selectedProduct, selectedProductMeta, selectedSampleRows, selectedUrls, selectedYunqiDisplay, store]);
 
   // 步骤 4 自动触发主图视觉对比；只有输入指纹变化时才重跑
+  // 指纹只取 URL 的路径部分（去掉签名参数），避免 403 自动刷新后签名变化导致无限循环
+  const stripOssQuery = (url: string) => {
+    try { return new URL(url).pathname; } catch { return url; }
+  };
   useEffect(() => {
     if (activeStep !== 3) return;
     const myImageUrl = firstTextValue(selectedYunqiDisplay?.imageUrl, selectedProductMeta?.imageUrl) || "";
@@ -2716,7 +2720,7 @@ export default function CompetitorProductWorkbench({
       })
       .filter(Boolean);
     if (!myImageUrl && competitorUrls.length === 0) return;
-    const fingerprint = [myImageUrl, ...competitorUrls].join("|");
+    const fingerprint = [myImageUrl, ...competitorUrls].map(stripOssQuery).join("|");
     if (fingerprint === visionFingerprintRef.current) return;
     if (visionLoading) return;
     visionFingerprintRef.current = fingerprint;
@@ -5056,67 +5060,6 @@ export default function CompetitorProductWorkbench({
       return `${withSign && pct > 0 ? "+" : ""}${pct}%`;
     };
 
-    const renderGapMatrix = () => {
-      if (comparisonMatrix.length === 0) return null;
-      return (
-        <Card title="差距对位矩阵 · 每个样本在哪里赢我" size="small" style={CARD_STYLE}>
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse", minWidth: 880 }}>
-              <thead>
-                <tr style={{ color: "#8c8c8c", background: "#fafafa" }}>
-                  <th style={{ padding: "8px 10px", textAlign: "left" }}>样本</th>
-                  <th style={{ padding: "8px 10px" }}>价格差</th>
-                  <th style={{ padding: "8px 10px" }}>月销差</th>
-                  <th style={{ padding: "8px 10px" }}>评分差</th>
-                  <th style={{ padding: "8px 10px" }}>评价差</th>
-                  <th style={{ padding: "8px 10px" }}>素材</th>
-                  <th style={{ padding: "8px 10px" }}>标题词覆盖</th>
-                  <th style={{ padding: "8px 10px", textAlign: "left" }}>流量来源 / 弱点</th>
-                </tr>
-              </thead>
-              <tbody>
-                {comparisonMatrix.map((row) => (
-                  <tr key={row.key} style={{ borderTop: "1px solid #f4f4f4" }}>
-                    <td style={{ padding: "8px 10px" }}>
-                      <Space size={6} wrap>
-                        <Tag color={row.priority === "P0" ? "red" : row.priority === "P1" ? "orange" : "default"} style={{ marginInlineEnd: 0 }}>{row.priority}</Tag>
-                        <Text ellipsis style={{ maxWidth: 240 }}>{row.title}</Text>
-                      </Space>
-                    </td>
-                    <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.priceDelta, false) }}>
-                      {row.priceDelta === 0 ? "-" : formatPct(row.priceDelta)}
-                    </td>
-                    <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.monthlyDelta, true) }}>
-                      {row.monthlyDelta === 0 ? "-" : formatPct(row.monthlyDelta)}
-                    </td>
-                    <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.scoreDelta, true, 0.1) }}>
-                      {row.scoreDelta === 0 ? "-" : `${row.scoreDelta > 0 ? "+" : ""}${row.scoreDelta.toFixed(2)}`}
-                    </td>
-                    <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.reviewDelta, true) }}>
-                      {row.reviewDelta === 0 ? "-" : formatPct(row.reviewDelta)}
-                    </td>
-                    <td style={{ padding: "8px 10px", textAlign: "center" }}>
-                      {row.videoDelta === 0 ? <Tag style={{ marginInlineEnd: 0 }}>平</Tag> : row.videoDelta > 0 ? <Tag color="green" style={{ marginInlineEnd: 0 }}>我有</Tag> : <Tag color="red" style={{ marginInlineEnd: 0 }}>缺</Tag>}
-                    </td>
-                    <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.keywordCoverage - 0.7, true, 0.1) }}>
-                      {Math.round(row.keywordCoverage * 100)}%
-                    </td>
-                    <td style={{ padding: "8px 10px", color: "#595959" }}>
-                      <div><Tag color="geekblue" style={{ marginInlineEnd: 0 }}>{row.trafficSource}</Tag></div>
-                      {row.weakness ? <div style={{ marginTop: 4, fontSize: 11, color: "#8c8c8c" }}>{row.weakness}</div> : null}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <div style={{ marginTop: 8, fontSize: 12, color: "#8c8c8c", lineHeight: 1.7 }}>
-            红色 = 我输、绿色 = 我赢、灰色 = 基本打平（阈值 8% 或 0.1 分）。价格低 / 月销高 / 评分高 / 评价多 / 有视频 / 标题词覆盖高 都算赢。
-          </div>
-        </Card>
-      );
-    };
-
     // P3.2：差距雷达图（归一化到 0-100，我的 vs 竞品中位数）
     const radarData = (() => {
       if (peerSnapshots.length === 0) return [];
@@ -5343,7 +5286,7 @@ export default function CompetitorProductWorkbench({
       </div>
     );
 
-    // 动作清单：纯文本列表
+    // 动作清单：纯文本列表（保留备用，深挖面板内可能使用）
     const renderActionBoard = (
       title: string,
       items: string[],
@@ -5367,6 +5310,7 @@ export default function CompetitorProductWorkbench({
         />
       </div>
     );
+    void renderActionBoard; // 保留备用
 
     // 今日清单：生成 Markdown 并复制（纯文本）
     const collectAllActions = (): Array<{ section: string; text: string }> => {
@@ -5484,207 +5428,235 @@ export default function CompetitorProductWorkbench({
       );
     };
 
-    // ========== 精简版头部结论条：一句话 + 4 列 Stat ==========
-    const renderHeroSummary = () => (
-      <Card style={{ ...CARD_STYLE, background: "linear-gradient(135deg, rgba(255,247,240,0.98) 0%, rgba(255,255,255,1) 100%)" }}>
-        <Space direction="vertical" size={14} style={{ width: "100%" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
-            <div style={{ flex: 1, minWidth: 260 }}>
-              <Text strong style={{ fontSize: 20 }}>步骤 4 · 决策总览</Text>
-              {analysis ? (
-                <div style={{ marginTop: 8, fontSize: 14, color: "#262626", lineHeight: 1.8 }}>
-                  <Tag color="orange" style={{ marginRight: 6 }}>{analysis.summary.canCompete}</Tag>
-                  关键词判断：<Text strong>{analysis.summary.keywordDecision}</Text>
-                </div>
-              ) : (
-                <div style={{ marginTop: 6, color: "#8c8c8c" }}>
-                  先选好样本，再生成当前商品的动作判断。
-                </div>
-              )}
-            </div>
-            {marketInsight ? (
-              <Space size={6} wrap>
-                <Tag color="orange">{marketInsight.marketVerdict}</Tag>
-                <Tag color="gold">价格带 {marketInsight.recommendedPriceBand}</Tag>
-                <Tag color="blue">样本 {results?.totalFound || resultSnapshots.length}</Tag>
+    // ========== 1️⃣ 判断条：Go / No-Go 一句话结论 ==========
+    const verdictColor = analysis?.summary.canCompete === "可以打"
+      ? "#52c41a"
+      : analysis?.summary.canCompete === "谨慎"
+        ? "#faad14"
+        : "#cf1322";
+    const renderVerdict = () => (
+      <Card
+        style={{
+          ...CARD_STYLE,
+          background: analysis
+            ? `linear-gradient(135deg, ${verdictColor}08 0%, #fff 100%)`
+            : "linear-gradient(135deg, rgba(255,247,240,0.98) 0%, rgba(255,255,255,1) 100%)",
+          borderLeft: analysis ? `4px solid ${verdictColor}` : undefined,
+        }}
+      >
+        {!analysis ? (
+          <Space direction="vertical" size={8} style={{ width: "100%" }}>
+            <Text strong style={{ fontSize: 20 }}>步骤 4 · 决策总览</Text>
+            <Text type="secondary">先选好样本，再生成当前商品的动作判断。</Text>
+          </Space>
+        ) : (
+          <Space direction="vertical" size={12} style={{ width: "100%" }}>
+            {/* 第一行：大字判定 + 机会分 + 价格带 */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+              <Space size={12} align="center">
+                <span style={{ fontSize: 28, fontWeight: 800, color: verdictColor, letterSpacing: 2 }}>
+                  {analysis.summary.canCompete || "待判断"}
+                </span>
+                {marketInsight ? (
+                  <span style={{ fontSize: 32, fontWeight: 700, color: TEMU_ORANGE }}>
+                    {marketInsight.opportunityScore}<span style={{ fontSize: 14, color: "#8c8c8c" }}>/100</span>
+                  </span>
+                ) : null}
               </Space>
-            ) : null}
-          </div>
-          {analysis ? (
-            <Row gutter={[12, 12]}>
-              {overviewStats.map((item, idx) => (
-                <Col xs={12} md={6} key={item.label}>
-                  <div style={{ background: "#fff", border: "1px solid rgba(229,91,0,0.12)", borderRadius: 12, padding: 14, height: "100%" }}>
-                    <Text type="secondary" style={{ fontSize: 12 }}>{item.label}</Text>
-                    <div style={{ marginTop: 6, fontSize: idx === 0 ? 22 : 15, fontWeight: 600, color: idx === 0 ? TEMU_ORANGE : "#262626", lineHeight: 1.4 }}>
-                      {item.value}
-                    </div>
-                  </div>
-                </Col>
-              ))}
-            </Row>
-          ) : null}
-          {analysis ? (
-            <div style={{ fontSize: 13, color: "#595959", lineHeight: 1.7, padding: "10px 12px", background: "rgba(255,255,255,0.6)", borderRadius: 8 }}>
-              <Text type="secondary" style={{ fontSize: 12, marginRight: 8 }}>为什么还能赢</Text>
-              {analysis.summary.winAngle}
+              <Space size={6} wrap>
+                {marketInsight ? <Tag color="gold">切入 {marketInsight.recommendedPriceBand}</Tag> : null}
+                <Tag color="blue">样本 {results?.totalFound || resultSnapshots.length}</Tag>
+                {marketInsight ? <Tag color="orange">{marketInsight.marketVerdict}</Tag> : null}
+              </Space>
             </div>
-          ) : null}
-        </Space>
+            {/* 第二行：一句话理由 */}
+            <div style={{ fontSize: 15, color: "#262626", lineHeight: 1.8 }}>
+              <Text strong>{analysis.summary.keywordDecision}</Text>
+              {analysis.summary.winAngle ? (
+                <Text style={{ marginLeft: 8, color: "#595959" }}>→ {analysis.summary.winAngle}</Text>
+              ) : null}
+            </div>
+            {/* 第三行：4 列快照指标（精简为一行内联） */}
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+              {overviewStats.map((item, idx) => (
+                <div key={item.label} style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>{item.label}</Text>
+                  <Text strong style={{ fontSize: idx === 0 ? 16 : 14, color: idx === 0 ? TEMU_ORANGE : "#262626" }}>
+                    {item.value}
+                  </Text>
+                </div>
+              ))}
+            </div>
+          </Space>
+        )}
       </Card>
     );
 
-    // ========== Tab 1 · 结论与动作 ==========
-    const renderConclusionTab = () => {
-      if (!analysis) return <Empty description="先选好样本，再生成动作建议。" />;
+    // ========== 2️⃣ 行动：今天做什么 ==========
+    const renderActionPlan = () => {
+      if (!analysis) return null;
       return (
-        <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+        <Card
+          title={<><Text strong style={{ fontSize: 16 }}>🎯 行动清单</Text><Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>按紧急度排序，先改再验再扩</Text></>}
+          size="small"
+          style={CARD_STYLE}
+          extra={
+            actionProgress ? (
+              <Space size={8}>
+                <Tag color="orange">{actionProgress.total} 条</Tag>
+                <Button size="small" icon={<CopyOutlined />} onClick={copyTodayChecklist}>
+                  复制清单
+                </Button>
+              </Space>
+            ) : null
+          }
+        >
           <Row gutter={[16, 16]}>
-            <Col xs={24} xl={14}>
-              <Card
-                title="动作待办 · 按优先级排"
-                size="small"
-                style={CARD_STYLE}
-                extra={
-                  actionProgress ? (
-                    <Space size={8}>
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        共 {actionProgress.total} 条
-                      </Text>
-                      <Button size="small" icon={<CopyOutlined />} onClick={copyTodayChecklist}>
-                        复制今日清单
-                      </Button>
-                    </Space>
-                  ) : null
-                }
-              >
-                <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-                  {whyWinSection ? renderActionBoard(whyWinSection.title, whyWinSection.items, true, whyWinSection.key) : null}
-                  {executionSections.map((section) => (
-                    <div key={section.key}>{renderActionBoard(section.title, section.items, false, section.key)}</div>
-                  ))}
-                </Space>
-              </Card>
+            {/* 左列：今天 + 本周 + 下批 */}
+            <Col xs={24} xl={16}>
+              {whyWinSection ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                  message={<Text strong>为什么别人卖得更快</Text>}
+                  description={
+                    <ul style={{ margin: "6px 0 0 0", paddingLeft: 16, lineHeight: 2 }}>
+                      {whyWinSection.items.map((item, i) => <li key={i}>{item}</li>)}
+                    </ul>
+                  }
+                />
+              ) : null}
+              <Row gutter={[12, 12]}>
+                {executionSections.map((section) => (
+                  <Col xs={24} md={section.key === "today" ? 24 : 12} key={section.key}>
+                    <div style={section.key === "today" ? accentPanelStyle : softPanelStyle}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                        <Text strong style={section.key === "today" ? { color: TEMU_ORANGE } : undefined}>
+                          {section.key === "today" ? "🔥 " : section.key === "week" ? "📅 " : "📦 "}
+                          {section.title}
+                        </Text>
+                        <Tag>{section.items.length}</Tag>
+                      </div>
+                      <List
+                        size="small"
+                        dataSource={section.items}
+                        locale={{ emptyText: "暂无" }}
+                        renderItem={(item, idx) => (
+                          <List.Item style={{ paddingInline: 0, paddingBlock: 6, borderBottom: "1px solid #f4f4f4" }}>
+                            <Text style={{ lineHeight: 1.7 }}>
+                              {section.key === "today" ? <Tag color="red" style={{ marginRight: 4 }}>P{idx}</Tag> : null}
+                              {item}
+                            </Text>
+                          </List.Item>
+                        )}
+                      />
+                    </div>
+                  </Col>
+                ))}
+              </Row>
             </Col>
-            <Col xs={24} xl={10}>
-              <Card title="持续监控 · 盯什么指标" size="small" style={CARD_STYLE}>
-                <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-                  {monitorSections.map((section) => (
-                    <div key={section.key}>{renderActionBoard(section.title, section.items, false, section.key)}</div>
-                  ))}
-                </Space>
-              </Card>
+            {/* 右列：持续监控 */}
+            <Col xs={24} xl={8}>
+              <div style={{ ...softPanelStyle, background: "#fafafa" }}>
+                <Text strong style={{ fontSize: 13 }}>📊 持续监控</Text>
+                {monitorSections.map((section) => (
+                  <div key={section.key} style={{ marginTop: 10 }}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>{section.title}</Text>
+                    <List
+                      size="small"
+                      dataSource={section.items}
+                      locale={{ emptyText: "暂无" }}
+                      renderItem={(item) => (
+                        <List.Item style={{ paddingInline: 0, paddingBlock: 4, borderBottom: "none", fontSize: 12 }}>
+                          <Text style={{ fontSize: 12, color: "#595959" }}>• {item}</Text>
+                        </List.Item>
+                      )}
+                    />
+                  </div>
+                ))}
+              </div>
             </Col>
-          </Row>
-          <Card
-            title={`证据样本 · Top ${Math.min(3, comparisonRows.length)}`}
-            size="small"
-            style={CARD_STYLE}
-            extra={<Text type="secondary" style={{ fontSize: 12 }}>价格、销量、流量来源、差距、动作</Text>}
-          >
-            {comparisonRows.length === 0 ? (
-              <Empty description="先从步骤 3 挑 3-5 个真正可比的样本。" />
-            ) : (
-              <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-                {comparisonRows.slice(0, 3).map((item) => renderComparisonEvidence(item))}
-              </Space>
-            )}
-          </Card>
-        </Space>
-      );
-    };
-
-    // ========== Tab 2 · 市场定位 ==========
-    const renderMarketTab = () => {
-      if (!marketInsight) return <Empty description="先完成搜索，再看市场定位。" />;
-      return (
-        <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-          {renderOpportunityBreakdown()}
-          {renderPriceBandHeatmap()}
-          {scatterPoints.length > 0 ? renderPositioningScatter() : null}
-          <Card title="价格分布" size="small" style={CARD_STYLE}
-            extra={(
-              <Space size={6}>
-                <Tag color="gold">均价 ${avgPrice.toFixed(2)}</Tag>
-                <Tag color="orange">机会分 {marketInsight.opportunityScore}/100</Tag>
-              </Space>
-            )}>
-            {priceDistribution.length === 0 ? (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="先搜索这个商品的核心关键词" />
-            ) : (
-              <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={priceDistribution}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="range" fontSize={11} />
-                  <YAxis fontSize={11} />
-                  <RTooltip />
-                  <Bar dataKey="count" name="商品数" radius={[6, 6, 0, 0]}>
-                    {priceDistribution.map((_: any, index: number) => <Cell key={index} fill={PRICE_COLORS[index % PRICE_COLORS.length]} />)}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            )}
-          </Card>
-        </Space>
-      );
-    };
-
-    // ========== Tab 3 · 竞品差距 ==========
-    const renderGapTab = () => {
-      if (comparisonMatrix.length === 0 && radarData.length === 0 && keywordCoverage.length === 0) {
-        return <Empty description="先选 3-5 个竞品样本，再看差距分析。" />;
-      }
-      return (
-        <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-          {comparisonMatrix.length > 0 ? renderGapMatrix() : null}
-          {radarData.length > 0 ? renderGapRadar() : null}
-          {keywordCoverage.length > 0 ? renderKeywordCoverage() : null}
-        </Space>
-      );
-    };
-
-    // ========== 诊断详情（扁平展开） ==========
-    const renderDiagnosticsSection = () => (
-      <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-        <Card title="我的商品诊断（价格 / 流量 / 标题 / 主图 等）" size="small" style={CARD_STYLE}>
-          <Row gutter={[12, 12]}>
-            {diagnosticSections.map((item) => (
-              <Col xs={24} md={12} key={item.title}>
-                {renderInsightPanel(item.title, item.value, { rows: 4 })}
-              </Col>
-            ))}
           </Row>
         </Card>
-        <Card title="市场与竞品判断（评价 / 履约 / 六格说明）" size="small" style={CARD_STYLE}>
+      );
+    };
+
+    // ========== 3️⃣ 证据：我 vs 竞品对照 ==========
+    const renderEvidenceSection = () => {
+      if (comparisonRows.length === 0 && comparisonMatrix.length === 0) return null;
+      return (
+        <Card
+          title={<><Text strong style={{ fontSize: 16 }}>📋 证据对照</Text><Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>我的商品 vs 竞品样本，红输绿赢</Text></>}
+          size="small"
+          style={CARD_STYLE}
+        >
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-            <div style={accentPanelStyle}>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-                <Text strong>市场盘面</Text>
-                <Space wrap size={[6, 6]}>
-                  <Tag color="orange">{marketInsight?.marketVerdict}</Tag>
-                  <Tag color="gold">价格带 {marketInsight?.recommendedPriceBand}</Tag>
-                </Space>
+            {/* 差距矩阵（如有） */}
+            {comparisonMatrix.length > 0 ? (
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse", minWidth: 880 }}>
+                  <thead>
+                    <tr style={{ color: "#8c8c8c", background: "#fafafa" }}>
+                      <th style={{ padding: "8px 10px", textAlign: "left" }}>样本</th>
+                      <th style={{ padding: "8px 10px" }}>价格差</th>
+                      <th style={{ padding: "8px 10px" }}>月销差</th>
+                      <th style={{ padding: "8px 10px" }}>评分差</th>
+                      <th style={{ padding: "8px 10px" }}>评价差</th>
+                      <th style={{ padding: "8px 10px" }}>素材</th>
+                      <th style={{ padding: "8px 10px" }}>标题词覆盖</th>
+                      <th style={{ padding: "8px 10px", textAlign: "left" }}>流量来源 / 弱点</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {comparisonMatrix.map((row) => (
+                      <tr key={row.key} style={{ borderTop: "1px solid #f4f4f4" }}>
+                        <td style={{ padding: "8px 10px" }}>
+                          <Space size={6} wrap>
+                            <Tag color={row.priority === "P0" ? "red" : row.priority === "P1" ? "orange" : "default"} style={{ marginInlineEnd: 0 }}>{row.priority}</Tag>
+                            <Text ellipsis style={{ maxWidth: 240 }}>{row.title}</Text>
+                          </Space>
+                        </td>
+                        <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.priceDelta, false) }}>
+                          {row.priceDelta === 0 ? "-" : formatPct(row.priceDelta)}
+                        </td>
+                        <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.monthlyDelta, true) }}>
+                          {row.monthlyDelta === 0 ? "-" : formatPct(row.monthlyDelta)}
+                        </td>
+                        <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.scoreDelta, true, 0.1) }}>
+                          {row.scoreDelta === 0 ? "-" : `${row.scoreDelta > 0 ? "+" : ""}${row.scoreDelta.toFixed(2)}`}
+                        </td>
+                        <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.reviewDelta, true) }}>
+                          {row.reviewDelta === 0 ? "-" : formatPct(row.reviewDelta)}
+                        </td>
+                        <td style={{ padding: "8px 10px", textAlign: "center" }}>
+                          {row.videoDelta === 0 ? <Tag style={{ marginInlineEnd: 0 }}>平</Tag> : row.videoDelta > 0 ? <Tag color="green" style={{ marginInlineEnd: 0 }}>我有</Tag> : <Tag color="red" style={{ marginInlineEnd: 0 }}>缺</Tag>}
+                        </td>
+                        <td style={{ padding: "8px 10px", textAlign: "center", ...deltaCellStyle(row.keywordCoverage - 0.7, true, 0.1) }}>
+                          {Math.round(row.keywordCoverage * 100)}%
+                        </td>
+                        <td style={{ padding: "8px 10px", color: "#595959" }}>
+                          <div><Tag color="geekblue" style={{ marginInlineEnd: 0 }}>{row.trafficSource}</Tag></div>
+                          {row.weakness ? <div style={{ marginTop: 4, fontSize: 11, color: "#8c8c8c" }}>{row.weakness}</div> : null}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div style={{ marginTop: 6, fontSize: 11, color: "#bfbfbf" }}>
+                  红色 = 我输、绿色 = 我赢、灰色 = 打平（阈值 8%）
+                </div>
               </div>
-              {marketInsight ? (
-                <Paragraph style={{ marginTop: 8, marginBottom: 0, lineHeight: 1.8 }}>
-                  当前词更看重 {marketInsight.primaryNeed}，建议从 {marketInsight.entryFocus} 切入。Top10 集中度 {formatPercentText(marketInsight.top10SalesShare)}，视频覆盖 {formatPercentText(marketInsight.videoRate)}。
-                </Paragraph>
-              ) : null}
-            </div>
-            <Row gutter={[12, 12]}>
-              {[...reviewTrustSections, ...fulfillmentSections, ...marketPanels].map((item: any) => (
-                <Col xs={24} md={12} xl={8} key={item.title || item.label}>
-                  {renderInsightPanel((item.title || item.label) as string, item.value, { rows: 4 })}
-                </Col>
-              ))}
-            </Row>
+            ) : null}
+            {/* Top3 样本卡片 */}
+            {comparisonRows.slice(0, 3).map((item) => renderComparisonEvidence(item))}
           </Space>
         </Card>
-      </Space>
-    );
+      );
+    };
 
-    // ========== 主图视觉对比（基于已加入对比的链接，自动触发）==========
-    const renderVisionCompareCard = () => {
+    // ========== 4️⃣ 深挖：详细分析（平铺展开） ==========
+    const renderDeepDive = () => {
       const hasMyImage = Boolean(firstTextValue(selectedYunqiDisplay?.imageUrl, selectedProductMeta?.imageUrl));
       const competitorCount = selectedSampleRows.slice(0, 3).filter((row) => {
         const latest = row.latest as any;
@@ -5692,153 +5664,159 @@ export default function CompetitorProductWorkbench({
       }).length;
 
       return (
-        <Card
-          size="small"
-          title={(
-            <Space size={8}>
-              <RobotOutlined style={{ color: TEMU_ORANGE }} />
-              <Text strong>主图视觉对比（Gemini）</Text>
-              {visionLoading ? <Tag color="processing">分析中</Tag> : null}
-            </Space>
-          )}
-          extra={(
-            <Space size={8}>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                对比 {hasMyImage ? "我方 + " : ""}{competitorCount} 张竞品主图
-              </Text>
-              <Button
-                size="small"
-                icon={<ReloadOutlined />}
-                loading={visionLoading}
-                onClick={() => {
-                  visionFingerprintRef.current = ""; // 清掉指纹，强制重跑
-                  void runVisionCompare();
-                }}
-                disabled={!hasMyImage && competitorCount === 0}
-              >
-                重新分析
-              </Button>
-            </Space>
-          )}
-          style={CARD_STYLE}
-        >
-          {visionLoading && !visionResult ? (
-            <div style={{ padding: "20px 0", textAlign: "center", color: "#8c8c8c" }}>
-              正在把我方主图和竞品主图丢给 Gemini 做视觉对比，通常 10-30 秒…
-            </div>
-          ) : visionError ? (
-            <Alert type="error" showIcon message="AI 视觉对比失败" description={visionError} />
-          ) : !hasMyImage && competitorCount === 0 ? (
-            <Empty description="需要先关联我方主图或在步骤 3 勾选带主图的竞品样本" />
-          ) : visionResult ? (
-            <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-              {Array.isArray(visionResult.imageErrors) && visionResult.imageErrors.length > 0 ? (
-                <Alert
-                  type="warning"
-                  showIcon
-                  message={`${visionResult.imageErrors.length} 张图片拉取失败，已自动跳过`}
-                  description={visionResult.imageErrors.map((item) => `${item.title}: ${item.error}`).join("；")}
-                />
-              ) : null}
-
-              {visionResult.rawText ? (
-                <Alert
-                  type="info"
-                  showIcon
-                  message="AI 未按 JSON 格式返回，下方为原始文本"
-                  description={<pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{visionResult.rawText}</pre>}
-                />
-              ) : null}
-
-              <Row gutter={[16, 16]}>
-                {visionResult.myStrengths.length > 0 ? (
-                  <Col xs={24} md={12}>
-                    <Text strong style={{ color: "#52c41a" }}>我方主图优势</Text>
-                    <List
-                      size="small"
-                      dataSource={visionResult.myStrengths}
-                      renderItem={(item) => (
-                        <List.Item style={{ paddingInline: 0 }}>
-                          <Text>✓ {item}</Text>
-                        </List.Item>
-                      )}
-                    />
-                  </Col>
+        <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+          {/* 4a. 主图视觉对比 */}
+          <Card
+            size="small"
+            title={<Space size={8}><RobotOutlined style={{ color: TEMU_ORANGE }} /><Text strong>主图视觉对比（Gemini）</Text>{visionLoading ? <Tag color="processing">分析中</Tag> : null}</Space>}
+            extra={
+              <Space size={8}>
+                <Text type="secondary" style={{ fontSize: 12 }}>对比 {hasMyImage ? "我方 + " : ""}{competitorCount} 张竞品主图</Text>
+                <Button size="small" icon={<ReloadOutlined />} loading={visionLoading}
+                  onClick={() => { visionFingerprintRef.current = ""; void runVisionCompare(); }}
+                  disabled={!hasMyImage && competitorCount === 0}
+                >重新分析</Button>
+              </Space>
+            }
+            style={CARD_STYLE}
+          >
+            {visionLoading && !visionResult ? (
+              <div style={{ padding: "20px 0", textAlign: "center", color: "#8c8c8c" }}>正在把我方主图和竞品主图丢给 Gemini 做视觉对比，通常 10-30 秒…</div>
+            ) : visionError ? (
+              <Alert type="error" showIcon message="AI 视觉对比失败" description={visionError} />
+            ) : !hasMyImage && competitorCount === 0 ? (
+              <Empty description="需要先关联我方主图或在步骤 3 勾选带主图的竞品样本" />
+            ) : visionResult ? (
+              <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+                {Array.isArray(visionResult.imageErrors) && visionResult.imageErrors.length > 0 ? (
+                  <Alert type="warning" showIcon
+                    message={`${visionResult.imageErrors.length} 张图片拉取失败，已自动跳过`}
+                    description={visionResult.imageErrors.map((item) => `${item.title}: ${item.error}`).join("；")}
+                  />
                 ) : null}
-
-                {visionResult.myWeaknesses.length > 0 ? (
-                  <Col xs={24} md={12}>
-                    <Text strong style={{ color: "#fa541c" }}>我方主图短板</Text>
-                    <List
-                      size="small"
-                      dataSource={visionResult.myWeaknesses}
-                      renderItem={(item) => (
-                        <List.Item style={{ paddingInline: 0 }}>
-                          <Text>▲ {item}</Text>
-                        </List.Item>
-                      )}
-                    />
-                  </Col>
+                {visionResult.rawText ? (
+                  <Alert type="info" showIcon message="AI 未按 JSON 格式返回" description={<pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{visionResult.rawText}</pre>} />
                 ) : null}
-
-                {visionResult.competitorTakeaways.length > 0 ? (
-                  <Col xs={24} md={12}>
-                    <Text strong>竞品可借鉴点</Text>
-                    <List
-                      size="small"
-                      dataSource={visionResult.competitorTakeaways}
-                      renderItem={(item) => (
+                <Row gutter={[16, 16]}>
+                  {visionResult.myStrengths.length > 0 ? (
+                    <Col xs={24} md={12}>
+                      <Text strong style={{ color: "#52c41a" }}>我方主图优势</Text>
+                      <List size="small" dataSource={visionResult.myStrengths} renderItem={(item) => <List.Item style={{ paddingInline: 0 }}><Text>✓ {item}</Text></List.Item>} />
+                    </Col>
+                  ) : null}
+                  {visionResult.myWeaknesses.length > 0 ? (
+                    <Col xs={24} md={12}>
+                      <Text strong style={{ color: "#fa541c" }}>我方主图短板</Text>
+                      <List size="small" dataSource={visionResult.myWeaknesses} renderItem={(item) => <List.Item style={{ paddingInline: 0 }}><Text>▲ {item}</Text></List.Item>} />
+                    </Col>
+                  ) : null}
+                  {visionResult.competitorTakeaways.length > 0 ? (
+                    <Col xs={24} md={12}>
+                      <Text strong>竞品可借鉴点</Text>
+                      <List size="small" dataSource={visionResult.competitorTakeaways} renderItem={(item) => (
                         <List.Item style={{ paddingInline: 0, flexDirection: "column", alignItems: "flex-start", gap: 4 }}>
                           <Text type="secondary" style={{ fontSize: 12 }}>{item.title || "竞品"}</Text>
                           <Text>{item.takeaway || "-"}</Text>
                         </List.Item>
-                      )}
-                    />
-                  </Col>
-                ) : null}
-
-                {visionResult.improvements.length > 0 ? (
-                  <Col xs={24} md={12}>
-                    <Text strong>改图动作清单</Text>
-                    <List
-                      size="small"
-                      dataSource={visionResult.improvements}
-                      renderItem={(item) => (
+                      )} />
+                    </Col>
+                  ) : null}
+                  {visionResult.improvements.length > 0 ? (
+                    <Col xs={24} md={12}>
+                      <Text strong>改图动作清单</Text>
+                      <List size="small" dataSource={visionResult.improvements} renderItem={(item) => (
                         <List.Item style={{ paddingInline: 0 }}>
                           <Space align="start">
-                            <Tag color={item.priority === "P0" ? "red" : item.priority === "P1" ? "orange" : "default"}>
-                              {item.priority || "P2"}
-                            </Tag>
+                            <Tag color={item.priority === "P0" ? "red" : item.priority === "P1" ? "orange" : "default"}>{item.priority || "P2"}</Tag>
                             <Text>{item.action || "-"}</Text>
                           </Space>
                         </List.Item>
-                      )}
-                    />
-                  </Col>
-                ) : null}
-              </Row>
+                      )} />
+                    </Col>
+                  ) : null}
+                </Row>
+                <Text type="secondary" style={{ fontSize: 12 }}>模型：{visionResult.model || "gemini"} · 最多分析 1 张我方主图 + 3 张竞品主图</Text>
+              </Space>
+            ) : (
+              <div style={{ padding: "20px 0", textAlign: "center", color: "#8c8c8c" }}>进入步骤 4 时会自动分析当前已加入对比的主图</div>
+            )}
+          </Card>
 
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                模型：{visionResult.model || "gemini"} · 最多分析 1 张我方主图 + 3 张竞品主图
-              </Text>
+          {/* 4b. 市场定位 */}
+          {marketInsight ? (
+            <>
+              {renderOpportunityBreakdown()}
+              {renderPriceBandHeatmap()}
+              {scatterPoints.length > 0 ? renderPositioningScatter() : null}
+              {priceDistribution.length > 0 ? (
+                <Card title="价格分布" size="small" style={CARD_STYLE}
+                  extra={<Space size={6}><Tag color="gold">均价 ${avgPrice.toFixed(2)}</Tag><Tag color="orange">机会分 {marketInsight.opportunityScore}/100</Tag></Space>}
+                >
+                  <ResponsiveContainer width="100%" height={240}>
+                    <BarChart data={priceDistribution}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="range" fontSize={11} />
+                      <YAxis fontSize={11} />
+                      <RTooltip />
+                      <Bar dataKey="count" name="商品数" radius={[6, 6, 0, 0]}>
+                        {priceDistribution.map((_: any, index: number) => <Cell key={index} fill={PRICE_COLORS[index % PRICE_COLORS.length]} />)}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </Card>
+              ) : null}
+            </>
+          ) : null}
+
+          {/* 4c. 差距雷达 + 关键词 */}
+          {radarData.length > 0 ? renderGapRadar() : null}
+          {keywordCoverage.length > 0 ? renderKeywordCoverage() : null}
+
+          {/* 4d. 诊断详情 */}
+          <Card title="我的商品诊断（价格 / 流量 / 标题 / 主图 等）" size="small" style={CARD_STYLE}>
+            <Row gutter={[12, 12]}>
+              {diagnosticSections.map((item) => (
+                <Col xs={24} md={12} key={item.title}>
+                  {renderInsightPanel(item.title, item.value, { rows: 4 })}
+                </Col>
+              ))}
+            </Row>
+          </Card>
+          <Card title="市场与竞品判断（评价 / 履约 / 六格说明）" size="small" style={CARD_STYLE}>
+            <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+              {marketInsight ? (
+                <div style={accentPanelStyle}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+                    <Text strong>市场盘面</Text>
+                    <Space wrap size={[6, 6]}>
+                      <Tag color="orange">{marketInsight.marketVerdict}</Tag>
+                      <Tag color="gold">价格带 {marketInsight.recommendedPriceBand}</Tag>
+                    </Space>
+                  </div>
+                  <Paragraph style={{ marginTop: 8, marginBottom: 0, lineHeight: 1.8 }}>
+                    当前词更看重 {marketInsight.primaryNeed}，建议从 {marketInsight.entryFocus} 切入。Top10 集中度 {formatPercentText(marketInsight.top10SalesShare)}，视频覆盖 {formatPercentText(marketInsight.videoRate)}。
+                  </Paragraph>
+                </div>
+              ) : null}
+              <Row gutter={[12, 12]}>
+                {[...reviewTrustSections, ...fulfillmentSections, ...marketPanels].map((item: any) => (
+                  <Col xs={24} md={12} xl={8} key={item.title || item.label}>
+                    {renderInsightPanel((item.title || item.label) as string, item.value, { rows: 4 })}
+                  </Col>
+                ))}
+              </Row>
             </Space>
-          ) : (
-            <div style={{ padding: "20px 0", textAlign: "center", color: "#8c8c8c" }}>
-              进入步骤 4 时会自动分析当前已加入对比的主图
-            </div>
-          )}
-        </Card>
+          </Card>
+        </Space>
       );
     };
 
     return (
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-        {renderHeroSummary()}
-        {renderVisionCompareCard()}
-        {renderConclusionTab()}
-        {renderMarketTab()}
-        {renderGapTab()}
-        {renderDiagnosticsSection()}
+        {renderVerdict()}
+        {renderActionPlan()}
+        {renderEvidenceSection()}
+        {renderDeepDive()}
       </Space>
     );
   };
