@@ -2155,6 +2155,22 @@ async function handleSellerAuthPopupPage(newPage, logPrefix = "[popup-monitor]")
       return;
     }
 
+    // 检测空白弹窗：seller-login 打开后内容完全空白（Temu 偶尔弹出无效的 session 验证页）
+    // 先 F5 刷新一次，可能是加载失败；刷新后仍然空白就关掉，避免死循环 10 轮
+    const bodyText = await newPage.evaluate(() => (document.body?.innerText || "").trim()).catch(() => "");
+    if (bodyText.length < 10) {
+      console.error(`${logPrefix} Popup body is blank/near-empty (${bodyText.length} chars), refreshing: ${currentUrl}`);
+      await newPage.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+      await randomDelay(3000, 5000);
+      const bodyAfterRefresh = await newPage.evaluate(() => (document.body?.innerText || "").trim()).catch(() => "");
+      if (bodyAfterRefresh.length < 10) {
+        console.error(`${logPrefix} Still blank after refresh (${bodyAfterRefresh.length} chars), closing stale popup`);
+        await newPage.close().catch(() => {});
+        return;
+      }
+      console.error(`${logPrefix} Content appeared after refresh (${bodyAfterRefresh.length} chars), proceeding with auth flow`);
+    }
+
     for (let attempt = 0; attempt < 10; attempt++) {
       if (__fatalLoginError) {
         console.error(`${logPrefix} Aborting popup login loop due to fatal login error: ${__fatalLoginError}`);

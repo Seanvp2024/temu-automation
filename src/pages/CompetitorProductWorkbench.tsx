@@ -1863,22 +1863,24 @@ export default function CompetitorProductWorkbench({
     && selectedYunqiGoodsId === selectedGoodsId;
   const selectedYunqiDisplay = useMemo(() => {
     if (!selectedProduct) return null;
+    // 全部从云启取数据，卖家后台数据仅作兜底
+    const yunqi = isSelectedYunqiExactMatch ? selectedYunqiDetail : null;
     return {
       title: firstTextValue(
+        yunqi?.title,
+        yunqi?.titleZh,
         selectedProduct.title,
-        isSelectedYunqiExactMatch ? selectedYunqiDetail?.title : "",
-        isSelectedYunqiExactMatch ? selectedYunqiDetail?.titleZh : "",
       ),
       imageUrl: firstTextValue(
+        yunqi ? getYunqiDetailImageUrl(yunqi) : "",
         selectedProductMeta?.imageUrl,
-        isSelectedYunqiExactMatch ? getYunqiDetailImageUrl(selectedYunqiDetail) : "",
       ),
-      price: (isSelectedYunqiExactMatch ? toSafeNumber(selectedYunqiDetail?.price) : 0) || selectedProduct.price || 0,
-      dailySales: (isSelectedYunqiExactMatch ? toSafeNumber(selectedYunqiDetail?.dailySales) : 0) || selectedProduct.dailySales || 0,
-      monthlySales: (isSelectedYunqiExactMatch ? toSafeNumber(selectedYunqiDetail?.monthlySales) : 0) || selectedProduct.monthlySales || 0,
-      score: (isSelectedYunqiExactMatch ? toSafeNumber(selectedYunqiDetail?.score ?? selectedYunqiDetail?.rating) : 0) || selectedProduct.score || 0,
-      reviewCount: (isSelectedYunqiExactMatch ? toSafeNumber(selectedYunqiDetail?.reviewCount) : 0) || selectedProduct.reviewCount || 0,
-      hasVideo: (isSelectedYunqiExactMatch ? Boolean(selectedYunqiDetail?.videoUrl) : false) || selectedProduct.hasVideo,
+      price: (yunqi ? toSafeNumber(yunqi.price) : 0) || selectedProduct.price || 0,
+      dailySales: (yunqi ? toSafeNumber(yunqi.dailySales) : 0) || selectedProduct.dailySales || 0,
+      monthlySales: (yunqi ? toSafeNumber(yunqi.monthlySales) : 0) || selectedProduct.monthlySales || 0,
+      score: (yunqi ? toSafeNumber(yunqi.score ?? yunqi.rating) : 0) || selectedProduct.score || 0,
+      reviewCount: (yunqi ? toSafeNumber(yunqi.reviewCount) : 0) || selectedProduct.reviewCount || 0,
+      hasVideo: (yunqi ? Boolean(yunqi.videoUrl) : false) || selectedProduct.hasVideo,
     };
   }, [isSelectedYunqiExactMatch, selectedProduct, selectedProductMeta?.imageUrl, selectedYunqiDetail]);
   const selectedYunqiTags = useMemo(() => collectYunqiTags(selectedYunqiDetail).slice(0, 12), [selectedYunqiDetail]);
@@ -2513,10 +2515,26 @@ export default function CompetitorProductWorkbench({
     return null;
   }, [keyword, results, resultSnapshots, selectedProduct, selectedSnapshots, wareHouseType]);
 
+  // 用云启数据覆盖本地商品数据，确保对比分析使用最新的价格/销量/评分
+  const analysisMyProduct = useMemo(() => {
+    if (!selectedProduct) return null;
+    if (!selectedYunqiDisplay) return selectedProduct;
+    return {
+      ...selectedProduct,
+      title: selectedYunqiDisplay.title || selectedProduct.title,
+      price: selectedYunqiDisplay.price || selectedProduct.price,
+      dailySales: selectedYunqiDisplay.dailySales || selectedProduct.dailySales,
+      monthlySales: selectedYunqiDisplay.monthlySales || selectedProduct.monthlySales,
+      score: selectedYunqiDisplay.score || selectedProduct.score,
+      reviewCount: selectedYunqiDisplay.reviewCount || selectedProduct.reviewCount,
+      hasVideo: selectedYunqiDisplay.hasVideo || selectedProduct.hasVideo,
+    };
+  }, [selectedProduct, selectedYunqiDisplay]);
+
   const analysis = useMemo<ExecutionReport | null>(() => {
-    if (!selectedProduct || !marketInsight || selectedSnapshots.length === 0) return null;
-    return buildExecutionReport(selectedProduct, selectedSnapshots, marketInsight);
-  }, [marketInsight, selectedProduct, selectedSnapshots]);
+    if (!analysisMyProduct || !marketInsight || selectedSnapshots.length === 0) return null;
+    return buildExecutionReport(analysisMyProduct, selectedSnapshots, marketInsight);
+  }, [analysisMyProduct, marketInsight, selectedSnapshots]);
   const diagnosisReferenceTags = useMemo(() => {
     const rows = selectedSampleRows.length > 0 ? selectedSampleRows : searchRows.slice(0, 5);
     return dedupeStrings(
@@ -2550,9 +2568,11 @@ export default function CompetitorProductWorkbench({
   // 记录上次分析的输入指纹，避免 selectedSampleRows 对象引用变化时反复触发
   const visionFingerprintRef = useRef<string>("");
 
+  const visionAutoRefreshedRef = useRef(false);
+
   const runVisionCompare = useCallback(async () => {
     const myImageUrl = firstTextValue(selectedYunqiDisplay?.imageUrl, selectedProductMeta?.imageUrl);
-    const competitorImageEntries = selectedSampleRows
+    const buildCompetitorEntries = () => selectedSampleRows
       .slice(0, 3)
       .map((row) => {
         const latest = row.latest as any;
@@ -2567,6 +2587,8 @@ export default function CompetitorProductWorkbench({
       })
       .filter(Boolean) as Array<{ url: string; title: string; priceText: string; monthlySales: number }>;
 
+    let competitorImageEntries = buildCompetitorEntries();
+
     if (!myImageUrl && competitorImageEntries.length === 0) {
       return; // 步骤 4 自动触发时静默跳过，等用户补齐数据
     }
@@ -2574,10 +2596,10 @@ export default function CompetitorProductWorkbench({
     setVisionLoading(true);
     setVisionError(null);
 
-    try {
+    const doVisionCompare = async (entries: typeof competitorImageEntries) => {
       const result = await window.electronAPI?.competitor?.visionCompare({
         myImage: myImageUrl ? { url: myImageUrl, title: selectedYunqiDisplay?.title || selectedProduct?.title || "我的主图" } : null,
-        competitorImages: competitorImageEntries,
+        competitorImages: entries,
         context: {
           keyword: results?.keyword || keyword.trim(),
           primaryNeed: marketInsight?.primaryNeed,
@@ -2586,14 +2608,64 @@ export default function CompetitorProductWorkbench({
         },
       });
       if (!result) throw new Error("AI 返回为空");
+      return result;
+    };
+
+    try {
+      const result = await doVisionCompare(competitorImageEntries);
       setVisionResult(result);
+      visionAutoRefreshedRef.current = false;
     } catch (error) {
-      setVisionError(stripWorkerErrorCode(getErrorMessage(error)));
+      const errMsg = getErrorMessage(error);
+      // OSS 签名过期（403）：自动刷新样本获取新图片 URL，然后重试一次
+      const isOssExpired = /403|OSS.*签名.*过期|Forbidden/i.test(errMsg);
+      if (isOssExpired && !visionAutoRefreshedRef.current && competitor && selectedUrls.length > 0) {
+        visionAutoRefreshedRef.current = true;
+        try {
+          const response = await withRetry(
+            () => competitor.batchTrack({ urls: selectedUrls }),
+            { label: "vision-auto-refresh" },
+          );
+          // 把新快照写入 tracked store
+          const existingTracked = await readArrayStoreValue("temu_competitor_tracked");
+          const updated = (existingTracked as TrackedProduct[]).map((item) => {
+            if (!selectedUrls.includes(item.url)) return item;
+            const next = response.results.find((r: any) => r.url === item.url);
+            if (next && !next.error) {
+              return { ...item, title: next.title || item.title, snapshots: [...item.snapshots, next].slice(-30) };
+            }
+            return item;
+          });
+          setTracked(updated);
+          await setStoreValueForActiveAccount(store, "temu_competitor_tracked", updated);
+          window.dispatchEvent(new CustomEvent(COMPETITOR_TRACKED_UPDATED_EVENT));
+          // 用刷新后的 sampleRows 构建新的图片入参（此处 selectedSampleRows 还没更新，从 updated 里取）
+          const trackedByUrl = new Map(updated.map((item) => [item.url, item]));
+          const freshEntries = selectedUrls.slice(0, 3).map((url) => {
+            const item = trackedByUrl.get(url);
+            const latest = item?.snapshots?.[item.snapshots.length - 1] as any;
+            const imgUrl = firstTextValue(latest?.imageUrl, latest?.imageUrls?.[0]);
+            if (!imgUrl) return null;
+            return { url: imgUrl, title: latest?.titleZh || latest?.title || "竞品", priceText: latest?.priceText || "", monthlySales: toSafeNumber(latest?.monthlySales) };
+          }).filter(Boolean) as typeof competitorImageEntries;
+
+          if (freshEntries.length > 0) {
+            const retryResult = await doVisionCompare(freshEntries);
+            setVisionResult(retryResult);
+            setVisionError(null);
+            setVisionLoading(false);
+            return;
+          }
+        } catch (refreshErr) {
+          console.warn("[vision-compare] auto-refresh failed:", refreshErr);
+        }
+      }
+      setVisionError(stripWorkerErrorCode(errMsg));
       setVisionResult(null);
     } finally {
       setVisionLoading(false);
     }
-  }, [keyword, marketInsight, results?.keyword, selectedProduct, selectedProductMeta, selectedSampleRows, selectedYunqiDisplay]);
+  }, [competitor, keyword, marketInsight, results?.keyword, selectedProduct, selectedProductMeta, selectedSampleRows, selectedUrls, selectedYunqiDisplay, store]);
 
   // 步骤 4 自动触发主图视觉对比；只有输入指纹变化时才重跑
   useEffect(() => {

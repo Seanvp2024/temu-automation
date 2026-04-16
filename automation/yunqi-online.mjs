@@ -550,6 +550,16 @@ const YUNQI_CDP_PORT = 9399;
 const YUNQI_CDP_USER_DATA = path.join(APPDATA_DIR, "yunqi-chrome-profile");
 let _cdpProcess = null;
 
+/** 关闭 CDP Chrome 进程（登录拿到 token 后调用，避免多余的浏览器窗口） */
+function closeCdpChrome() {
+  if (!_cdpProcess) return;
+  try {
+    _cdpProcess.kill();
+  } catch {}
+  _cdpProcess = null;
+  console.error("[yunqi-cdp] Chrome 进程已关闭");
+}
+
 function findChromeExeForCdp() {
   const candidates = [
     "C:/Program Files/Google/Chrome/Application/chrome.exe",
@@ -810,14 +820,26 @@ export function buildYunqiOnlineHandlers({ ensureBrowser, getContext, randomDela
   async function getYunqiApiPage() {
     try {
       let context = getContext();
-      if (!context) {
-        // 浏览器未启动，先启动
+      // 检查浏览器是否掉线（用户关了 Chrome / context 被销毁）
+      const browserAlive = context && typeof context.pages === "function";
+      if (browserAlive) {
+        try { context.pages(); } catch { context = null; }
+      }
+      if (!context || !browserAlive) {
+        // 清理缓存的旧页面引用
+        _yunqiApiPage = null;
         await ensureBrowser();
         context = getContext();
       }
       if (!context) return null;
-      // 复用已有页面
-      if (_yunqiApiPage && !_yunqiApiPage.isClosed()) return _yunqiApiPage;
+      // 复用已有页面（先确认页面还活着）
+      if (_yunqiApiPage) {
+        try {
+          if (_yunqiApiPage.isClosed()) _yunqiApiPage = null;
+          else { await _yunqiApiPage.evaluate(() => 1); } // 快速心跳
+        } catch { _yunqiApiPage = null; }
+      }
+      if (_yunqiApiPage) return _yunqiApiPage;
       // 在已有页面中找一个云启域名的
       const pages = context.pages();
       for (const p of pages) {
@@ -852,16 +874,31 @@ export function buildYunqiOnlineHandlers({ ensureBrowser, getContext, randomDela
     const bodyStr = options?.body == null ? null : (typeof options.body === "string" ? options.body : JSON.stringify(options.body));
     const fullUrl = new URL(pathName, YUNQI_HOME_URL).toString();
 
-    // 先确保 CDP Chrome 在云启域名上（cookie 需要同源）
+    // 先确保 CDP Chrome 在云启域名上（cookie 需要同源），检测 session 是否掉线
     try {
       const navResult = await sendCdpCommand("Runtime.evaluate", {
-        expression: `window.location.origin`,
+        expression: `window.location.href`,
         returnByValue: true,
       });
-      const currentOrigin = navResult?.result?.value || "";
-      if (!currentOrigin.includes("yunqishuju")) {
+      const currentHref = navResult?.result?.value || "";
+      if (!currentHref.includes("yunqishuju")) {
         await sendCdpCommand("Page.navigate", { url: YUNQI_TEMU_URL });
         await new Promise((r) => setTimeout(r, 3000));
+      } else if (currentHref.includes("/login")) {
+        // session 过期跳到了登录页，自动重新登录
+        console.error("[yunqi-cdp] Session 过期，CDP Chrome 在登录页，尝试自动重新登录...");
+        await automateLoginViaCdp();
+        // 等待登录完成，轮询 token
+        const loginDeadline = Date.now() + 30_000;
+        while (Date.now() < loginDeadline) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const tok = await extractTokenFromCdpChrome();
+          if (tok) {
+            writeYunqiTokenRecord(tok, "cdp-session-refresh");
+            console.error("[yunqi-cdp] 重新登录成功，token 已刷新");
+            break;
+          }
+        }
       }
     } catch {}
 
@@ -1354,7 +1391,15 @@ export function buildYunqiOnlineHandlers({ ensureBrowser, getContext, randomDela
     const url = String(params.url || "").trim();
     const goodsId = String(params.goodsId || "").trim() || parseTemuGoodsIdFromUrl(url);
     if (!goodsId) throw new Error("Please provide a valid Temu goods link or goodsId");
-    const payload = await requestYunqiSearch(buildYunqiSearchBody({ ...params, goodsId, keyword: "", maxResults: 20 }));
+    // 优先用 goodsId 作为关键词走 CDP 搜索（实时数据），API 作为兜底
+    let payload;
+    try {
+      payload = await requestYunqiSearch(buildYunqiSearchBody({ ...params, goodsId, keyword: goodsId, maxResults: 20 }));
+    } catch (cdpErr) {
+      console.error(`[competitorTrack] CDP 搜索失败, 回退 API: ${String(cdpErr?.message || cdpErr).slice(0, 200)}`);
+      if (String(cdpErr?.message || "").includes(YUNQI_AUTH_INVALID_CODE)) throw cdpErr;
+      payload = await requestYunqiSearch(buildYunqiSearchBody({ ...params, goodsId, keyword: "", maxResults: 20 }));
+    }
     const items = extractYunqiItems(payload);
     const matched = items.find((item) => firstNonEmptyText(item?.goods_id, item?.goodsId, item?.id) === goodsId) || null;
     if (!matched) {
@@ -1449,14 +1494,50 @@ export function buildYunqiOnlineHandlers({ ensureBrowser, getContext, randomDela
     autoLogin: async () => {
       // ---- 纯 CDP 模式：启动真实 Chrome，全自动登录 ----
 
-      // 1. 先检查是否已有有效 token（从 CDP Chrome cookie 或本地文件）
-      const existingToken = await extractTokenFromCdpChrome();
-      if (existingToken) {
-        const saved = writeYunqiTokenRecord(existingToken, "cdp-existing");
-        return { ...saved, autoLogin: true, alreadyLoggedIn: true, cdpMode: true };
+      // 0. 检查 CDP Chrome 是否在登录页（session 过期跳转）
+      let cdpOnLoginPage = false;
+      if (await isCdpAlive()) {
+        try {
+          const navResult = await sendCdpCommand("Runtime.evaluate", {
+            expression: `window.location.href`,
+            returnByValue: true,
+          });
+          const currentHref = navResult?.result?.value || "";
+          cdpOnLoginPage = currentHref.includes("/login");
+          if (cdpOnLoginPage) {
+            console.error("[yunqi-cdp] autoLogin: CDP Chrome 在登录页，session 已过期，需要重新登录");
+          }
+        } catch {}
       }
 
-      // 2. 启动真实 Chrome（使用系统默认 profile）
+      // 1. 先检查是否已有有效 token（从 CDP Chrome cookie 或本地文件）
+      //    但如果 Chrome 在 /login 页面，说明 session 已过期，cookie 中的 token 不可信
+      if (!cdpOnLoginPage) {
+        const existingToken = await extractTokenFromCdpChrome();
+        if (existingToken) {
+          const saved = writeYunqiTokenRecord(existingToken, "cdp-existing");
+          return { ...saved, autoLogin: true, alreadyLoggedIn: true, cdpMode: true };
+        }
+      }
+
+      // 2. 如果 CDP Chrome 已在运行但在登录页，直接在当前页面重新登录
+      if (cdpOnLoginPage) {
+        console.error("[yunqi-cdp] autoLogin: 在已有的 CDP Chrome 登录页上重新登录...");
+        await automateLoginViaCdp();
+        const loginDeadline = Date.now() + 60_000;
+        while (Date.now() < loginDeadline) {
+          await new Promise((r) => setTimeout(r, 3000));
+          const token = await extractTokenFromCdpChrome();
+          if (token) {
+            const saved = writeYunqiTokenRecord(token, "cdp-session-refresh");
+            console.error("[yunqi-cdp] autoLogin: 重新登录成功，token 已刷新");
+            return { ...saved, autoLogin: true, alreadyLoggedIn: false, cdpMode: true };
+          }
+        }
+        throw new Error("重新登录超时，请检查账号密码是否正确，或手动在 CDP Chrome 中登录");
+      }
+
+      // 3. 启动真实 Chrome（使用系统默认 profile）
       console.error("[yunqi-cdp] 启动真实 Chrome 进行云启登录...");
       await launchCdpChromeProcess(YUNQI_LOGIN_URL);
 
@@ -1471,10 +1552,10 @@ export function buildYunqiOnlineHandlers({ ensureBrowser, getContext, randomDela
         return { ...saved, autoLogin: true, alreadyLoggedIn: true, cdpMode: true };
       }
 
-      // 3. 自动填写账号密码登录
-      const loginOk = await automateLoginViaCdp();
+      // 4. 自动填写账号密码登录
+      await automateLoginViaCdp();
 
-      // 4. 轮询等待登录完成（最多 60 秒）
+      // 5. 轮询等待登录完成（最多 60 秒）
       const deadline = Date.now() + 60_000;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 3000));

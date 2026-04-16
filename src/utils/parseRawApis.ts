@@ -699,7 +699,7 @@ function buildFluxDetailLookup(apis: any[]) {
   return { detailByIdentity, trendByIdentity };
 }
 
-function buildFluxRangeDataset(apis: any[], syncedAt = "") {
+function buildFluxRangeDataset(apis: any[], syncedAt = "", allApis: any[] = []) {
   const { detailByIdentity, trendByIdentity } = buildFluxDetailLookup(apis);
   const mallSummary = normalizeFluxSummary(findApi(apis, "mall/summary"));
   const fluxResults = findAllApis(apis, "goods/list");
@@ -714,10 +714,66 @@ function buildFluxRangeDataset(apis: any[], syncedAt = "") {
     return mergeFluxItemDetail(item, detailResult, trendResult);
   });
 
+  // 当没有 mall/summary（如欧区/美区）时，从 goods/list 聚合汇总 + 从 daily cache 构建趋势
+  const summary = mallSummary || buildFallbackFluxSummary(items, allApis);
+
   return {
-    summary: mallSummary,
+    summary,
     items,
     syncedAt,
+  };
+}
+
+/** 从 goods/list 聚合指标 + __flux_product_daily_cache__ 构建 trendList，作为无 mall/summary 时的兜底 */
+function buildFallbackFluxSummary(items: any[], allApis: any[]) {
+  if (items.length === 0 && allApis.length === 0) return null;
+
+  // 聚合 goods/list 的指标
+  let totalVisitors = 0;
+  let totalBuyers = 0;
+  for (const item of items) {
+    totalVisitors += toNumberValue(pickFirst(item.detailVisitorNum, item.detailVisitNum, item.goodsDetailVisitorNum));
+    totalBuyers += toNumberValue(pickFirst(item.buyerNum, item.payBuyerNum));
+  }
+
+  // 从 __flux_product_daily_cache__ 构建每日趋势
+  const trendList: any[] = [];
+  const dailyCacheApi = allApis.find((a: any) => a.path === "__flux_product_daily_cache__");
+  if (dailyCacheApi?.data?.result) {
+    const products = dailyCacheApi.data.result;
+    const dayMap: Record<string, { visitors: number; buyers: number }> = {};
+    for (const product of Object.values(products) as any[]) {
+      const stationEntries = Object.values(product?.stations || {}) as any[];
+      for (const station of stationEntries) {
+        for (const day of toArray(station?.daily)) {
+          const date = toStringValue(day?.date);
+          if (!date) continue;
+          if (!dayMap[date]) dayMap[date] = { visitors: 0, buyers: 0 };
+          dayMap[date].visitors += toNumberValue(pickFirst(day.detailVisitorNum, day.detailVisitNum));
+          dayMap[date].buyers += toNumberValue(day.buyerNum);
+        }
+      }
+    }
+    const sortedDates = Object.keys(dayMap).sort();
+    for (const date of sortedDates) {
+      const d = dayMap[date];
+      trendList.push({
+        date,
+        visitors: d.visitors,
+        buyers: d.buyers,
+        conversionRate: d.visitors > 0 ? d.buyers / d.visitors : 0,
+      });
+    }
+  }
+
+  if (totalVisitors === 0 && totalBuyers === 0 && trendList.length === 0) return null;
+
+  return {
+    todayVisitors: totalVisitors,
+    todayBuyers: totalBuyers,
+    todayConversionRate: totalVisitors > 0 ? totalBuyers / totalVisitors : 0,
+    updateTime: "",
+    trendList,
   };
 }
 
@@ -1079,13 +1135,13 @@ export function parseFluxData(raw: any): any {
     return accumulator;
   }, {});
 
-  const availableRanges = Object.keys(apisByRange).sort((left, right) => getFluxRangePriority(left) - getFluxRangePriority(right));
+  const availableRanges = Object.keys(apisByRange).filter((label) => !label.startsWith("__")).sort((left, right) => getFluxRangePriority(left) - getFluxRangePriority(right));
   const summaryByRange = availableRanges.reduce<Record<string, any>>((accumulator, label) => {
-    accumulator[label] = buildFluxRangeDataset(apisByRange[label] || [], raw.syncedAt).summary;
+    accumulator[label] = buildFluxRangeDataset(apisByRange[label] || [], raw.syncedAt, apis).summary;
     return accumulator;
   }, {});
   const itemsByRange = availableRanges.reduce<Record<string, any[]>>((accumulator, label) => {
-    accumulator[label] = buildFluxRangeDataset(apisByRange[label] || [], raw.syncedAt).items;
+    accumulator[label] = buildFluxRangeDataset(apisByRange[label] || [], raw.syncedAt, apis).items;
     return accumulator;
   }, {});
   const primaryRangeLabel = pickFluxPrimaryRangeLabel(summaryByRange, itemsByRange, raw?.meta?.rangeLabel);

@@ -737,6 +737,7 @@ function BatchCreate() {
               <Tag color="blue">液体 {filterSummary.excludedSummary?.liquid || 0}</Tag>
               <Tag color="purple">膏体 {filterSummary.excludedSummary?.paste || 0}</Tag>
               <Tag color="orange">带电 {filterSummary.excludedSummary?.electric || 0}</Tag>
+              <Tag color="cyan">服饰鞋 {filterSummary.excludedSummary?.clothing || 0}</Tag>
               <Tag color="red">IP {filterSummary.excludedSummary?.ip || 0}</Tag>
             </Space>
           )}
@@ -781,7 +782,7 @@ function BatchCreate() {
               </div>
               <div className="create-flow-hint">
                 <Text strong>2. 过滤风险</Text>
-                <Text type="secondary">可先剔除液体、膏体、带电和 IP 等高风险商品。</Text>
+                <Text type="secondary">可先剔除液体、膏体、带电、服饰鞋和 IP 等高风险商品。</Text>
               </div>
               <div className="create-flow-hint">
                 <Text strong>3. 批量创建</Text>

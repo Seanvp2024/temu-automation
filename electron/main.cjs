@@ -113,6 +113,7 @@ const STORE_KEY_PATTERN = /^[A-Za-z0-9._:-]+$/;
 
 const AUTO_PRICING_FILTER_KEYWORDS = {
   liquid: [
+    // 中文
     "液体", "液态", "喷雾", "香水", "精油", "乳液", "爽肤水", "精华液", "精华水", "面霜", "乳霜", "溶液",
     "洗发水", "护发素", "沐浴露", "沐浴乳", "洗衣液", "柔顺剂", "护理液", "清洁液", "清洁剂", "消毒液", "消毒水",
     "墨水", "胶水", "机油", "酒精", "染发剂", "染发膏", "卸妆水", "卸妆油", "卸妆乳", "化妆水", "柔肤水",
@@ -122,16 +123,82 @@ const AUTO_PRICING_FILTER_KEYWORDS = {
     "护手霜", "身体乳", "润肤乳", "润肤露", "保湿水", "爽身粉液", "花露水", "驱蚊液", "杀虫剂",
     "啤酒", "饮料", "饮品", "果汁", "牛奶", "蜂蜜", "酱油", "醋", "食用油",
     "打火机油", "稀释剂", "稀释液", "颜料", "油漆", "涂料", "万能胶", "502", "ab胶",
+    // 英文
+    "liquid", "spray", "perfume", "fragrance", "cologne", "essential oil", "lotion", "toner", "serum", "emulsion",
+    "shampoo", "conditioner", "body wash", "shower gel", "detergent", "softener", "cleaner", "cleaning solution",
+    "disinfectant", "sanitizer", "ink", "glue", "motor oil", "alcohol", "hair dye", "hair color",
+    "makeup remover", "foundation liquid", "concealer liquid", "nail polish", "nail remover",
+    "hand wash", "hand soap", "dish soap", "facial cleanser", "face wash",
+    "hand cream", "body lotion", "moisturizer", "sunscreen", "sunblock", "spf",
+    "insect repellent", "insecticide", "bug spray", "mosquito repellent",
+    "beverage", "juice", "milk", "honey", "soy sauce", "vinegar", "cooking oil", "olive oil",
+    "lighter fluid", "thinner", "solvent", "paint", "adhesive", "super glue", "epoxy",
+    "eau de toilette", "eau de parfum", "mist", "aftershave",
+    "eyeliner liquid", "lip gloss", "lip oil", "lip tint",
   ],
   paste: [
+    // 中文
     "膏体", "膏状", "牙膏", "乳膏", "软膏", "凝胶", "啫喱", "胶泥", "泥膜", "发蜡", "发胶", "摩丝",
     "唇膏", "口红", "润唇膏", "唇膜", "面膜", "睡眠面膜", "眼膜", "鼻膜", "护手膏", "身体霜",
     "睫毛膏", "眼影膏", "腮红膏", "高光膏", "遮瑕膏", "粉底膏", "修容膏", "眉膏",
     "护肤膏", "万金油", "清凉油", "凡士林", "护臀膏", "蚊虫膏", "膏药",
     "牙膏状", "啫喱膏", "浆糊", "黄油", "奶油", "果酱", "酱料",
+    // 英文
+    "paste", "toothpaste", "cream", "ointment", "gel", "jelly", "wax", "hair wax", "hair gel", "mousse",
+    "lipstick", "lip balm", "lip cream", "chapstick", "face mask", "facial mask", "sleep mask", "eye mask",
+    "mascara", "eye shadow cream", "blush cream", "concealer", "foundation cream",
+    "vaseline", "petroleum jelly", "balm", "salve", "pomade",
+    "butter", "jam", "sauce", "clay mask", "mud mask", "putty",
   ],
   electric: [
+    // 中文
     "带电", "电池", "锂电", "纽扣电池", "充电", "充电器", "适配器", "usb", "电动", "电机", "插电", "无线充", "电源",
+    // 英文
+    "battery", "batteries", "lithium", "li-ion", "li-po", "lipo",
+    "charger", "charging", "rechargeable", "adapter", "power adapter", "power supply", "power bank",
+    "electric", "electrical", "electronic motor", "motor driven", "plug-in", "plug in",
+    "wireless charger", "wireless charging",
+    "led light", "led lamp", "led strip",
+    "bluetooth", "speaker", "headphone", "earphone", "earbuds", "headset",
+    "vibrator", "vibrating", "massage gun", "massager",
+    "fan", "mini fan", "portable fan",
+    "hair dryer", "hair clipper", "hair trimmer", "shaver", "razor electric",
+    "heated", "heating pad", "heating",
+  ],
+  clothing: [
+    // 中文 — 衣服
+    "衣服", "上衣", "外套", "夹克", "棉衣", "棉服", "羽绒服", "冲锋衣", "风衣", "大衣", "毛呢大衣",
+    "卫衣", "帽衫", "连帽衫", "毛衣", "针织衫", "打底衫", "polo衫", "衬衫", "衬衣", "t恤", "短袖", "长袖",
+    "背心", "马甲", "吊带", "西装", "西服", "礼服", "套装", "旗袍", "汉服",
+    "运动服", "健身服", "瑜伽服", "泳衣", "比基尼", "睡衣", "睡袍", "浴袍", "内衣", "文胸", "胸罩", "内裤",
+    "连衣裙", "半身裙", "短裙", "长裙", "a字裙", "百褶裙", "包臀裙", "纱裙", "牛仔裙",
+    // 中文 — 裤子
+    "裤子", "长裤", "短裤", "牛仔裤", "休闲裤", "运动裤", "西裤", "阔腿裤", "直筒裤", "紧身裤",
+    "打底裤", "瑜伽裤", "工装裤", "哈伦裤", "九分裤", "五分裤", "七分裤", "喇叭裤", "破洞裤",
+    "束脚裤", "棉裤", "保暖裤", "秋裤",
+    // 中文 — 鞋子
+    "鞋子", "鞋", "运动鞋", "跑步鞋", "篮球鞋", "足球鞋", "板鞋", "帆布鞋", "休闲鞋", "皮鞋",
+    "高跟鞋", "凉鞋", "拖鞋", "靴子", "短靴", "长靴", "雪地靴", "马丁靴", "切尔西靴",
+    "豆豆鞋", "乐福鞋", "穆勒鞋", "渔夫鞋", "老爹鞋", "增高鞋", "小白鞋", "单鞋", "雨鞋", "雨靴",
+    "登山鞋", "徒步鞋", "溯溪鞋", "涉水鞋", "洞洞鞋",
+    // 英文 — clothing
+    "shirt", "t-shirt", "tshirt", "blouse", "top", "tank top", "camisole", "vest",
+    "jacket", "coat", "overcoat", "trench coat", "windbreaker", "parka", "down jacket", "puffer",
+    "hoodie", "sweatshirt", "sweater", "cardigan", "pullover", "knitwear", "knitted",
+    "suit", "blazer", "tuxedo", "formal wear",
+    "dress", "gown", "skirt", "mini skirt", "maxi skirt", "pleated skirt",
+    "sportswear", "activewear", "swimsuit", "swimwear", "bikini",
+    "pajamas", "pyjamas", "nightgown", "bathrobe", "robe", "lingerie", "underwear", "bra", "briefs", "panties", "boxers",
+    // 英文 — pants
+    "pants", "trousers", "jeans", "denim", "shorts", "leggings", "joggers", "sweatpants",
+    "cargo pants", "chinos", "slacks", "capri", "culottes", "overalls",
+    "yoga pants", "flare pants", "wide leg pants", "straight leg pants", "skinny pants",
+    // 英文 — shoes
+    "shoes", "sneakers", "trainers", "running shoes", "basketball shoes",
+    "boots", "ankle boots", "chelsea boots", "combat boots", "snow boots", "hiking boots",
+    "sandals", "slippers", "flip flops", "heels", "high heels", "pumps", "stilettos",
+    "loafers", "moccasins", "flats", "oxford shoes", "derby shoes",
+    "canvas shoes", "espadrilles", "clogs", "mules", "wedges", "platform shoes",
   ],
 };
 
@@ -212,7 +279,9 @@ function detectProductTableHeaderRow(rows = []) {
   for (let i = 0; i < Math.min(10, rows.length); i++) {
     const row = Array.isArray(rows[i]) ? rows[i] : [];
     const rowText = row.map((cell) => normalizeImportedCellText(cell, " ")).join("|");
-    if (rowText.includes("商品标题") || rowText.includes("商品名称") || rowText.includes("商品主图") || rowText.includes("美元价格")) {
+    if (rowText.includes("商品标题") || rowText.includes("商品名称") || rowText.includes("商品主图") || rowText.includes("美元价格")
+      || /product\s*(title|name)/i.test(rowText) || /item\s*(title|name)/i.test(rowText)
+      || /goods\s*(title|name)/i.test(rowText) || /usd\s*price/i.test(rowText) || /sku\s*id/i.test(rowText)) {
       return i;
     }
   }
@@ -223,19 +292,38 @@ function buildAutoPricingRowSearchText(row = []) {
   return row.map((cell) => normalizeImportedCellText(cell, " ")).filter(Boolean).join(" | ");
 }
 
+function matchesKeyword(text, keyword) {
+  // 中文关键词：直接用 includes 子串匹配
+  if (/[\u4e00-\u9fff]/.test(keyword)) {
+    return text.includes(keyword);
+  }
+  // 英文关键词：用单词边界匹配，避免 "gel" 匹配 "angel" 等误判
+  const trimmed = keyword.trim();
+  if (!trimmed) return false;
+  try {
+    const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`\\b${escaped}\\b`, "i").test(text);
+  } catch {
+    return text.includes(keyword);
+  }
+}
+
 function detectAutoPricingExcludedReasons(row = []) {
   const searchText = buildAutoPricingRowSearchText(row);
   const normalizedText = searchText.toLowerCase();
   const reasons = [];
 
-  if (AUTO_PRICING_FILTER_KEYWORDS.liquid.some((keyword) => normalizedText.includes(keyword))) {
+  if (AUTO_PRICING_FILTER_KEYWORDS.liquid.some((keyword) => matchesKeyword(normalizedText, keyword))) {
     reasons.push("液体");
   }
-  if (AUTO_PRICING_FILTER_KEYWORDS.paste.some((keyword) => normalizedText.includes(keyword))) {
+  if (AUTO_PRICING_FILTER_KEYWORDS.paste.some((keyword) => matchesKeyword(normalizedText, keyword))) {
     reasons.push("膏体");
   }
-  if (AUTO_PRICING_FILTER_KEYWORDS.electric.some((keyword) => normalizedText.includes(keyword))) {
+  if (AUTO_PRICING_FILTER_KEYWORDS.electric.some((keyword) => matchesKeyword(normalizedText, keyword))) {
     reasons.push("带电");
+  }
+  if (AUTO_PRICING_FILTER_KEYWORDS.clothing.some((keyword) => matchesKeyword(normalizedText, keyword))) {
+    reasons.push("服饰鞋");
   }
   if (AUTO_PRICING_IP_PATTERNS.some((pattern) => pattern.test(searchText))) {
     reasons.push("IP");
@@ -279,7 +367,7 @@ function filterAutoPricingProductTable(inputPath) {
 
   const keptRows = [];
   const excludedRows = [];
-  const excludedSummary = { liquid: 0, paste: 0, electric: 0, ip: 0 };
+  const excludedSummary = { liquid: 0, paste: 0, electric: 0, clothing: 0, ip: 0 };
 
   dataRows.forEach((row) => {
     const reasons = detectAutoPricingExcludedReasons(row);
@@ -292,6 +380,7 @@ function filterAutoPricingProductTable(inputPath) {
     if (reasons.includes("液体")) excludedSummary.liquid += 1;
     if (reasons.includes("膏体")) excludedSummary.paste += 1;
     if (reasons.includes("带电")) excludedSummary.electric += 1;
+    if (reasons.includes("服饰鞋")) excludedSummary.clothing += 1;
     if (reasons.includes("IP")) excludedSummary.ip += 1;
   });
 

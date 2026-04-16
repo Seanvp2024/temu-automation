@@ -199,8 +199,8 @@ const ShopOverview: React.FC = () => {
       if (governRaw) setGovern(governRaw);
       if (marketingRaw) setMarketing(marketingRaw);
       if (adsRaw) setAdsHome(adsRaw);
-      if (fluxUSRaw) setFluxUS(fluxUSRaw);
-      if (fluxEURaw) setFluxEU(fluxEURaw);
+      if (fluxUSRaw) setFluxUS(parseFluxData(fluxUSRaw));
+      if (fluxEURaw) setFluxEU(parseFluxData(fluxEURaw));
       if (qualityEURaw) setQualityEU(qualityEURaw);
       if (checkupRaw) setCheckup(checkupRaw);
       if (qcDetailRaw) setQcDetail(qcDetailRaw);
