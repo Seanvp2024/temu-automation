@@ -1387,6 +1387,269 @@ export function buildYunqiOnlineHandlers({ ensureBrowser, getContext, randomDela
     throw new Error("竞品搜索暂时不可用");
   }
 
+  /**
+   * 通过云启 API 或详情页 CDP 抓取，补全 CDP 搜索列表页缺失的字段：
+   * GMV、店铺评分、店铺商品数、市场价、欧元价、上架时间、最近更新、投流时间、评论提示、广告记录等。
+   */
+  async function fetchYunqiDetailFields(goodsId) {
+    // ── 方案 1：通过云启 API 获取详情 ──
+    const apiPaths = [
+      `/api/proxytemu/goods/${goodsId}/detail`,
+      `/api/proxytemu/good/${goodsId}`,
+      `/api/proxytemu/goods/${goodsId}`,
+    ];
+    for (const apiPath of apiPaths) {
+      try {
+        const result = await requestYunqiApi(apiPath, { method: "GET" });
+        if (result && (result.code === 0 || result.data)) {
+          const detail = result.data || result;
+          console.error(`[yunqi-detail] API 获取详情成功: ${apiPath}`);
+          return detail;
+        }
+      } catch (err) {
+        if (String(err?.message || "").includes(YUNQI_AUTH_INVALID_CODE)) throw err;
+        // 可能 404，继续尝试下一个路径
+      }
+    }
+
+    // ── 方案 2：CDP 导航到详情页，抓取 Vue/Nuxt 数据或 DOM ──
+    if (!(await isCdpAlive())) {
+      console.error("[yunqi-detail] CDP 不可用，跳过详情页抓取");
+      return null;
+    }
+
+    try {
+      const detailUrl = `https://www.yunqishuju.com/temu/detail/${goodsId}`;
+      console.error(`[yunqi-detail] CDP 导航到详情页: ${detailUrl}`);
+      await sendCdpCommand("Page.navigate", { url: detailUrl });
+      await new Promise((r) => setTimeout(r, 5000));
+
+      const detailScrapeScript = `
+        (() => {
+          const result = {};
+
+          // ── 尝试从 Nuxt/Vue store 获取完整数据 ──
+          try {
+            const nuxtData = window.__NUXT__?.data || window.__NUXT__?.state || {};
+            const findDetail = (obj, depth) => {
+              if (!obj || typeof obj !== 'object' || depth > 5) return null;
+              // 检查是否有 goods_id 匹配的对象
+              if (String(obj.goods_id || obj.goodsId || obj.id || '') === '${goodsId}') return obj;
+              if (Array.isArray(obj)) {
+                for (const item of obj) {
+                  const found = findDetail(item, depth + 1);
+                  if (found) return found;
+                }
+              } else {
+                for (const key of Object.keys(obj)) {
+                  const found = findDetail(obj[key], depth + 1);
+                  if (found) return found;
+                }
+              }
+              return null;
+            };
+            const storeData = findDetail(nuxtData, 0);
+            if (storeData) {
+              Object.assign(result, storeData);
+              result._source = 'nuxt_store';
+              return JSON.stringify(result);
+            }
+
+            // 尝试 Vue 组件
+            const appEl = document.querySelector('#__nuxt') || document.querySelector('#app') || document.querySelector('[id*="app"]');
+            if (appEl?.__vue_app__) {
+              const vueData = findDetail(appEl.__vue_app__.$data || {}, 0);
+              if (vueData) {
+                Object.assign(result, vueData);
+                result._source = 'vue_app';
+                return JSON.stringify(result);
+              }
+            }
+            if (window.$nuxt?.$store?.state) {
+              const vuexData = findDetail(window.$nuxt.$store.state, 0);
+              if (vuexData) {
+                Object.assign(result, vuexData);
+                result._source = 'vuex_store';
+                return JSON.stringify(result);
+              }
+            }
+          } catch(e) {}
+
+          // ── Fallback: 从 DOM 提取 ──
+          try {
+            result._source = 'dom_scrape';
+            const getText = (selectors) => {
+              for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el?.innerText?.trim()) return el.innerText.trim();
+              }
+              return '';
+            };
+            const getTextByLabel = (label) => {
+              const allLabels = [...document.querySelectorAll('span,label,div,th,td,dt,p')];
+              for (const el of allLabels) {
+                const text = (el.innerText || '').trim();
+                if (text === label || text.startsWith(label)) {
+                  // 获取相邻元素的值
+                  const sibling = el.nextElementSibling;
+                  if (sibling?.innerText?.trim()) return sibling.innerText.trim();
+                  const parent = el.parentElement;
+                  if (parent) {
+                    const valueEl = parent.querySelector('span:last-child, div:last-child, dd, td:last-child');
+                    if (valueEl && valueEl !== el && valueEl.innerText?.trim()) return valueEl.innerText.trim();
+                  }
+                }
+              }
+              return '';
+            };
+            const parseNum = (text) => {
+              if (!text) return null;
+              const cleaned = text.replace(/[,$¥€\\s]/g, '');
+              const num = parseFloat(cleaned);
+              return isFinite(num) ? num : null;
+            };
+
+            // 通用标签值对抓取
+            const labelMap = {
+              'USD GMV': 'usd_gmv', 'EUR GMV': 'eur_gmv',
+              'GMV(USD)': 'usd_gmv', 'GMV(EUR)': 'eur_gmv',
+              '美元GMV': 'usd_gmv', '欧元GMV': 'eur_gmv',
+              '店铺评分': 'mall_score', '店铺商品数': 'mall_product_count',
+              '市场价': 'market_price', '原价': 'market_price',
+              '美元价': 'usd_price', '欧元价': 'eur_price',
+              'USD价格': 'usd_price', 'EUR价格': 'eur_price',
+              '上架时间': 'created_at', '上架日期': 'created_at',
+              '最近更新': 'last_modified', '更新时间': 'last_modified',
+              '最近投流': 'last_ad_time', '投流时间': 'last_ad_time',
+              '评论数': 'comment_num_tips', '评论': 'comment_num_tips',
+              '同款数': 'same_num', '相似款': 'same_num',
+              '日销': 'daily_sales', '周销': 'weekly_sales',
+              '月销': 'monthly_sales', '总销量': 'total_sales',
+              '累计销量': 'total_sales',
+            };
+            for (const [label, key] of Object.entries(labelMap)) {
+              const value = getTextByLabel(label);
+              if (value && !result[key]) {
+                const num = parseNum(value);
+                result[key] = num != null ? num : value;
+              }
+            }
+
+            // 抓取所有 Statistic / 数据卡片
+            const statCards = document.querySelectorAll('.el-statistic, .stat-card, [class*="statistic"], [class*="stat-"]');
+            statCards.forEach(card => {
+              const titleEl = card.querySelector('[class*="title"], [class*="label"], [class*="head"]');
+              const valueEl = card.querySelector('[class*="value"], [class*="content"], [class*="number"]');
+              if (titleEl && valueEl) {
+                const titleText = titleEl.innerText.trim();
+                const valueText = valueEl.innerText.trim();
+                for (const [label, key] of Object.entries(labelMap)) {
+                  if (titleText.includes(label) && !result[key]) {
+                    const num = parseNum(valueText);
+                    result[key] = num != null ? num : valueText;
+                  }
+                }
+              }
+            });
+
+            // 抓取表格里的分站价格
+            const priceTables = document.querySelectorAll('table, .el-table');
+            const prices = [];
+            priceTables.forEach(table => {
+              const rows = table.querySelectorAll('tr, .el-table__row');
+              rows.forEach(row => {
+                const cells = [...row.querySelectorAll('td, .el-table__cell')];
+                if (cells.length >= 2) {
+                  const region = cells[0]?.innerText?.trim();
+                  const priceVal = cells[1]?.innerText?.trim();
+                  if (region && priceVal && /\\$|€|£/.test(priceVal)) {
+                    prices.push({ region, price: priceVal });
+                  }
+                }
+              });
+            });
+            if (prices.length > 0) result.prices = prices;
+
+            // 广告记录
+            const adElements = document.querySelectorAll('[class*="ad-record"], [class*="adRecord"], [class*="ad_record"]');
+            if (adElements.length > 0) {
+              result.ad_records = [...adElements].map(el => ({
+                text: el.innerText?.trim() || '',
+              })).filter(r => r.text);
+            }
+          } catch(e) {}
+
+          return JSON.stringify(result);
+        })()
+      `;
+
+      const detailResult = await sendCdpCommand("Runtime.evaluate", {
+        expression: detailScrapeScript, returnByValue: true,
+      });
+      const detailData = JSON.parse(detailResult?.result?.value || "{}");
+
+      // 导航回首页，避免影响后续搜索操作
+      sendCdpCommand("Page.navigate", { url: "https://www.yunqishuju.com/temu/home" }).catch(() => {});
+
+      if (Object.keys(detailData).length > 1) {
+        console.error(`[yunqi-detail] CDP 详情页抓取成功 (source: ${detailData._source || "unknown"}, fields: ${Object.keys(detailData).length})`);
+        return detailData;
+      }
+      console.error("[yunqi-detail] CDP 详情页抓取无有效数据");
+      return null;
+    } catch (err) {
+      // 出错也尝试导航回首页
+      sendCdpCommand("Page.navigate", { url: "https://www.yunqishuju.com/temu/home" }).catch(() => {});
+      console.error(`[yunqi-detail] CDP 详情页抓取失败: ${String(err?.message || err).slice(0, 200)}`);
+      return null;
+    }
+  }
+
+  /**
+   * 将详情补充数据合并到已有的搜索列表数据中（列表数据优先级高，详情只补空字段）
+   */
+  function mergeDetailIntoSearchResult(searchData, detailData) {
+    if (!detailData || typeof detailData !== "object") return searchData;
+    const merged = { ...searchData };
+    // 需要补全的字段列表（搜索列表页通常缺失的）
+    const detailOnlyFields = [
+      "usd_gmv", "usdGmv", "eur_gmv", "eurGmv",
+      "mall_score", "mallScore", "mall_product_count", "mallTotalGoods",
+      "market_price", "marketPrice", "eur_price", "eurPrice",
+      "created_at", "createdAt", "issued_date", "issuedDate", "listed_at",
+      "last_modified", "lastModified", "updated_at",
+      "last_ad_time", "lastAdTime",
+      "comment_num_tips", "total_comment_num_tips", "commentNumTips",
+      "same_num", "sameNum",
+      "ad_records", "adRecords",
+      "video_url", "videoUrl",
+      "brand", "activity_type", "activityType",
+      "sold_out", "soldOut", "adult",
+      "ware_house_type", "wareHouseType",
+      "daily_sales_list",
+      "prices",
+      "labels",
+    ];
+    for (const key of detailOnlyFields) {
+      const detailVal = detailData[key];
+      if (detailVal == null || detailVal === "" || detailVal === 0) continue;
+      // 只在搜索数据缺失时填入
+      const existingVal = merged[key];
+      if (existingVal == null || existingVal === "" || existingVal === 0 || (Array.isArray(existingVal) && existingVal.length === 0)) {
+        merged[key] = detailVal;
+      }
+    }
+    // 也补全搜索数据中可能被截断的标题
+    if (!merged.title_zh && detailData.title_zh) merged.title_zh = detailData.title_zh;
+    if (!merged.titleZh && detailData.titleZh) merged.titleZh = detailData.titleZh;
+    if (!merged.original_title && detailData.original_title) merged.original_title = detailData.original_title;
+    // mall 对象
+    if (detailData.mall && typeof detailData.mall === "object" && (!merged.mall || typeof merged.mall !== "object")) {
+      merged.mall = detailData.mall;
+    }
+    return merged;
+  }
+
   const competitorTrack = async (params = {}) => {
     const url = String(params.url || "").trim();
     const goodsId = String(params.goodsId || "").trim() || parseTemuGoodsIdFromUrl(url);
@@ -1406,6 +1669,18 @@ export function buildYunqiOnlineHandlers({ ensureBrowser, getContext, randomDela
       if (params.allowNotMatched) return { url, productUrl: url || getTemuProductUrlFromGoodsId(goodsId), goodsId, requestedGoodsId: goodsId, matchStatus: "not_matched", candidates: [], scrapedAt: new Date().toISOString() };
       throw new Error(`Yunqi did not return an exact match for goodsId=${goodsId}`);
     }
+    // ── 先获取详情补充数据（会占用 CDP 导航），再获取同款数 ──
+    // batchTrack 场景下 skipDetail=true 跳过详情抓取以提速
+    let detail = null;
+    if (!params.skipDetail) {
+      try {
+        detail = await fetchYunqiDetailFields(goodsId);
+      } catch (err) {
+        if (String(err?.message || "").includes(YUNQI_AUTH_INVALID_CODE)) throw err;
+        logSilent("yunqi.detail.fetch", err, "warn");
+      }
+    }
+
     let sameNum = null;
     try {
       const similarPayload = await requestYunqiApi(`/api/proxytemu/goods/${goodsId}/image-similar`, { method: "POST", body: {} });
@@ -1414,7 +1689,10 @@ export function buildYunqiOnlineHandlers({ ensureBrowser, getContext, randomDela
       if (String(error?.message || "").includes(`[${YUNQI_AUTH_INVALID_CODE}]`)) throw error;
       logSilent("yunqi.sameNum.fetch", error, "warn");
     }
-    const mapped = mapYunqiApiProductToCompetitorProduct(matched);
+
+    // 合并详情数据到搜索结果，然后再做标准映射
+    const enriched = mergeDetailIntoSearchResult(matched, detail);
+    const mapped = mapYunqiApiProductToCompetitorProduct(enriched);
     return { ...mapped, sameNum: sameNum ?? mapped.sameNum ?? null, requestedGoodsId: goodsId, matchStatus: "exact", scrapedAt: new Date().toISOString() };
   };
 
@@ -1583,7 +1861,7 @@ export function buildYunqiOnlineHandlers({ ensureBrowser, getContext, randomDela
       const results = [];
       for (const url of urls) {
         try {
-          results.push({ ...(await competitorTrack({ url, allowNotMatched: true })), url });
+          results.push({ ...(await competitorTrack({ url, allowNotMatched: true, skipDetail: true })), url });
         } catch (error) {
           results.push({ url, productUrl: url, goodsId: parseTemuGoodsIdFromUrl(url), error: String(error?.message || error || "Competitor track failed"), scrapedAt: new Date().toISOString() });
         }
