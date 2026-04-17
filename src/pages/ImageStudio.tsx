@@ -8,6 +8,7 @@ import {
   Empty,
   Image,
   Input,
+  InputNumber,
   List,
   Progress,
   Row,
@@ -616,6 +617,17 @@ export default function ImageStudio() {
   const [imageLanguage, setImageLanguage] = useState(getDefaultImageLanguageForRegion("us"));
   const [imageSize] = useState("800x800");
   const [selectedImageTypes, setSelectedImageTypes] = useState<string[]>(DEFAULT_IMAGE_TYPES);
+  // 套装件数（1 = 单件，2 = 2pc, 3 = 3pc ...），控制出图里展示几件相同商品同框
+  const [packCount, setPackCount] = useState<number>(() => {
+    if (typeof window === "undefined") return 1;
+    const saved = Number(window.localStorage?.getItem("image_studio_pack_count") || "1");
+    return Number.isFinite(saved) && saved >= 1 && saved <= 12 ? saved : 1;
+  });
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem("image_studio_pack_count", String(packCount));
+    }
+  }, [packCount]);
   const [analysis, setAnalysis] = useState<ImageStudioAnalysis>(EMPTY_IMAGE_STUDIO_ANALYSIS);
   const [plans, setPlans] = useState<ImageStudioPlan[]>([]);
   const [results, setResults] = useState<ResultStateMap>({});
@@ -1125,10 +1137,29 @@ export default function ImageStudio() {
     try {
       const files = await buildNativeImagePayloads(uploadFiles);
       if (!runInBackground) setActiveStep(3);
+      // 套装件数：
+      // 1. 件数约束对"所有"图片类型都生效——画面里必须出现 N 件同款商品
+      // 2. "NPCS" 文字角标"只"加在主图（main）上，避免细节图/场景图等被角标打扰
+      const clampedPack = Math.max(1, Math.min(12, Math.floor(packCount || 1)));
+      const patchedPlans = clampedPack > 1
+        ? plans.map((plan) => {
+            const isMain = plan.imageType === "main";
+            const directive = isMain
+              ? `【套装件数 · 强约束】
+1. 画面必须展示 ${clampedPack} 件完全相同的该商品同框（${clampedPack}PCS / ${clampedPack}-pack 装），件数严格等于 ${clampedPack}，不多不少。摆放自然整齐，每件商品完整可见，避免遮挡造成数不清件数。
+2. 必须在图片显眼位置（如左上角或右下角）叠加加粗、清晰、有底色或描边的文字角标「${clampedPack}PCS」（或「${clampedPack}-PACK」「SET OF ${clampedPack}」），字号醒目、与商品形成对比，符合 Temu / Amazon 主图规范，不遮挡商品主体。
+
+`
+              : `【套装件数约束】画面必须展示 ${clampedPack} 件完全相同的该商品同框，件数严格等于 ${clampedPack}，不多不少。不要在图片上叠加任何「${clampedPack}PCS」文字角标——此类角标只用于主图，其它图保持干净画面。
+
+`;
+            return { ...plan, prompt: directive + (plan.prompt || "") };
+          })
+        : plans;
       await imageStudioAPI.startGenerate({
         jobId: nextJobId,
         files,
-        plans,
+        plans: patchedPlans,
         productMode,
         runInBackground,
         salesRegion,
@@ -2273,6 +2304,23 @@ export default function ImageStudio() {
             <Text className="studio-type-panel__hint">选择这次要生成的图片方向，通常保留 4 到 6 类就够用。</Text>
           </div>
           <div className="studio-type-panel__actions">
+            <Tooltip title="N 件装：让模型在每张图里展示 N 件完全相同的同款商品同框（2PC / 3PC / 5PC …）。选 1 则只出单件商品。">
+              <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 10px", background: "#fff", border: "1px solid #e6ebf1", borderRadius: 999, height: 28 }}>
+                <Text style={{ fontSize: 12, color: "#5d6b80" }}>套装件数</Text>
+                <InputNumber
+                  size="small"
+                  min={1}
+                  max={12}
+                  value={packCount}
+                  onChange={(v) => setPackCount(typeof v === "number" && v >= 1 && v <= 12 ? Math.floor(v) : 1)}
+                  controls={false}
+                  style={{ width: 48 }}
+                />
+                <Text style={{ fontSize: 12, color: packCount > 1 ? "#fa8c16" : "#bfbfbf" }}>
+                  {packCount > 1 ? `${packCount}PC` : "单件"}
+                </Text>
+              </div>
+            </Tooltip>
             <Tag style={{ margin: 0, borderRadius: 999, paddingInline: 12, color: "#5d6b80", background: "#fff", borderColor: "#e6ebf1" }}>
               已选 {selectedImageTypes.length}/{DEFAULT_IMAGE_TYPES.length}
             </Tag>
