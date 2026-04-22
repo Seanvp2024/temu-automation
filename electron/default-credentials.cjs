@@ -27,10 +27,10 @@ const ENCODED = Object.freeze({
 });
 
 const PLAINTEXT_DEFAULTS = Object.freeze({
-  analyzeBaseUrl: "https://api.vectorengine.ai",
-  analyzeModel: "gemini-3.1-flash-lite-preview",
+  analyzeBaseUrl: "https://api.vectorengine.cn/v1",
+  analyzeModel: "gpt-5.4",
   generateBaseUrl: "https://grsaiapi.com",
-  generateModel: "nano-banana-2",
+  generateModel: "gpt-image-2",
 });
 
 function getDefaultCredentials() {
