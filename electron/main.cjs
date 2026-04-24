@@ -1379,12 +1379,18 @@ function stopWorker() {
 const AUTO_IMAGE_HOST = "127.0.0.1";
 const AUTO_IMAGE_DEFAULT_PORT = 3210;
 const AUTO_IMAGE_HEALTH_PATH = "/api/history";
-const IMAGE_STUDIO_SAFE_ANALYZE_MODEL = "gemini-3.1-flash-lite-preview";
+const IMAGE_STUDIO_SAFE_ANALYZE_MODEL = "gpt-5.4";
+const IMAGE_STUDIO_SAFE_ANALYZE_BASE_URL = "https://api.vectorengine.cn/v1";
+const IMAGE_STUDIO_LEGACY_DENIED_ANALYZE_MODELS = new Set([
+  "gemini-3.1-flash-lite-preview",
+]);
 const IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG = Object.freeze({
-  analyzeModel: "gemini-3.1-flash-lite-preview",
-  analyzeBaseUrl: "https://api.vectorengine.ai/v1",
-  generateModel: "gemini-3.1-flash-image-preview",
-  generateBaseUrl: "https://api.vectorengine.ai/v1",
+  analyzeModel: IMAGE_STUDIO_SAFE_ANALYZE_MODEL,
+  analyzeBaseUrl: IMAGE_STUDIO_SAFE_ANALYZE_BASE_URL,
+  generateModel: "gpt-image-2",
+  generateBaseUrl: "https://grsaiapi.com",
+  gptGenerateModel: "gpt-image-2",
+  gptGenerateBaseUrl: "https://grsaiapi.com",
 });
 const IMAGE_STUDIO_RUNTIME_CONFIG_KEYS = Object.freeze([
   "analyzeModel",
@@ -1393,11 +1399,19 @@ const IMAGE_STUDIO_RUNTIME_CONFIG_KEYS = Object.freeze([
   "generateModel",
   "generateApiKey",
   "generateBaseUrl",
+  "gptGenerateModel",
+  "gptGenerateApiKey",
+  "gptGenerateBaseUrl",
 ]);
+
+// AI 出图 profile：default = 原有生图页，gpt = 新增 GPT 版生图页（共享子进程，切换时重启）
+const IMAGE_STUDIO_PROFILES = Object.freeze(["default", "gpt"]);
+let currentImageStudioProfile = "default";
 
 let imageStudioProcess = null;
 let imageStudioPort = AUTO_IMAGE_DEFAULT_PORT;
 let imageStudioStartupPromise = null;
+let imageStudioLifecyclePromise = Promise.resolve();
 let imageStudioRuntimeConfigOverrides = {};
 
 // 用户自定义 AI 凭证持久化到 userData/ai-credentials.json
@@ -1616,7 +1630,8 @@ function canListenOnImageStudioPort(port) {
   });
 }
 
-async function findAvailableImageStudioPort() {
+async function findAvailableImageStudioPort(options = {}) {
+  const { allowHealthyReuse = true } = options;
   const candidates = [
     imageStudioPort,
     AUTO_IMAGE_DEFAULT_PORT,
@@ -1624,7 +1639,7 @@ async function findAvailableImageStudioPort() {
   ].filter((port, index, list) => list.indexOf(port) === index);
 
   for (const port of candidates) {
-    if (await isImageStudioHealthy(port)) return port;
+    if (allowHealthyReuse && await isImageStudioHealthy(port)) return port;
     if (await canListenOnImageStudioPort(port)) {
       return port;
     }
@@ -1645,28 +1660,98 @@ async function waitForImageStudio(startedProcess, maxWait = 90000) {
   throw new Error("AI 出图服务启动超时");
 }
 
-function stopImageStudioService() {
-  imageStudioStartupPromise = null;
-  if (imageStudioProcess) {
-    void killChildProcessTree(imageStudioProcess);
-    imageStudioProcess = null;
+function runImageStudioLifecycleTask(task) {
+  const run = imageStudioLifecyclePromise.catch(() => {}).then(task);
+  imageStudioLifecyclePromise = run.catch(() => {});
+  return run;
+}
+
+async function startImageStudioServiceSingleFlight(options = {}) {
+  if (imageStudioStartupPromise) {
+    return imageStudioStartupPromise;
   }
-  updateImageStudioStatus({ status: "stopped", ready: false, message: "AI 出图服务已停止" });
+
+  const startup = ensureImageStudioServiceInternal(options);
+  imageStudioStartupPromise = startup;
+  try {
+    return await startup;
+  } finally {
+    if (imageStudioStartupPromise === startup) {
+      imageStudioStartupPromise = null;
+    }
+  }
+}
+
+async function stopImageStudioServiceInternal(options = {}) {
+  const {
+    message = "AI 出图服务已停止",
+    updateStatus = true,
+    settleDelayMs = 400,
+  } = options;
+
+  imageStudioStartupPromise = null;
+  const oldProcess = imageStudioProcess;
+  imageStudioProcess = null;
+
+  if (oldProcess) {
+    try { await killChildProcessTree(oldProcess); } catch (_err) {}
+    if (settleDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, settleDelayMs));
+    }
+  }
+
+  if (updateStatus) {
+    updateImageStudioStatus({ status: "stopped", ready: false, message });
+  }
+}
+
+function stopImageStudioService() {
+  void runImageStudioLifecycleTask(() => stopImageStudioServiceInternal());
+}
+
+async function restartImageStudioService() {
+  return runImageStudioLifecycleTask(async () => {
+    await stopImageStudioServiceInternal({ updateStatus: false });
+    lastImageStudioConfigSignature = "";
+    lastImageStudioConfigSyncAt = 0;
+    return startImageStudioServiceSingleFlight({ allowHealthyReuse: false });
+  });
+}
+
+async function switchImageStudioProfile(profile) {
+  const target = IMAGE_STUDIO_PROFILES.includes(profile) ? profile : "default";
+
+  return runImageStudioLifecycleTask(async () => {
+    const healthy = await isImageStudioHealthy();
+    if (target === currentImageStudioProfile && healthy) {
+      const status = updateImageStudioStatus({ status: "ready", ready: true, message: "AI 出图服务已就绪" });
+      return { profile: currentImageStudioProfile, status };
+    }
+
+    currentImageStudioProfile = target;
+    lastImageStudioConfigSignature = "";
+    lastImageStudioConfigSyncAt = 0;
+
+    await stopImageStudioServiceInternal({ updateStatus: false });
+    updateImageStudioStatus({ status: "starting", ready: false, message: "正在切换生图 profile…" });
+
+    const status = await startImageStudioServiceSingleFlight({ allowHealthyReuse: false });
+    if (workerReady) {
+      await ensureWorkerStarted({ aiImageServer: status.url });
+    }
+    return { profile: currentImageStudioProfile, status };
+  });
 }
 
 async function ensureImageStudioService() {
   if (imageStudioStartupPromise) {
     return imageStudioStartupPromise;
   }
-  imageStudioStartupPromise = ensureImageStudioServiceInternal();
-  try {
-    return await imageStudioStartupPromise;
-  } finally {
-    imageStudioStartupPromise = null;
-  }
+  return runImageStudioLifecycleTask(() => startImageStudioServiceSingleFlight());
 }
 
-async function ensureImageStudioServiceInternal() {
+async function ensureImageStudioServiceInternal(options = {}) {
+  const { allowHealthyReuse = true } = options;
   const projectInfo = resolveAutoImageProjectDir();
   if (!projectInfo?.projectPath) {
     const searched = (projectInfo?.searchedPaths || []).join("；");
@@ -1674,7 +1759,7 @@ async function ensureImageStudioServiceInternal() {
   }
   updateImageStudioStatus({ projectPath: projectInfo.projectPath });
 
-  if (await isImageStudioHealthy()) {
+  if (allowHealthyReuse && await isImageStudioHealthy()) {
     return updateImageStudioStatus({ status: "ready", ready: true, message: "AI 出图服务已就绪" });
   }
 
@@ -1683,7 +1768,7 @@ async function ensureImageStudioServiceInternal() {
     imageStudioProcess = null;
   }
 
-  const nextPort = await findAvailableImageStudioPort();
+  const nextPort = await findAvailableImageStudioPort({ allowHealthyReuse });
   updateImageStudioStatus({ projectPath: projectInfo.projectPath, port: nextPort });
   updateImageStudioStatus({ status: "starting", ready: false, message: "正在启动 AI 出图服务…" });
 
@@ -1691,36 +1776,61 @@ async function ensureImageStudioServiceInternal() {
 
   // 读取项目目录下的 .env.local，注入 API Key 等配置（Next.js standalone 模式不自动加载）
   const envLocalPath = path.join(projectInfo.projectPath, ".env.local");
-  const envLocalVars = readEnvKeyValueFile(envLocalPath);
+  const envLocalVars = normalizeImageStudioEnvVars(readEnvKeyValueFile(envLocalPath));
   if (Object.keys(envLocalVars).length > 0) {
     console.log(`[Main] Loaded ${Object.keys(envLocalVars).length} vars from ${envLocalPath}`);
   }
 
   // 注入内置默认 AI 凭证 + 用户覆盖，保证打包后 image-studio 子进程直接可用
+  // profile=gpt 时，用 gptGenerate* 覆盖到 GENERATE_* 环境变量（子进程层面感知不到 profile）
+  const isGptProfile = currentImageStudioProfile === "gpt";
   const baked = getDefaultCredentials();
+  // GPT profile 下：若 gpt* 三项为空，回落到 default 的 generate*，保证开箱即用
+  // 用户在 UI 填 key 会写入 override，优先级高于 baked
+  const pickGptOrDefault = (gptValue, defaultValue) => {
+    const v = typeof gptValue === "string" ? gptValue.trim() : "";
+    return v ? gptValue : defaultValue;
+  };
   const bakedEnv = {
     ANALYZE_API_KEY: baked.analyzeApiKey,
     ANALYZE_BASE_URL: baked.analyzeBaseUrl,
     ANALYZE_MODEL: baked.analyzeModel,
-    GENERATE_API_KEY: baked.generateApiKey,
-    GENERATE_BASE_URL: baked.generateBaseUrl,
-    GENERATE_MODEL: baked.generateModel,
+    GENERATE_API_KEY: isGptProfile ? pickGptOrDefault(baked.gptGenerateApiKey, baked.generateApiKey) : baked.generateApiKey,
+    GENERATE_BASE_URL: isGptProfile ? pickGptOrDefault(baked.gptGenerateBaseUrl, baked.generateBaseUrl) : baked.generateBaseUrl,
+    GENERATE_MODEL: isGptProfile ? pickGptOrDefault(baked.gptGenerateModel, baked.generateModel) : baked.generateModel,
   };
+  const profileEnvLocalVars = isGptProfile
+    ? {
+        ...envLocalVars,
+        GENERATE_API_KEY: envLocalVars.GPT_GENERATE_API_KEY || envLocalVars.GENERATE_API_KEY || bakedEnv.GENERATE_API_KEY,
+        GENERATE_BASE_URL: envLocalVars.GPT_GENERATE_BASE_URL || bakedEnv.GENERATE_BASE_URL || envLocalVars.GENERATE_BASE_URL,
+        GENERATE_MODEL: envLocalVars.GPT_GENERATE_MODEL || bakedEnv.GENERATE_MODEL,
+      }
+    : envLocalVars;
   const overrideEnv = {};
-  const overrideKeyMap = {
-    analyzeApiKey: "ANALYZE_API_KEY",
-    analyzeBaseUrl: "ANALYZE_BASE_URL",
-    analyzeModel: "ANALYZE_MODEL",
-    generateApiKey: "GENERATE_API_KEY",
-    generateBaseUrl: "GENERATE_BASE_URL",
-    generateModel: "GENERATE_MODEL",
-  };
+  const overrideKeyMap = isGptProfile
+    ? {
+        analyzeApiKey: "ANALYZE_API_KEY",
+        analyzeBaseUrl: "ANALYZE_BASE_URL",
+        analyzeModel: "ANALYZE_MODEL",
+        gptGenerateApiKey: "GENERATE_API_KEY",
+        gptGenerateBaseUrl: "GENERATE_BASE_URL",
+        gptGenerateModel: "GENERATE_MODEL",
+      }
+    : {
+        analyzeApiKey: "ANALYZE_API_KEY",
+        analyzeBaseUrl: "ANALYZE_BASE_URL",
+        analyzeModel: "ANALYZE_MODEL",
+        generateApiKey: "GENERATE_API_KEY",
+        generateBaseUrl: "GENERATE_BASE_URL",
+        generateModel: "GENERATE_MODEL",
+      };
   for (const [k, envKey] of Object.entries(overrideKeyMap)) {
     const v = imageStudioRuntimeConfigOverrides[k];
     if (typeof v === "string" && v.trim()) overrideEnv[envKey] = v;
   }
   // 优先级：process.env (系统) < 内置 baked < .env.local (开发) < 用户 override
-  const env = { ...process.env, ...bakedEnv, ...envLocalVars, ...overrideEnv, PORT: String(nextPort), HOSTNAME: AUTO_IMAGE_HOST, NODE_ENV: "production" };
+  const env = { ...process.env, ...bakedEnv, ...profileEnvLocalVars, ...overrideEnv, PORT: String(nextPort), HOSTNAME: AUTO_IMAGE_HOST, NODE_ENV: "production" };
 
   const spawnArgs = projectInfo.mode === "packaged-runtime"
     ? [projectInfo.serverPath]
@@ -1795,6 +1905,52 @@ function normalizeImageStudioRuntimeConfigValue(value) {
   return typeof value === "string" ? value : String(value);
 }
 
+function normalizeAnalyzeModelName(model) {
+  return normalizeImageStudioRuntimeConfigValue(model).trim();
+}
+
+function isLegacyDeniedAnalyzeModel(model) {
+  return IMAGE_STUDIO_LEGACY_DENIED_ANALYZE_MODELS.has(normalizeAnalyzeModelName(model).toLowerCase());
+}
+
+function isOpenAICompatAnalyzeModel(model) {
+  return /^(gpt-|o\d|chatgpt-|claude-|deepseek-|qwen-|glm-)/i.test(normalizeAnalyzeModelName(model));
+}
+
+function normalizeAnalyzeBaseUrlForModel(model, baseUrl) {
+  const normalizedBaseUrl = normalizeImageStudioRuntimeConfigValue(baseUrl).trim();
+  if (isLegacyDeniedAnalyzeModel(model)) {
+    return IMAGE_STUDIO_SAFE_ANALYZE_BASE_URL;
+  }
+  if (isOpenAICompatAnalyzeModel(model) && !/\/v1\/?$/i.test(normalizedBaseUrl)) {
+    return IMAGE_STUDIO_SAFE_ANALYZE_BASE_URL;
+  }
+  return normalizedBaseUrl;
+}
+
+function normalizeImageStudioEnvVars(vars = {}) {
+  const next = { ...(vars || {}) };
+  const model = normalizeAnalyzeModelName(next.ANALYZE_MODEL);
+  if (isLegacyDeniedAnalyzeModel(model)) {
+    next.ANALYZE_MODEL = IMAGE_STUDIO_SAFE_ANALYZE_MODEL;
+    next.ANALYZE_BASE_URL = IMAGE_STUDIO_SAFE_ANALYZE_BASE_URL;
+  } else if (model && isOpenAICompatAnalyzeModel(model)) {
+    next.ANALYZE_BASE_URL = normalizeAnalyzeBaseUrlForModel(model, next.ANALYZE_BASE_URL);
+  }
+  return next;
+}
+
+function normalizeImageStudioAnalyzeConfig(config) {
+  const next = { ...(config || {}) };
+  if (isLegacyDeniedAnalyzeModel(next.analyzeModel)) {
+    next.analyzeModel = IMAGE_STUDIO_SAFE_ANALYZE_MODEL;
+    next.analyzeBaseUrl = IMAGE_STUDIO_SAFE_ANALYZE_BASE_URL;
+  } else if (next.analyzeModel && isOpenAICompatAnalyzeModel(next.analyzeModel)) {
+    next.analyzeBaseUrl = normalizeAnalyzeBaseUrlForModel(next.analyzeModel, next.analyzeBaseUrl);
+  }
+  return next;
+}
+
 function normalizeImageStudioRuntimeConfigPatch(patch = {}) {
   const normalized = {};
   IMAGE_STUDIO_RUNTIME_CONFIG_KEYS.forEach((key) => {
@@ -1817,21 +1973,36 @@ function resolveImageStudioRuntimeConfigValue(key, ...candidates) {
 }
 
 function readImageStudioRuntimeConfig(projectInfo = getImageStudioProjectInfo()) {
-  const envLocalVars = readEnvKeyValueFile(projectInfo?.envLocalPath);
+  const envLocalVars = normalizeImageStudioEnvVars(readEnvKeyValueFile(projectInfo?.envLocalPath));
   const baked = getDefaultCredentials();
   // 优先级：内存 override (用户在 UI 修改) → .env.local (开发) → process.env → 内置默认凭证 → 静态兜底
-  return {
+  const config = {
     analyzeModel: resolveImageStudioRuntimeConfigValue("analyzeModel", envLocalVars.ANALYZE_MODEL, process.env.ANALYZE_MODEL, baked.analyzeModel, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.analyzeModel),
     analyzeApiKey: resolveImageStudioRuntimeConfigValue("analyzeApiKey", envLocalVars.ANALYZE_API_KEY, process.env.ANALYZE_API_KEY, baked.analyzeApiKey, ""),
     analyzeBaseUrl: resolveImageStudioRuntimeConfigValue("analyzeBaseUrl", envLocalVars.ANALYZE_BASE_URL, process.env.ANALYZE_BASE_URL, baked.analyzeBaseUrl, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.analyzeBaseUrl),
     generateModel: resolveImageStudioRuntimeConfigValue("generateModel", envLocalVars.GENERATE_MODEL, process.env.GENERATE_MODEL, baked.generateModel, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.generateModel),
     generateApiKey: resolveImageStudioRuntimeConfigValue("generateApiKey", envLocalVars.GENERATE_API_KEY, process.env.GENERATE_API_KEY, baked.generateApiKey, ""),
     generateBaseUrl: resolveImageStudioRuntimeConfigValue("generateBaseUrl", envLocalVars.GENERATE_BASE_URL, process.env.GENERATE_BASE_URL, baked.generateBaseUrl, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.generateBaseUrl),
+    gptGenerateModel: resolveImageStudioRuntimeConfigValue("gptGenerateModel", envLocalVars.GPT_GENERATE_MODEL, process.env.GPT_GENERATE_MODEL, baked.gptGenerateModel, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.gptGenerateModel),
+    gptGenerateApiKey: resolveImageStudioRuntimeConfigValue("gptGenerateApiKey", envLocalVars.GPT_GENERATE_API_KEY, process.env.GPT_GENERATE_API_KEY, baked.gptGenerateApiKey, ""),
+    gptGenerateBaseUrl: resolveImageStudioRuntimeConfigValue("gptGenerateBaseUrl", envLocalVars.GPT_GENERATE_BASE_URL, process.env.GPT_GENERATE_BASE_URL, baked.gptGenerateBaseUrl, IMAGE_STUDIO_DEFAULT_RUNTIME_CONFIG.gptGenerateBaseUrl),
   };
+  return normalizeImageStudioAnalyzeConfig(config);
 }
 
 function buildImageStudioRuntimeConfigPayload(projectInfo = getImageStudioProjectInfo()) {
-  const runtimeConfig = readImageStudioRuntimeConfig(projectInfo);
+  const runtimeConfig = { ...readImageStudioRuntimeConfig(projectInfo) };
+
+  if (currentImageStudioProfile === "gpt") {
+    runtimeConfig.generateModel = runtimeConfig.gptGenerateModel || runtimeConfig.generateModel;
+    runtimeConfig.generateApiKey = runtimeConfig.gptGenerateApiKey || runtimeConfig.generateApiKey;
+    runtimeConfig.generateBaseUrl = runtimeConfig.gptGenerateBaseUrl || runtimeConfig.generateBaseUrl;
+  }
+
+  delete runtimeConfig.gptGenerateModel;
+  delete runtimeConfig.gptGenerateApiKey;
+  delete runtimeConfig.gptGenerateBaseUrl;
+
   return Object.fromEntries(
     Object.entries(runtimeConfig).filter(([key, value]) => {
       if (Object.prototype.hasOwnProperty.call(imageStudioRuntimeConfigOverrides, key)) {
@@ -1868,6 +2039,7 @@ function hydrateImageStudioRuntimeConfigFromDisk() {
 
 function getImageStudioRuntimeConfigSignature(payload) {
   return JSON.stringify({
+    profile: currentImageStudioProfile,
     analyzeModel: payload.analyzeModel || "",
     analyzeBaseUrl: payload.analyzeBaseUrl || "",
     generateModel: payload.generateModel || "",
@@ -1908,6 +2080,19 @@ function isImageStudioConnectionError(message) {
   return typeof message === "string" && /connection error|fetch failed|econnrefused|network error/i.test(message);
 }
 
+function getImageStudioErrorText(error) {
+  return [
+    error?.message,
+    error?.code,
+    error?.cause?.message,
+    error?.cause?.code,
+  ].filter(Boolean).join(" ");
+}
+
+function isImageStudioLocalServiceConnectionError(error) {
+  return /fetch failed|ECONNREFUSED|ECONNRESET|ECONNABORTED|UND_ERR_SOCKET|socket hang up/i.test(getImageStudioErrorText(error));
+}
+
 function isLoopbackUrl(value) {
   try {
     const parsed = new URL(String(value || ""));
@@ -1944,8 +2129,8 @@ async function syncImageStudioRuntimeConfig(routePath = "", options = {}) {
     return false;
   }
 
-  const status = await ensureImageStudioService();
-  const response = await fetch(`${status.url}/api/config`, {
+  let status = await ensureImageStudioService();
+  const requestConfigSync = () => fetch(`${status.url}/api/config`, {
     method: "POST",
     headers: {
       ...getImageStudioAuthHeaders(projectInfo),
@@ -1953,6 +2138,18 @@ async function syncImageStudioRuntimeConfig(routePath = "", options = {}) {
     },
     body: JSON.stringify(payload),
   });
+
+  let response;
+  try {
+    response = await requestConfigSync();
+  } catch (error) {
+    if (!isImageStudioLocalServiceConnectionError(error)) {
+      throw error;
+    }
+    appendImageStudioLog(`[config] local service unavailable before ${routePath || "request"}，正在重启后重试: ${getImageStudioErrorText(error)}`);
+    status = await restartImageStudioService();
+    response = await requestConfigSync();
+  }
   const responsePayload = await readImageStudioResponse(response);
   if (!response.ok) {
     // /api/config 路由可能不存在于当前 runtime 构建中，404 时静默跳过 (运行时已经使用内置默认配置)
@@ -2034,26 +2231,40 @@ function getImageStudioErrorMessage(routePath, response, payload) {
   return `AI 出图服务请求失败 (${response.status})`;
 }
 
-function shouldFallbackAnalyzeModel(model) {
-  return typeof model === "string" && model.trim() && model !== IMAGE_STUDIO_SAFE_ANALYZE_MODEL;
+function getSafeAnalyzeConfigPatch() {
+  return {
+    analyzeModel: IMAGE_STUDIO_SAFE_ANALYZE_MODEL,
+    analyzeBaseUrl: IMAGE_STUDIO_SAFE_ANALYZE_BASE_URL,
+  };
+}
+
+function isAnalyzeModelAccessError(error) {
+  const text = getImageStudioErrorText(error);
+  return /no access to model|does not have access|model .*not found|unsupported model|model_not_found|permission/i.test(text);
+}
+
+function shouldFallbackAnalyzeModel(model, error) {
+  const currentModel = normalizeAnalyzeModelName(model);
+  if (!currentModel || currentModel === IMAGE_STUDIO_SAFE_ANALYZE_MODEL) return false;
+  return isLegacyDeniedAnalyzeModel(currentModel) || isAnalyzeModelAccessError(error);
 }
 
 function shouldPreemptivelyUpgradeAnalyzeModel(model) {
-  return typeof model === "string" && /flash-lite/i.test(model) && model !== IMAGE_STUDIO_SAFE_ANALYZE_MODEL;
+  return isLegacyDeniedAnalyzeModel(model);
 }
 
-async function ensureCompatibleAnalyzeModel() {
+async function ensureCompatibleAnalyzeModel(error) {
   try {
     const currentConfig = await imageStudioJson("/api/config");
     const currentModel = currentConfig?.analyzeModel;
-    if (!shouldFallbackAnalyzeModel(currentModel)) {
+    if (!shouldFallbackAnalyzeModel(currentModel, error)) {
       return false;
     }
 
     await imageStudioJson("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ analyzeModel: IMAGE_STUDIO_SAFE_ANALYZE_MODEL }),
+      body: JSON.stringify(getSafeAnalyzeConfigPatch()),
     });
     appendImageStudioLog(`[compat] analyze model switched from ${currentModel} to ${IMAGE_STUDIO_SAFE_ANALYZE_MODEL}`);
     return true;
@@ -2074,7 +2285,7 @@ async function normalizeAnalyzeModelBeforeRequest() {
     await imageStudioJson("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ analyzeModel: IMAGE_STUDIO_SAFE_ANALYZE_MODEL }),
+      body: JSON.stringify(getSafeAnalyzeConfigPatch()),
     });
     appendImageStudioLog(`[compat] analyze model normalized from ${currentModel} to ${IMAGE_STUDIO_SAFE_ANALYZE_MODEL}`);
     return true;
@@ -2085,7 +2296,7 @@ async function normalizeAnalyzeModelBeforeRequest() {
 }
 
 async function imageStudioFetch(routePath, init = {}) {
-  const status = await ensureImageStudioService();
+  let status = await ensureImageStudioService();
   if (routeNeedsImageStudioRuntimeConfig(routePath)) {
     await syncImageStudioRuntimeConfig(routePath);
   }
@@ -2094,10 +2305,24 @@ async function imageStudioFetch(routePath, init = {}) {
     ...getImageStudioAuthHeaders(projectInfo),
     ...(init.headers || {}),
   };
-  return fetch(`${status.url}${routePath}`, {
+  const request = () => fetch(`${status.url}${routePath}`, {
     ...init,
     headers,
   });
+
+  try {
+    return await request();
+  } catch (error) {
+    if (!isImageStudioLocalServiceConnectionError(error)) {
+      throw error;
+    }
+    appendImageStudioLog(`[http] ${routePath} local service unavailable，正在重启后重试: ${getImageStudioErrorText(error)}`);
+    status = await restartImageStudioService();
+    if (routeNeedsImageStudioRuntimeConfig(routePath)) {
+      await syncImageStudioRuntimeConfig(routePath, { force: true });
+    }
+    return request();
+  }
 }
 
 async function imageStudioJson(routePath, init = {}) {
@@ -3214,8 +3439,8 @@ ipcMain.handle("competitor:vision-compare", async (_event, payload) => {
 
   const runtimeConfig = readImageStudioRuntimeConfig();
   const apiKey = runtimeConfig.analyzeApiKey;
-  const rawBaseUrl = runtimeConfig.analyzeBaseUrl || "https://api.vectorengine.ai";
-  const model = runtimeConfig.analyzeModel || "gemini-3.1-flash-lite-preview";
+  const rawBaseUrl = runtimeConfig.analyzeBaseUrl || IMAGE_STUDIO_SAFE_ANALYZE_BASE_URL;
+  const model = runtimeConfig.analyzeModel || IMAGE_STUDIO_SAFE_ANALYZE_MODEL;
 
   if (!apiKey) {
     throw new Error("[ANALYZE_API_KEY_MISSING] 未配置分析用的 Gemini API Key，请到设置里填写");
@@ -3423,9 +3648,13 @@ ipcMain.handle("image-studio:ensure-running", async () => {
   return ensureImageStudioService();
 });
 
+// 切换生图 profile（default / gpt），切换时重启子进程以应用对应的 generate* 凭证
+ipcMain.handle("image-studio:switch-profile", async (_event, profile) => {
+  return switchImageStudioProfile(profile);
+});
+
 ipcMain.handle("image-studio:restart", async () => {
-  stopImageStudioService();
-  const status = await ensureImageStudioService();
+  const status = await restartImageStudioService();
   if (workerReady) {
     await ensureWorkerStarted({ aiImageServer: status.url });
   }
@@ -3443,15 +3672,7 @@ ipcMain.handle("image-studio:update-config", async (_event, payload) => {
   }
 
   const nextConfig = updateImageStudioRuntimeConfigOverrides(normalizedPatch);
-  await imageStudioJson("/api/config", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(normalizedPatch),
-  });
-
-  const currentPayload = buildImageStudioRuntimeConfigPayload();
-  lastImageStudioConfigSignature = getImageStudioRuntimeConfigSignature(currentPayload);
-  lastImageStudioConfigSyncAt = Date.now();
+  await syncImageStudioRuntimeConfig("/api/config", { force: true });
   appendImageStudioLog("[config] runtime config updated from renderer bridge");
   return nextConfig;
 });
@@ -3460,6 +3681,27 @@ ipcMain.handle("image-studio:open-external", async () => {
   const status = await ensureImageStudioService();
   await shell.openExternal(status.url);
   return status.url;
+});
+
+ipcMain.handle("image-studio:detect-components", async (_event, payload) => {
+  const requestDetectComponents = () => imageStudioJson("/api/detect-components", {
+    method: "POST",
+    body: createImageStudioFormData({
+      files: payload?.files,
+    }),
+  });
+
+  await normalizeAnalyzeModelBeforeRequest();
+
+  try {
+    return await requestDetectComponents();
+  } catch (error) {
+    const upgraded = await ensureCompatibleAnalyzeModel(error);
+    if (upgraded) {
+      return requestDetectComponents();
+    }
+    throw error;
+  }
 });
 
 ipcMain.handle("image-studio:analyze", async (_event, payload) => {
@@ -3478,7 +3720,7 @@ ipcMain.handle("image-studio:analyze", async (_event, payload) => {
   try {
     return await requestAnalyze();
   } catch (error) {
-    const upgraded = await ensureCompatibleAnalyzeModel();
+    const upgraded = await ensureCompatibleAnalyzeModel(error);
     if (upgraded) {
       return requestAnalyze();
     }
@@ -3503,7 +3745,7 @@ ipcMain.handle("image-studio:regenerate-analysis", async (_event, payload) => {
   try {
     return await requestRegenerateAnalysis();
   } catch (error) {
-    const upgraded = await ensureCompatibleAnalyzeModel();
+    const upgraded = await ensureCompatibleAnalyzeModel(error);
     if (upgraded) {
       return requestRegenerateAnalysis();
     }
@@ -3532,7 +3774,7 @@ ipcMain.handle("image-studio:translate", async (_event, payload) => {
       translations: normalizeImageStudioTranslationList(result, texts),
     };
   } catch (error) {
-    const upgraded = await ensureCompatibleAnalyzeModel();
+    const upgraded = await ensureCompatibleAnalyzeModel(error);
     if (!upgraded) {
       throw error;
     }

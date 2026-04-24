@@ -20,6 +20,7 @@ const ProductDetail = lazy(() => import("./pages/ProductDetail"));
 const Settings = lazy(() => import("./pages/Settings"));
 const ProductCreate = lazy(() => import("./pages/ProductCreate"));
 const ImageStudio = lazy(() => import("./pages/ImageStudio"));
+const ImageStudioGPT = lazy(() => import("./pages/ImageStudioGPT"));
 const Logs = lazy(() => import("./pages/Logs"));
 const CompetitorAnalysis = lazy(() => import("./pages/CompetitorAnalysis"));
 
@@ -135,6 +136,7 @@ function App() {
             <Route path="products/:id" element={<ProductDetail />} />
             <Route path="create-product" element={<ProductCreate />} />
             <Route path="image-studio" element={<ImageStudio />} />
+            <Route path="image-studio-gpt" element={<ImageStudioGPT />} />
             <Route path="collect" element={<Dashboard />} />
             <Route path="accounts" element={<AccountManager />} />
             <Route path="tasks" element={<Navigate to="/collect" replace />} />

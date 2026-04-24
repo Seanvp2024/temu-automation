@@ -145,7 +145,7 @@ export async function optimizeTitle(params, opts = {}) {
     category,
   });
 
-  const model = opts.model || "gemini-3.1-flash-lite-preview";
+  const model = opts.model || "gpt-5.4";
 
   const resp = await client.chat.completions.create({
     model,

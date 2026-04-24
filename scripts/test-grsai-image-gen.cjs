@@ -25,7 +25,7 @@ async function main() {
   const baseUrl = (env.GENERATE_BASE_URL || process.env.GENERATE_BASE_URL || "https://grsaiapi.com")
     .replace(/\/+$/, "")
     .replace(/\/v1$/i, "");
-  const model = env.GENERATE_MODEL || process.env.GENERATE_MODEL || "nano-banana-2";
+  const model = env.GENERATE_MODEL || process.env.GENERATE_MODEL || "gpt-image-2";
 
   if (!apiKey) {
     console.error("✗ GENERATE_API_KEY 未配置");

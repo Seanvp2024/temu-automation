@@ -54,6 +54,9 @@ export interface ImageStudioConfig {
   generateModel: string;
   generateApiKey: string;
   generateBaseUrl: string;
+  gptGenerateModel?: string;
+  gptGenerateApiKey?: string;
+  gptGenerateBaseUrl?: string;
 }
 
 export interface ImageStudioAnalysis {
@@ -106,6 +109,22 @@ export interface ImageStudioImageScore {
   appeal: number;
   overall: number;
   suggestions: string[];
+}
+
+export interface ImageStudioDetectedComponent {
+  id: number;
+  labelZh: string;
+  labelEn: string;
+  kind?: "single" | "group";
+  itemCount?: number;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+export interface ImageStudioComponentDetection {
+  components: ImageStudioDetectedComponent[];
 }
 
 export interface NativeImagePayload {
@@ -189,6 +208,9 @@ export const EMPTY_IMAGE_STUDIO_CONFIG: ImageStudioConfig = {
   generateModel: "",
   generateApiKey: "",
   generateBaseUrl: "",
+  gptGenerateModel: "",
+  gptGenerateApiKey: "",
+  gptGenerateBaseUrl: "",
 };
 
 export const EMPTY_IMAGE_STUDIO_ANALYSIS: ImageStudioAnalysis = {

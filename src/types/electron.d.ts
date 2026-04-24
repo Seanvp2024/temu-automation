@@ -1,5 +1,6 @@
 import type {
   ImageStudioAnalysis,
+  ImageStudioComponentDetection,
   ImageStudioConfig,
   ImageStudioGeneratedImage,
   ImageStudioHistoryItem,
@@ -109,12 +110,14 @@ interface ImageStudioJob {
 }
 
 interface ImageStudioAPI {
+  switchProfile?: () => Promise<{ profile: string; status: unknown }>;
   getStatus: () => Promise<ImageStudioStatus>;
   ensureRunning: () => Promise<ImageStudioStatus>;
   restart: () => Promise<ImageStudioStatus>;
   getConfig: () => Promise<ImageStudioConfig>;
   updateConfig: (payload: Partial<ImageStudioConfig>) => Promise<ImageStudioConfig>;
   openExternal: () => Promise<string>;
+  detectComponents: (payload: { files: NativeImagePayload[] }) => Promise<ImageStudioComponentDetection>;
   analyze: (payload: { files: NativeImagePayload[]; productMode: string }) => Promise<ImageStudioAnalysis>;
   regenerateAnalysis: (payload: { files: NativeImagePayload[]; productMode: string; analysis: ImageStudioAnalysis }) => Promise<Pick<ImageStudioAnalysis, "sellingPoints" | "targetAudience" | "usageScenes">>;
   translate: (payload: { texts: string[] }) => Promise<{ translations: string[] }>;
@@ -333,6 +336,7 @@ interface ElectronAPI {
   competitor: CompetitorAPI;
   yunqiDb: YunqiDbAPI;
   imageStudio: ImageStudioAPI;
+  imageStudioGpt: ImageStudioAPI & { switchProfile: () => Promise<{ profile: string; status: unknown }> };
   app: AppAPI;
   store: StoreAPI;
   onAutomationEvent: (callback: (data: any) => void) => (() => void);

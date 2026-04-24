@@ -1,5 +1,39 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
+function createImageStudioApi(profile) {
+  const ensureProfile = () => ipcRenderer.invoke("image-studio:switch-profile", profile);
+  const withProfile = (fn) => async (...args) => {
+    await ensureProfile();
+    return fn(...args);
+  };
+
+  return {
+    switchProfile: ensureProfile,
+    getStatus: withProfile(() => ipcRenderer.invoke("image-studio:get-status")),
+    ensureRunning: withProfile(() => ipcRenderer.invoke("image-studio:ensure-running")),
+    restart: withProfile(() => ipcRenderer.invoke("image-studio:restart")),
+    getConfig: withProfile(() => ipcRenderer.invoke("image-studio:get-config")),
+    updateConfig: withProfile((payload) => ipcRenderer.invoke("image-studio:update-config", payload)),
+    openExternal: withProfile(() => ipcRenderer.invoke("image-studio:open-external")),
+    detectComponents: withProfile((payload) => ipcRenderer.invoke("image-studio:detect-components", payload)),
+    analyze: withProfile((payload) => ipcRenderer.invoke("image-studio:analyze", payload)),
+    regenerateAnalysis: withProfile((payload) => ipcRenderer.invoke("image-studio:regenerate-analysis", payload)),
+    translate: withProfile((payload) => ipcRenderer.invoke("image-studio:translate", payload)),
+    generatePlans: withProfile((payload) => ipcRenderer.invoke("image-studio:generate-plans", payload)),
+    startGenerate: withProfile((payload) => ipcRenderer.invoke("image-studio:start-generate", payload)),
+    cancelGenerate: withProfile((jobId) => ipcRenderer.invoke("image-studio:cancel-generate", jobId)),
+    listHistory: withProfile(() => ipcRenderer.invoke("image-studio:list-history")),
+    getHistoryItem: withProfile((id) => ipcRenderer.invoke("image-studio:get-history-item", id)),
+    getHistorySources: withProfile((id) => ipcRenderer.invoke("image-studio:get-history-sources", id)),
+    saveHistory: withProfile((payload) => ipcRenderer.invoke("image-studio:save-history", payload)),
+    scoreImage: withProfile((payload) => ipcRenderer.invoke("image-studio:score-image", payload)),
+    listJobs: withProfile(() => ipcRenderer.invoke("image-studio:list-jobs")),
+    getJob: withProfile((jobId) => ipcRenderer.invoke("image-studio:get-job", jobId)),
+    clearJob: withProfile((jobId) => ipcRenderer.invoke("image-studio:clear-job", jobId)),
+    downloadAll: withProfile((payload) => ipcRenderer.invoke("image-studio:download-all", payload)),
+  };
+}
+
 contextBridge.exposeInMainWorld("electronAPI", {
   getAppPath: () => ipcRenderer.invoke("get-app-path"),
   selectFile: (filters) => ipcRenderer.invoke("select-file", filters),
@@ -114,29 +148,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     syncOnline: (params) => ipcRenderer.invoke("yunqi-db:sync-online", params),
   },
 
-  imageStudio: {
-    getStatus: () => ipcRenderer.invoke("image-studio:get-status"),
-    ensureRunning: () => ipcRenderer.invoke("image-studio:ensure-running"),
-    restart: () => ipcRenderer.invoke("image-studio:restart"),
-    getConfig: () => ipcRenderer.invoke("image-studio:get-config"),
-    updateConfig: (payload) => ipcRenderer.invoke("image-studio:update-config", payload),
-    openExternal: () => ipcRenderer.invoke("image-studio:open-external"),
-    analyze: (payload) => ipcRenderer.invoke("image-studio:analyze", payload),
-    regenerateAnalysis: (payload) => ipcRenderer.invoke("image-studio:regenerate-analysis", payload),
-    translate: (payload) => ipcRenderer.invoke("image-studio:translate", payload),
-    generatePlans: (payload) => ipcRenderer.invoke("image-studio:generate-plans", payload),
-    startGenerate: (payload) => ipcRenderer.invoke("image-studio:start-generate", payload),
-    cancelGenerate: (jobId) => ipcRenderer.invoke("image-studio:cancel-generate", jobId),
-    listHistory: () => ipcRenderer.invoke("image-studio:list-history"),
-    getHistoryItem: (id) => ipcRenderer.invoke("image-studio:get-history-item", id),
-    getHistorySources: (id) => ipcRenderer.invoke("image-studio:get-history-sources", id),
-    saveHistory: (payload) => ipcRenderer.invoke("image-studio:save-history", payload),
-    scoreImage: (payload) => ipcRenderer.invoke("image-studio:score-image", payload),
-    listJobs: () => ipcRenderer.invoke("image-studio:list-jobs"),
-    getJob: (jobId) => ipcRenderer.invoke("image-studio:get-job", jobId),
-    clearJob: (jobId) => ipcRenderer.invoke("image-studio:clear-job", jobId),
-    downloadAll: (payload) => ipcRenderer.invoke("image-studio:download-all", payload),
-  },
+  // 每次调用前显式切到对应 profile，保证普通版/GPT 版不会串用生图凭证。
+  imageStudio: createImageStudioApi("default"),
+  imageStudio: createImageStudioApi("default"),
+  imageStudioGpt: createImageStudioApi("gpt"),
 
   app: {
     getVersion: () => ipcRenderer.invoke("app:get-version"),
