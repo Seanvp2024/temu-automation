@@ -1044,6 +1044,7 @@ function BatchCreate() {
     .filter((item, index, list) => item && list.indexOf(item) === index);
   const taskStepText = taskStatusParts.join(" · ");
   const currentTaskStatusText = taskStepText || batchStatusMessage;
+  const currentProgressStepText = String(progressInfo?.step || batchStatusLabel || "-");
   const progressUpdatedAtText = String(progressInfo?.updatedAt || progressInfo?.startedAt || "");
   const aiStageActive = Boolean(running && /(下载原图|AI生图|上传图片|生成标题)/.test(progressInfo?.step || ""));
   const draftStageActive = Boolean(running && /(保存草稿|草稿保存|开始处理|执行失败)/.test(progressInfo?.step || ""));
@@ -1801,7 +1802,7 @@ function BatchCreate() {
                 </Text>
               </div>
               <Space wrap>
-                <Tag color={batchTagColor}>{batchStatusLabel}</Tag>
+                <Tag color={batchTagColor}>{currentProgressStepText}</Tag>
               </Space>
             </div>
 
@@ -1811,8 +1812,8 @@ function BatchCreate() {
                 <span className="create-progress-current__value">{currentTaskStatusText}</span>
               </div>
               <div className="create-progress-current__item">
-                <span className="create-progress-current__label">任务状态</span>
-                <Tag color={batchTagColor}>{batchStatusLabel}</Tag>
+                <span className="create-progress-current__label">当前步骤</span>
+                <span className="create-progress-current__value">{currentProgressStepText}</span>
               </div>
               {progressUpdatedAtText ? (
                 <div className="create-progress-current__item">
