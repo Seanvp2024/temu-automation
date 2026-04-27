@@ -621,9 +621,9 @@ function BatchCreate() {
   const currentFileName = filePath ? filePath.split(/[/\\]/).pop() : "未选择文件";
   const successCount = results.filter((item: any) => item.success).length;
   const failCount = results.filter((item: any) => !item.success).length;
-  const progressTotal = progressInfo?.total || count || 0;
-  const progressPercent = progressTotal > 0 ? Math.round(((progressInfo?.completed || 0) / progressTotal) * 100) : 0;
-  const completedCount = progressInfo?.completed || 0;
+  const completedCount = Math.max(Number(progressInfo?.completed) || 0, results.length);
+  const progressTotal = Math.max(Number(progressInfo?.total || count || 0), completedCount);
+  const progressPercent = progressTotal > 0 ? Math.round((completedCount / progressTotal) * 100) : 0;
   const pendingCount = Math.max(progressTotal - completedCount, 0);
   const previewData = preview;
 

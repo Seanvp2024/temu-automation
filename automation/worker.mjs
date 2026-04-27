@@ -9513,20 +9513,24 @@ async function searchCategoryAPI(page, searchTerm, options = {}) {
 async function temuXHR(page, endpoint, body, options = {}) {
   const configuredMaxRetries = getConfiguredMaxRetries();
   const { maxRetries = configuredMaxRetries } = options;
+  const requestTimeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 60000;
   const NON_RETRYABLE = [1000001, 1000002, 1000003, 1000004, 40001, 40003, 50001, 6000002]; // 参数错误/无权限/属性不匹配（外层专用重试处理）
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const raw = await page.evaluate(async ({ ep, bd }) => {
+      const raw = await page.evaluate(async ({ ep, bd, timeoutMs }) => {
         // 优先用 fetch（Temu 前端拦截器 hook 了 fetch 添加 anti-content）
         // mallid header 是必须的认证字段
         const mallid = document.cookie.match(/mallid=([^;]+)/)?.[1] || "";
+        const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
         try {
           const resp = await fetch(ep, {
             method: "POST",
             headers: { "Content-Type": "application/json", "mallid": mallid },
             credentials: "include",
             body: JSON.stringify(bd),
+            signal: controller?.signal,
           });
           const text = await resp.text();
           try {
@@ -9535,6 +9539,9 @@ async function temuXHR(page, endpoint, body, options = {}) {
             return { status: resp.status, body: null, text: text?.slice(0, 500) };
           }
         } catch (fetchErr) {
+          if (fetchErr?.name === "AbortError") {
+            return { status: 0, body: null, error: `fetch timeout after ${timeoutMs}ms` };
+          }
           // fetch 失败，fallback 到 XHR
           return new Promise((resolve) => {
             const xhr = new XMLHttpRequest();
@@ -9542,7 +9549,7 @@ async function temuXHR(page, endpoint, body, options = {}) {
             xhr.setRequestHeader("Content-Type", "application/json");
             xhr.setRequestHeader("mallid", mallid);
             xhr.withCredentials = true;
-            xhr.timeout = 30000;
+            xhr.timeout = timeoutMs;
             xhr.onreadystatechange = function () {
               if (xhr.readyState === 4) {
                 try {
@@ -9556,8 +9563,10 @@ async function temuXHR(page, endpoint, body, options = {}) {
             xhr.ontimeout = () => resolve({ status: 0, body: null, error: "XHR timeout" });
             xhr.send(JSON.stringify(bd));
           });
+        } finally {
+          if (timer) clearTimeout(timer);
         }
-      }, { ep: endpoint, bd: body });
+      }, { ep: endpoint, bd: body, timeoutMs: requestTimeoutMs });
 
       // 解析结果
       if (!raw.body) {

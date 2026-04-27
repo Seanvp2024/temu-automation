@@ -117,6 +117,8 @@ const AUTO_PRICING_FILTER_KEYWORDS = {
     "液体", "液态", "喷雾", "香水", "精油", "乳液", "爽肤水", "精华液", "精华水", "面霜", "乳霜", "溶液",
     "洗发水", "护发素", "沐浴露", "沐浴乳", "洗衣液", "柔顺剂", "护理液", "清洁液", "清洁剂", "消毒液", "消毒水",
     "墨水", "胶水", "机油", "酒精", "染发剂", "染发膏", "卸妆水", "卸妆油", "卸妆乳", "化妆水", "柔肤水",
+    "护理剂", "修复剂", "防护剂", "养护剂", "抛光剂", "上光剂", "翻新剂", "除胶剂", "除锈剂", "润滑剂", "防锈剂", "除雾剂",
+    "玻璃水", "蜡水", "水性", "油性",
     "粉底液", "气垫", "bb霜", "cc霜", "防晒霜", "防晒乳", "防晒喷雾", "隔离霜", "粉底", "遮瑕液",
     "眼线液", "睫毛液", "眉笔液", "腮红液", "高光液", "修容液", "唇釉", "唇蜜", "唇彩", "唇油",
     "指甲油", "甲油", "甲油胶", "洗甲水", "洗手液", "洗洁精", "洗衣凝珠", "洗面奶", "洁面乳", "洁面液",
@@ -138,7 +140,8 @@ const AUTO_PRICING_FILTER_KEYWORDS = {
   ],
   paste: [
     // 中文
-    "膏体", "膏状", "牙膏", "乳膏", "软膏", "凝胶", "啫喱", "胶泥", "泥膜", "发蜡", "发胶", "摩丝",
+    "膏", "膏体", "膏状", "牙膏", "乳膏", "软膏", "凝胶", "啫喱", "胶泥", "泥膜", "发蜡", "发胶", "摩丝",
+    "蜡", "车蜡", "固体蜡", "修复膏", "翻新膏", "护理膏", "清洁膏", "抛光膏", "研磨膏", "补墙膏", "补漆膏", "密封膏",
     "唇膏", "口红", "润唇膏", "唇膜", "面膜", "睡眠面膜", "眼膜", "鼻膜", "护手膏", "身体霜",
     "睫毛膏", "眼影膏", "腮红膏", "高光膏", "遮瑕膏", "粉底膏", "修容膏", "眉膏",
     "护肤膏", "万金油", "清凉油", "凡士林", "护臀膏", "蚊虫膏", "膏药",
@@ -153,6 +156,8 @@ const AUTO_PRICING_FILTER_KEYWORDS = {
   electric: [
     // 中文
     "带电", "电池", "锂电", "纽扣电池", "充电", "充电器", "适配器", "usb", "电动", "电机", "插电", "无线充", "电源",
+    "电子", "电器", "电源线", "数据线", "遥控", "太阳能", "发光", "led", "LED", "LED灯", "灯", "灯具", "灯带", "灯串", "小夜灯",
+    "风扇", "剃须刀", "按摩器", "电吹风",
     // 英文
     "battery", "batteries", "lithium", "li-ion", "li-po", "lipo",
     "charger", "charging", "rechargeable", "adapter", "power adapter", "power supply", "power bank",
@@ -1252,12 +1257,23 @@ function mergeWorkerSnapshotIntoTask(task, live, fallbackTaskId) {
   const now = new Date().toLocaleString("zh-CN");
   const isRunning = Boolean(live?.running);
   const isPaused = Boolean(live?.paused);
-  const nextStatus = typeof live?.status === "string" && live.status
+  const liveResults = Array.isArray(live?.results) ? live.results : [];
+  const liveTotal = Number(live?.total) || baseTask.total || 0;
+  const liveCompleted = Number(live?.completed) || (liveResults.length > 0 ? liveResults.length : baseTask.completed);
+  let nextStatus = typeof live?.status === "string" && live.status
     ? live.status
     : (isRunning ? (isPaused ? "paused" : "running") : baseTask.status);
-  const nextResults = Array.isArray(live?.results) ? live.results : baseTask.results;
-  const nextCompleted = Number(live?.completed)
-    || (Array.isArray(live?.results) ? live.results.length : baseTask.completed);
+  if (!isRunning && !isPaused && ["running", "pausing", "paused"].includes(nextStatus)) {
+    if (liveTotal > 0 && liveCompleted >= liveTotal) {
+      nextStatus = "completed";
+    } else if (["completed", "failed", "interrupted"].includes(baseTask.status)) {
+      nextStatus = baseTask.status;
+    } else {
+      nextStatus = "interrupted";
+    }
+  }
+  const nextResults = liveResults.length > 0 ? liveResults : baseTask.results;
+  const nextCompleted = liveCompleted;
   const nextFinishedAt = !isRunning && !isPaused && ["completed", "failed", "interrupted"].includes(nextStatus)
     ? (typeof live?.finishedAt === "string" && live.finishedAt ? live.finishedAt : (baseTask.finishedAt || now))
     : "";
