@@ -18,9 +18,18 @@ process.on("unhandledRejection", (reason) => {
   console.error("[Main] Unhandled rejection:", reason);
 });
 
+if (process.env.APP_USER_DATA) {
+  try {
+    app.setPath("userData", process.env.APP_USER_DATA);
+  } catch (error) {
+    console.error("[Main] Failed to override userData path:", error?.message || error);
+  }
+}
+
 let mainWindow = null;
 let worker = null;
-const DEFAULT_WORKER_PORT = Number(process.env.TEMU_WORKER_PORT) > 0 ? Number(process.env.TEMU_WORKER_PORT) : 19280;
+const configuredWorkerPort = Number(process.env.TEMU_WORKER_PORT || process.env.WORKER_PORT);
+const DEFAULT_WORKER_PORT = configuredWorkerPort > 0 ? configuredWorkerPort : 19280;
 let workerPort = DEFAULT_WORKER_PORT;
 let workerReady = false;
 let workerAiImageServer = "";
@@ -32,6 +41,9 @@ const AUTO_PRICING_TASK_LIMIT = 20;
 const CREATE_HISTORY_KEY = "temu_create_history";
 const ACCOUNT_STORE_KEY = "temu_accounts";
 const ACTIVE_ACCOUNT_ID_KEY = "temu_active_account_id";
+const BASE_WINDOW_TITLE = "Temu 自动化运营工具";
+const WINDOW_TITLE_PREFIX = process.env.TEMU_WINDOW_TITLE_PREFIX || (process.env.NODE_ENV === "development" ? "[Codex 1420]" : "");
+const WINDOW_TITLE = process.env.TEMU_WINDOW_TITLE || `${WINDOW_TITLE_PREFIX ? `${WINDOW_TITLE_PREFIX} ` : ""}${BASE_WINDOW_TITLE}`;
 const ACCOUNT_SCOPED_STORE_KEYS = new Set([
   "temu_collection_diagnostics",
   "temu_create_history",
@@ -109,6 +121,7 @@ let autoPricingTaskPromise = null;
 let autoPricingTaskSyncTimer = null;
 let autoPricingCurrentTaskId = null;
 const WORKER_HTTP_TIMEOUT_MS = 5 * 60 * 1000;
+const WORKER_LONG_TASK_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 const STORE_KEY_PATTERN = /^[A-Za-z0-9._:-]+$/;
 
 const AUTO_PRICING_FILTER_KEYWORDS = {
@@ -117,8 +130,6 @@ const AUTO_PRICING_FILTER_KEYWORDS = {
     "液体", "液态", "喷雾", "香水", "精油", "乳液", "爽肤水", "精华液", "精华水", "面霜", "乳霜", "溶液",
     "洗发水", "护发素", "沐浴露", "沐浴乳", "洗衣液", "柔顺剂", "护理液", "清洁液", "清洁剂", "消毒液", "消毒水",
     "墨水", "胶水", "机油", "酒精", "染发剂", "染发膏", "卸妆水", "卸妆油", "卸妆乳", "化妆水", "柔肤水",
-    "护理剂", "修复剂", "防护剂", "养护剂", "抛光剂", "上光剂", "翻新剂", "除胶剂", "除锈剂", "润滑剂", "防锈剂", "除雾剂",
-    "玻璃水", "蜡水", "水性", "油性",
     "粉底液", "气垫", "bb霜", "cc霜", "防晒霜", "防晒乳", "防晒喷雾", "隔离霜", "粉底", "遮瑕液",
     "眼线液", "睫毛液", "眉笔液", "腮红液", "高光液", "修容液", "唇釉", "唇蜜", "唇彩", "唇油",
     "指甲油", "甲油", "甲油胶", "洗甲水", "洗手液", "洗洁精", "洗衣凝珠", "洗面奶", "洁面乳", "洁面液",
@@ -140,8 +151,7 @@ const AUTO_PRICING_FILTER_KEYWORDS = {
   ],
   paste: [
     // 中文
-    "膏", "膏体", "膏状", "牙膏", "乳膏", "软膏", "凝胶", "啫喱", "胶泥", "泥膜", "发蜡", "发胶", "摩丝",
-    "蜡", "车蜡", "固体蜡", "修复膏", "翻新膏", "护理膏", "清洁膏", "抛光膏", "研磨膏", "补墙膏", "补漆膏", "密封膏",
+    "膏体", "膏状", "牙膏", "乳膏", "软膏", "凝胶", "啫喱", "胶泥", "泥膜", "发蜡", "发胶", "摩丝",
     "唇膏", "口红", "润唇膏", "唇膜", "面膜", "睡眠面膜", "眼膜", "鼻膜", "护手膏", "身体霜",
     "睫毛膏", "眼影膏", "腮红膏", "高光膏", "遮瑕膏", "粉底膏", "修容膏", "眉膏",
     "护肤膏", "万金油", "清凉油", "凡士林", "护臀膏", "蚊虫膏", "膏药",
@@ -156,8 +166,6 @@ const AUTO_PRICING_FILTER_KEYWORDS = {
   electric: [
     // 中文
     "带电", "电池", "锂电", "纽扣电池", "充电", "充电器", "适配器", "usb", "电动", "电机", "插电", "无线充", "电源",
-    "电子", "电器", "电源线", "数据线", "遥控", "太阳能", "发光", "led", "LED", "LED灯", "灯", "灯具", "灯带", "灯串", "小夜灯",
-    "风扇", "剃须刀", "按摩器", "电吹风",
     // 英文
     "battery", "batteries", "lithium", "li-ion", "li-po", "lipo",
     "charger", "charging", "rechargeable", "adapter", "power adapter", "power supply", "power bank",
@@ -230,6 +238,54 @@ const AUTO_PRICING_IP_PATTERNS = [
   /我的世界|minecraft/i,
 ];
 
+const AUTO_PRICING_FILTER_EXTRA_KEYWORDS = {
+  liquid: [
+    "水管", "花园水管", "软管", "水泵", "水枪", "喷水", "洒水", "喷淋", "花洒", "水龙头", "水槽", "水箱", "水杯", "水瓶",
+    "水壶", "水袋", "水桶", "水盆", "水刮", "水族", "鱼缸", "饮水", "吸水", "补水", "加湿", "除湿", "蒸汽", "雾化",
+    "冰块", "冰格", "冰模", "制冰", "冰球", "冷饮", "滤茶", "茶滤", "茶漏", "泡茶", "茶具", "咖啡滤", "漏斗",
+    "hose", "garden hose", "water hose", "sprinkler", "watering", "water pump", "water gun", "faucet", "tap",
+    "water bottle", "water cup", "hydration", "humidifier", "mist humidifier", "steam", "ice cube", "ice mold",
+    "ice tray", "tea strainer", "tea infuser", "tea filter", "coffee filter",
+  ],
+  paste: [
+    "膏", "霜", "泥", "胶状", "胶体", "粘土", "修复膏", "清洁膏", "抛光膏", "密封胶", "玻璃胶", "美缝剂",
+    "caulk", "sealant", "polish paste", "cleaning paste", "repair paste", "putty", "slime",
+  ],
+  clothing: [
+    "女装", "男装", "童装", "宝宝衣", "婴儿衣", "儿童衣", "服装", "服饰", "衣裤", "裤", "裙", "鞋靴", "袜子", "帽子", "围巾",
+    "手套", "腰带", "皮带", "领带", "假领", "袖套", "护膝", "护腕", "围裙", "围兜", "披肩", "披风",
+    "apparel", "garment", "clothes", "clothing", "outfit", "costume", "uniform", "sock", "socks", "hat", "cap",
+    "scarf", "glove", "gloves", "belt", "apron", "bib", "shawl", "cape",
+  ],
+};
+
+for (const [group, keywords] of Object.entries(AUTO_PRICING_FILTER_EXTRA_KEYWORDS)) {
+  const target = AUTO_PRICING_FILTER_KEYWORDS[group];
+  if (!Array.isArray(target)) continue;
+  for (const keyword of keywords) {
+    if (keyword && !target.includes(keyword)) target.push(keyword);
+  }
+}
+
+AUTO_PRICING_IP_PATTERNS.push(
+  /任天堂|nintendo|mario|马里奥/i,
+  /pokemon|pok[eé]mon|皮卡丘|宝可梦|精灵宝可梦/i,
+  /sonic|索尼克/i,
+  /spongebob|海绵宝宝/i,
+  /winnie|pooh|维尼|小熊维尼/i,
+  /kuromi|库洛米|美乐蒂|melody|玉桂狗|cinnamoroll/i,
+  /doraemon|哆啦a梦|机器猫/i,
+  /奥特曼|ultraman/i,
+  /迪迦|特利迦|假面骑士|kamen\s*rider/i,
+  /鬼灭|kimetsu|demon\s*slayer/i,
+  /咒术回战|jujutsu/i,
+  /海绵宝宝|spongebob/i,
+  /史努比|snoopy/i,
+  /可达鸭|psyduck/i,
+  /卡通人物|动漫人物|电影周边|游戏周边|明星同款|品牌logo|商标图案/i,
+  /custom\s*(name|logo|photo|text)|personalized|定制照片|定制头像|个性化定制/i,
+);
+
 function normalizeImportedCellTexts(value, seen = new WeakSet()) {
   if (value === null || value === undefined || value === "") return [];
   if (typeof value === "string") {
@@ -278,6 +334,37 @@ function normalizeImportedCellText(value, separator = " | ") {
       return true;
     })
     .join(separator);
+}
+
+function detectSpreadsheetFileKind(filePath) {
+  try {
+    const extension = path.extname(filePath).toLowerCase();
+    if (extension === ".xlsx" || extension === ".xls") return "excel";
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const header = Buffer.alloc(4);
+      const bytesRead = fs.readSync(fd, header, 0, 4, 0);
+      if (bytesRead >= 2 && header[0] === 0x50 && header[1] === 0x4b) return "excel";
+      if (bytesRead >= 4 && header[0] === 0xd0 && header[1] === 0xcf && header[2] === 0x11 && header[3] === 0xe0) return "excel";
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (error) {
+    console.warn("[spreadsheet] detect failed:", error?.message || error);
+  }
+  return "csv";
+}
+
+function readSpreadsheetRows(filePath) {
+  const kind = detectSpreadsheetFileKind(filePath);
+  const workbook = XLSX.readFile(filePath, { cellDates: false });
+  const firstSheetName = workbook.SheetNames[0];
+  if (!firstSheetName) {
+    throw new Error("表格没有可用的工作表");
+  }
+  const worksheet = workbook.Sheets[firstSheetName];
+  const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, raw: false, defval: "" });
+  return { kind, rows };
 }
 
 function detectProductTableHeaderRow(rows = []) {
@@ -355,14 +442,11 @@ function filterAutoPricingProductTable(inputPath) {
     throw new Error(`表格文件不存在: ${inputPath || ""}`);
   }
 
-  const workbook = XLSX.readFile(inputPath, { cellDates: false });
-  const firstSheetName = workbook.SheetNames[0];
-  if (!firstSheetName) {
+  const { rows: allRows } = readSpreadsheetRows(inputPath);
+  /*
     throw new Error("表格没有可用的工作表");
-  }
 
-  const worksheet = workbook.Sheets[firstSheetName];
-  const allRows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
+  */
   const headerRowIdx = detectProductTableHeaderRow(allRows);
   const headerRow = Array.isArray(allRows[headerRowIdx]) ? allRows[headerRowIdx] : [];
   const prefixRows = allRows.slice(0, headerRowIdx + 1);
@@ -724,6 +808,10 @@ async function shutdownOldWorker() {
     if (fs.existsSync(portFile)) {
       const { port: oldPort, token: oldToken } = parseWorkerPortFile(fs.readFileSync(portFile, "utf-8"));
       if (oldPort > 0) {
+        if (oldPort !== DEFAULT_WORKER_PORT) {
+          console.log(`[Main] Skip shutdown for worker on port ${oldPort}; current target port is ${DEFAULT_WORKER_PORT}`);
+          return;
+        }
         console.log(`[Main] Trying to shutdown old worker on port ${oldPort}`);
         // 先尝试 shutdown 命令
         await httpPost(oldPort, { action: "shutdown" }, { authToken: oldToken }).catch(() => {});
@@ -932,6 +1020,8 @@ function resolveSendCmdTimeout(params, requestOptions) {
   return 0;
 }
 
+const LONG_RUNNING_WORKER_ACTIONS = new Set(["auto_pricing", "workflow_pack_images", "competitor_auto_register"]);
+
 async function sendCmd(action, params = {}, requestOptions = {}) {
   if (!workerReady) {
     await ensureWorkerStarted();
@@ -941,8 +1031,10 @@ async function sendCmd(action, params = {}, requestOptions = {}) {
   const timeoutMs = resolveSendCmdTimeout(params, requestOptions);
   if (timeoutMs > 0) {
     payload.timeoutMs = timeoutMs;
+  } else if (LONG_RUNNING_WORKER_ACTIONS.has(action)) {
+    payload.timeoutMs = WORKER_LONG_TASK_TIMEOUT_MS;
   }
-  const keepLongRunningWorkerAlive = action === "auto_pricing" || action === "competitor_auto_register";
+  const keepLongRunningWorkerAlive = LONG_RUNNING_WORKER_ACTIONS.has(action);
   try {
     return await httpPost(workerPort, payload);
   } catch (error) {
@@ -983,6 +1075,46 @@ function isSafeStorageReady() {
   }
 }
 
+const _loggedDecryptFailureFingerprints = new Set();
+
+function getSecretFingerprint(text) {
+  const raw = typeof text === "string" ? text : String(text ?? "");
+  return `${raw.slice(0, 24)}:${raw.length}`;
+}
+
+function logDecryptFailureOnce(text, error) {
+  const fingerprint = getSecretFingerprint(text);
+  if (_loggedDecryptFailureFingerprints.has(fingerprint)) {
+    return;
+  }
+  _loggedDecryptFailureFingerprints.add(fingerprint);
+  console.error("[Store] Failed to decrypt secret:", error.message);
+}
+
+function readSecretWithStatus(text, { encrypted = false } = {}) {
+  if (typeof text !== "string" || !text) {
+    return { value: "", state: "missing" };
+  }
+
+  if (!encrypted || !text.startsWith("enc:")) {
+    return { value: text, state: text ? "ready" : "missing" };
+  }
+
+  if (!isSafeStorageReady()) {
+    return { value: "", state: "decrypt_failed" };
+  }
+
+  try {
+    return {
+      value: safeStorage.decryptString(Buffer.from(text.slice(4), "base64")),
+      state: "ready",
+    };
+  } catch (error) {
+    logDecryptFailureOnce(text, error);
+    return { value: "", state: "decrypt_failed" };
+  }
+}
+
 function encryptSecret(text) {
   if (typeof text !== "string" || !text) return "";
   if (!isSafeStorageReady()) return text;
@@ -995,15 +1127,60 @@ function encryptSecret(text) {
 }
 
 function decryptSecret(text) {
-  if (typeof text !== "string" || !text) return "";
-  if (!text.startsWith("enc:")) return text;
-  if (!isSafeStorageReady()) return "";
-  try {
-    return safeStorage.decryptString(Buffer.from(text.slice(4), "base64"));
-  } catch (error) {
-    console.error("[Store] Failed to decrypt secret:", error.message);
-    return "";
+  return readSecretWithStatus(text, { encrypted: true }).value;
+}
+
+function normalizeAccountPhone(phone) {
+  return typeof phone === "string" ? phone.replace(/\D+/g, "") : "";
+}
+
+function sanitizeAccountForStore(account) {
+  if (!account || typeof account !== "object") {
+    return account;
   }
+  const {
+    passwordState,
+    passwordRepairRequired,
+    ...rest
+  } = account;
+  return rest;
+}
+
+function preserveExistingAccountPasswords(nextAccounts, existingAccounts) {
+  if (!Array.isArray(nextAccounts) || nextAccounts.length === 0) {
+    return nextAccounts;
+  }
+  if (!Array.isArray(existingAccounts) || existingAccounts.length === 0) {
+    return nextAccounts;
+  }
+
+  const passwordById = new Map();
+  const passwordByPhone = new Map();
+
+  for (const account of existingAccounts) {
+    const password = typeof account?.password === "string" ? account.password : "";
+    if (!password) continue;
+
+    const accountId = typeof account?.id === "string" ? account.id : "";
+    const normalizedPhone = normalizeAccountPhone(account?.phone);
+
+    if (accountId) passwordById.set(accountId, password);
+    if (normalizedPhone) passwordByPhone.set(normalizedPhone, password);
+  }
+
+  return nextAccounts.map((account) => {
+    const password = typeof account?.password === "string" ? account.password : "";
+    if (password) return account;
+
+    const accountId = typeof account?.id === "string" ? account.id : "";
+    const normalizedPhone = normalizeAccountPhone(account?.phone);
+    const preservedPassword =
+      (accountId ? passwordById.get(accountId) : "") ||
+      (normalizedPhone ? passwordByPhone.get(normalizedPhone) : "") ||
+      "";
+
+    return preservedPassword ? { ...account, password: preservedPassword } : account;
+  });
 }
 
 function serializeStoreValue(key, data) {
@@ -1016,10 +1193,15 @@ function serializeStoreValue(key, data) {
   return {
     __temuSecureStore: "accounts:v1",
     encrypted,
-    accounts: normalized.map((account) => ({
-      ...account,
-      password: encrypted ? encryptSecret(account?.password) : (typeof account?.password === "string" ? account.password : ""),
-    })),
+    accounts: normalized.map((account) => {
+      const sanitizedAccount = sanitizeAccountForStore(account);
+      return {
+        ...sanitizedAccount,
+        password: encrypted
+          ? encryptSecret(sanitizedAccount?.password)
+          : (typeof sanitizedAccount?.password === "string" ? sanitizedAccount.password : ""),
+      };
+    }),
   };
 }
 
@@ -1043,10 +1225,15 @@ function deserializeStoreValue(key, data, filePath) {
     return data;
   }
 
-  return data.accounts.map((account) => ({
-    ...account,
-    password: data.encrypted ? decryptSecret(account?.password) : (typeof account?.password === "string" ? account.password : ""),
-  }));
+  return data.accounts.map((account) => {
+    const secret = readSecretWithStatus(account?.password, { encrypted: Boolean(data.encrypted) });
+    return {
+      ...account,
+      password: secret.value,
+      passwordState: secret.state,
+      passwordRepairRequired: secret.state !== "ready",
+    };
+  });
 }
 
 function appendCreateHistoryEntries(entries) {
@@ -1066,8 +1253,13 @@ function appendCreateHistoryEntries(entries) {
 function normalizeAutoPricingTask(task = {}) {
   const results = Array.isArray(task.results) ? task.results : [];
   const summary = summarizeAutoPricingResults(results);
+  const taskId = typeof task.taskId === "string" ? task.taskId : `pricing_${Date.now()}`;
+  const flowType = task.flowType === "workflow" || task.mode === "workflow" || /^workflow_pack_/.test(taskId)
+    ? "workflow"
+    : "classic";
   return {
-    taskId: typeof task.taskId === "string" ? task.taskId : `pricing_${Date.now()}`,
+    taskId,
+    flowType,
     status: typeof task.status === "string" ? task.status : "idle",
     running: Boolean(task.running),
     paused: Boolean(task.paused),
@@ -1257,23 +1449,12 @@ function mergeWorkerSnapshotIntoTask(task, live, fallbackTaskId) {
   const now = new Date().toLocaleString("zh-CN");
   const isRunning = Boolean(live?.running);
   const isPaused = Boolean(live?.paused);
-  const liveResults = Array.isArray(live?.results) ? live.results : [];
-  const liveTotal = Number(live?.total) || baseTask.total || 0;
-  const liveCompleted = Number(live?.completed) || (liveResults.length > 0 ? liveResults.length : baseTask.completed);
-  let nextStatus = typeof live?.status === "string" && live.status
+  const nextStatus = typeof live?.status === "string" && live.status
     ? live.status
     : (isRunning ? (isPaused ? "paused" : "running") : baseTask.status);
-  if (!isRunning && !isPaused && ["running", "pausing", "paused"].includes(nextStatus)) {
-    if (liveTotal > 0 && liveCompleted >= liveTotal) {
-      nextStatus = "completed";
-    } else if (["completed", "failed", "interrupted"].includes(baseTask.status)) {
-      nextStatus = baseTask.status;
-    } else {
-      nextStatus = "interrupted";
-    }
-  }
-  const nextResults = liveResults.length > 0 ? liveResults : baseTask.results;
-  const nextCompleted = liveCompleted;
+  const nextResults = Array.isArray(live?.results) ? live.results : baseTask.results;
+  const nextCompleted = Number(live?.completed)
+    || (Array.isArray(live?.results) ? live.results.length : baseTask.completed);
   const nextFinishedAt = !isRunning && !isPaused && ["completed", "failed", "interrupted"].includes(nextStatus)
     ? (typeof live?.finishedAt === "string" && live.finishedAt ? live.finishedAt : (baseTask.finishedAt || now))
     : "";
@@ -1393,7 +1574,14 @@ function stopWorker() {
 // ============ AI 出图服务管理 ============
 
 const AUTO_IMAGE_HOST = "127.0.0.1";
-const AUTO_IMAGE_DEFAULT_PORT = 3210;
+function normalizeImageStudioPort(value, fallback = 3210) {
+  const port = Number(value);
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : fallback;
+}
+const AUTO_IMAGE_DEFAULT_PORT = normalizeImageStudioPort(
+  process.env.TEMU_IMAGE_STUDIO_PORT || process.env.AUTO_IMAGE_PORT || process.env.IMAGE_STUDIO_PORT,
+  3210,
+);
 const AUTO_IMAGE_HEALTH_PATH = "/api/history";
 const IMAGE_STUDIO_SAFE_ANALYZE_MODEL = "gpt-5.4";
 const IMAGE_STUDIO_SAFE_ANALYZE_BASE_URL = "https://api.vectorengine.cn/v1";
@@ -2106,7 +2294,13 @@ function getImageStudioErrorText(error) {
 }
 
 function isImageStudioLocalServiceConnectionError(error) {
-  return /fetch failed|ECONNREFUSED|ECONNRESET|ECONNABORTED|UND_ERR_SOCKET|socket hang up/i.test(getImageStudioErrorText(error));
+  const text = getImageStudioErrorText(error);
+  // Headers/body timeout 不属于"连接掉线"，只是 LLM 处理慢。
+  // 误判会导致 Electron 杀掉还在工作的 Next.js 子进程 → 前端重试 → 死循环。
+  if (/UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|Headers Timeout Error|Body Timeout Error/i.test(text)) {
+    return false;
+  }
+  return /fetch failed|ECONNREFUSED|ECONNRESET|ECONNABORTED|UND_ERR_SOCKET|socket hang up/i.test(text);
 }
 
 function isLoopbackUrl(value) {
@@ -2311,6 +2505,37 @@ async function normalizeAnalyzeModelBeforeRequest() {
   }
 }
 
+// 长链路路由：designer / 批量生图 等需要几分钟 LLM 调用的，
+// 不能走 node 内置 fetch 的 5 分钟 headersTimeout，否则到点就断开。
+// node24 内置 undici 与 npm 装的 undici v8 dispatcher ABI 不兼容，
+// 不能把 v8 的 Agent 传给内置 fetch，所以这类路由直接调 undici.fetch。
+const IMAGE_STUDIO_LONG_RUNNING_ROUTES = new Set([
+  "/api/designer/run",
+  "/api/designer/compose",
+  "/api/generate",
+  "/api/regenerate",
+  "/api/compose",
+]);
+let imageStudioLongRunningFetchPair = null;
+function getImageStudioLongRunningFetch() {
+  if (imageStudioLongRunningFetchPair) return imageStudioLongRunningFetchPair;
+  try {
+    const undici = require("undici");
+    const agent = new undici.Agent({
+      headersTimeout: 0,   // 不限制等响应头的时间
+      bodyTimeout: 0,      // 不限制等 body 的时间
+      connect: { timeout: 10_000 },
+      keepAliveTimeout: 10_000,
+      keepAliveMaxTimeout: 10_000,
+    });
+    imageStudioLongRunningFetchPair = { fetch: undici.fetch, agent };
+  } catch (err) {
+    console.error("[Main] Failed to init undici long-running fetch:", err?.message || err);
+    imageStudioLongRunningFetchPair = null;
+  }
+  return imageStudioLongRunningFetchPair;
+}
+
 async function imageStudioFetch(routePath, init = {}) {
   let status = await ensureImageStudioService();
   if (routeNeedsImageStudioRuntimeConfig(routePath)) {
@@ -2321,10 +2546,21 @@ async function imageStudioFetch(routePath, init = {}) {
     ...getImageStudioAuthHeaders(projectInfo),
     ...(init.headers || {}),
   };
-  const request = () => fetch(`${status.url}${routePath}`, {
-    ...init,
-    headers,
-  });
+  const isLongRunning = IMAGE_STUDIO_LONG_RUNNING_ROUTES.has(routePath);
+  const longRunningFetch = isLongRunning ? getImageStudioLongRunningFetch() : null;
+  const request = () => {
+    if (longRunningFetch) {
+      return longRunningFetch.fetch(`${status.url}${routePath}`, {
+        ...init,
+        headers,
+        dispatcher: longRunningFetch.agent,
+      });
+    }
+    return fetch(`${status.url}${routePath}`, {
+      ...init,
+      headers,
+    });
+  };
 
   try {
     return await request();
@@ -2771,7 +3007,7 @@ async function createWindow() {
 
   mainWindow = new BrowserWindow({
     width: 1280, height: 800,
-    title: "上新流程",
+    title: WINDOW_TITLE,
     show: false,
     backgroundColor: "#ffffff",
     autoHideMenuBar: true,
@@ -2782,14 +3018,20 @@ async function createWindow() {
     },
   });
 
+  mainWindow.setTitle(WINDOW_TITLE);
   mainWindow.setMenuBarVisibility(false);
 
   mainWindow.webContents.once("did-finish-load", () => {
+    mainWindow.setTitle(WINDOW_TITLE);
     mainWindow.show();
+  });
+  mainWindow.webContents.on("page-title-updated", (event) => {
+    event.preventDefault();
+    mainWindow?.setTitle(WINDOW_TITLE);
   });
 
   // 开发模式：等待 Vite dev server 就绪（最多30秒）
-  const devUrl = "http://localhost:1420";
+  const devUrl = process.env.TEMU_DEV_URL || "http://localhost:1420";
   const forcedProduction = process.env.NODE_ENV === "production";
   const isDev = !forcedProduction && (process.env.NODE_ENV === "development" || !app.isPackaged);
 
@@ -3078,6 +3320,97 @@ ipcMain.handle("automation:filter-product-table", async (_e, csvPath) => {
   return result;
 });
 
+ipcMain.handle("automation:generate-pack-images", async (_e, params) => {
+  const now = new Date().toLocaleString("zh-CN");
+  const taskId = typeof params?.taskId === "string" && params.taskId.trim()
+    ? params.taskId.trim()
+    : `workflow_pack_${Date.now()}`;
+  const nextTask = upsertAutoPricingTask({
+    taskId,
+    flowType: "workflow",
+    status: "running",
+    running: true,
+    paused: false,
+    total: Number(params?.count) || 0,
+    completed: 0,
+    current: "新上品流程处理中",
+    step: "新上品流程",
+    message: "正在准备素材、上传素材中心并保存草稿",
+    csvPath: typeof params?.csvPath === "string" ? params.csvPath : "",
+    startRow: Number(params?.startRow) || 0,
+    count: Number(params?.count) || 0,
+    results: [],
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    finishedAt: "",
+  });
+  startAutoPricingTaskSync();
+
+  let imageStudioUrl = "";
+  try {
+    const imageStudio = await ensureImageStudioService();
+    imageStudioUrl = imageStudio?.url || "";
+  } catch (err) {
+    console.error(`[Main] Image studio unavailable, workflow pack image generation may fail: ${err?.message || err}`);
+    imageStudioUrl = workerAiImageServer || process.env.AI_IMAGE_SERVER || getImageStudioBaseUrl(imageStudioPort);
+  }
+  await ensureWorkerStarted({ aiImageServer: imageStudioUrl });
+  try {
+    const result = await sendCmd("workflow_pack_images", {
+      ...(params || {}),
+      taskId,
+      timeoutMs: Number(params?.timeoutMs) > 0 ? Number(params.timeoutMs) : WORKER_LONG_TASK_TIMEOUT_MS,
+    }, { timeoutMs: WORKER_LONG_TASK_TIMEOUT_MS });
+    const finishedAt = new Date().toLocaleString("zh-CN");
+    const results = Array.isArray(result?.results) ? result.results : [];
+    const total = Number(result?.total) || nextTask.total;
+    const finishedTask = upsertAutoPricingTask({
+      ...nextTask,
+      taskId,
+      flowType: "workflow",
+      status: result?.success === false ? "failed" : "completed",
+      running: false,
+      paused: false,
+      total,
+      completed: total || results.length,
+      current: result?.success === false ? "处理未完成" : "已完成",
+      step: "新上品流程",
+      message: result?.message || `新上品流程完成：成功 ${Number(result?.successCount) || 0}，失败 ${Number(result?.failCount) || 0}`,
+      results,
+      updatedAt: finishedAt,
+      finishedAt,
+    });
+    return {
+      ...(result || {}),
+      taskId,
+      task: getAutoPricingProgressPayload(finishedTask),
+    };
+  } catch (error) {
+    const failedAt = new Date().toLocaleString("zh-CN");
+    const failedTask = upsertAutoPricingTask({
+      ...nextTask,
+      taskId,
+      flowType: "workflow",
+      status: "failed",
+      running: false,
+      paused: false,
+      current: "处理失败",
+      step: "新上品流程",
+      message: error?.message || "新上品流程处理失败",
+      updatedAt: failedAt,
+      finishedAt: failedAt,
+    });
+    error.task = getAutoPricingProgressPayload(failedTask);
+    throw error;
+  } finally {
+    const latestTask = await syncAutoPricingTaskFromWorker(taskId, { markInterruptedOnIdle: true }).catch(() => null);
+    if (!latestTask || !latestTask.running) {
+      stopAutoPricingTaskSync();
+    }
+  }
+});
+
 ipcMain.handle("automation:auto-pricing", async (_e, params) => {
   const existingTask = getAutoPricingTask(autoPricingCurrentTaskId);
   if (existingTask && ["running", "pausing", "paused"].includes(existingTask.status)) {
@@ -3089,16 +3422,15 @@ ipcMain.handle("automation:auto-pricing", async (_e, params) => {
     };
   }
 
-  // AI 生图模式才预热生图服务；表格图片模式不需要启动这条链路。
-  const shouldUseImageStudio = params?.generateAI !== false;
-  let imageStudioUrl = workerAiImageServer || process.env.AI_IMAGE_SERVER || getImageStudioBaseUrl(imageStudioPort);
-  if (shouldUseImageStudio) {
-    try {
-      const imageStudio = await ensureImageStudioService();
-      imageStudioUrl = imageStudio?.url || imageStudioUrl;
-    } catch (err) {
-      console.error(`[Main] Image studio unavailable, auto-pricing will run without it: ${err?.message || err}`);
-    }
+  // 优先尝试启动 AI 出图服务，但 runtime 缺失时不应该让整个批量上品任务无法启动。
+  // 单个商品在生图阶段失败会被任务内部记录为 failed，但 worker 仍能跑分类搜索/属性匹配/草稿提交等其他阶段。
+  let imageStudioUrl = "";
+  try {
+    const imageStudio = await ensureImageStudioService();
+    imageStudioUrl = imageStudio?.url || "";
+  } catch (err) {
+    console.error(`[Main] Image studio unavailable, auto-pricing will run without it: ${err?.message || err}`);
+    imageStudioUrl = workerAiImageServer || process.env.AI_IMAGE_SERVER || getImageStudioBaseUrl(imageStudioPort);
   }
   await ensureWorkerStarted({ aiImageServer: imageStudioUrl });
   const credentials = getActiveWorkerCredentials();
@@ -3110,6 +3442,7 @@ ipcMain.handle("automation:auto-pricing", async (_e, params) => {
 
   const nextTask = upsertAutoPricingTask({
     taskId,
+    flowType: "classic",
     status: "running",
     running: true,
     paused: false,
@@ -3133,7 +3466,7 @@ ipcMain.handle("automation:auto-pricing", async (_e, params) => {
     ...params,
     taskId,
     credentials,
-    timeoutMs: 60 * 60 * 1000,
+    timeoutMs: WORKER_LONG_TASK_TIMEOUT_MS,
   })
     .then((result) => {
       const finishedAt = new Date().toLocaleString("zh-CN");
@@ -3147,6 +3480,7 @@ ipcMain.handle("automation:auto-pricing", async (_e, params) => {
       upsertAutoPricingTask({
         ...nextTask,
         taskId,
+        flowType: "classic",
         status: result?.success === false ? "failed" : "completed",
         running: false,
         paused: false,
@@ -3167,6 +3501,7 @@ ipcMain.handle("automation:auto-pricing", async (_e, params) => {
         upsertAutoPricingTask({
           ...nextTask,
           taskId,
+          flowType: "classic",
           status: live.paused ? "paused" : "running",
           running: Boolean(live.running),
           paused: Boolean(live.paused),
@@ -3185,6 +3520,7 @@ ipcMain.handle("automation:auto-pricing", async (_e, params) => {
       upsertAutoPricingTask({
         ...nextTask,
         taskId,
+        flowType: "classic",
         status: "failed",
         running: false,
         paused: false,
@@ -3821,6 +4157,32 @@ ipcMain.handle("image-studio:generate-plans", async (_event, payload) => {
   return normalizeImageStudioPlanList(plans);
 });
 
+ipcMain.handle("image-studio:run-designer", async (_event, payload) => {
+  const result = await imageStudioJson("/api/designer/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      analysis: payload?.analysis || {},
+      extraNotes: typeof payload?.extraNotes === "string" ? payload.extraNotes : "",
+      debug: !!payload?.debug,
+    }),
+  });
+  return result;
+});
+
+ipcMain.handle("image-studio:compose-briefs", async (_event, payload) => {
+  const result = await imageStudioJson("/api/designer/compose", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      briefs: Array.isArray(payload?.briefs) ? payload.briefs : [],
+      sharedDna: payload?.sharedDna || null,
+      productImageBase64: typeof payload?.productImageBase64 === "string" ? payload.productImageBase64 : null,
+    }),
+  });
+  return result;
+});
+
 ipcMain.handle("image-studio:start-generate", async (event, payload) => {
   const jobId = typeof payload?.jobId === "string" && payload.jobId
     ? payload.jobId
@@ -4323,7 +4685,12 @@ async function persistStoreValue(normalizedKey, data) {
   await prev.catch(() => {});
   try {
     const filePath = getStoreFilePath(normalizedKey);
-    await writeStoreJsonAtomicAsync(filePath, data, { key: normalizedKey });
+    let nextData = data;
+    if (normalizedKey === ACCOUNT_STORE_KEY && Array.isArray(data)) {
+      const existingAccounts = await readStoreJsonWithRecoveryAsync(filePath, normalizedKey);
+      nextData = preserveExistingAccountPasswords(data, existingAccounts);
+    }
+    await writeStoreJsonAtomicAsync(filePath, nextData, { key: normalizedKey });
     if (ACCOUNT_SCOPED_STORE_KEYS.has(normalizedKey)) {
       const activeAccountId = await readStoreJsonWithRecoveryAsync(
         getStoreFilePath(ACTIVE_ACCOUNT_ID_KEY),

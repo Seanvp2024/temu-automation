@@ -1787,42 +1787,6 @@ body {
   color: var(--color-text-sec);
 }
 
-.create-status-strip {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid #edf1f5;
-  border-radius: 16px;
-  background: #fbfcfe;
-}
-
-.create-status-item {
-  display: grid;
-  gap: 6px;
-  min-width: 0;
-}
-
-.create-status-label {
-  font-size: 12px;
-  color: var(--color-text-sec);
-}
-
-.create-status-value {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--color-text);
-  font-size: 14px;
-  font-weight: 700;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.create-status-item--state .ant-tag {
-  width: fit-content;
-  margin-inline-end: 0;
-}
-
 .create-preview-card {
   overflow: hidden;
 }
