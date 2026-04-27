@@ -8928,6 +8928,23 @@ function classifyAutoPricingError(stage, rawMessage) {
   return `${stage || "unknown"}:${rootCause}`;
 }
 
+function getDraftFailureMessage(draftResult) {
+  if (!draftResult || typeof draftResult !== "object") {
+    return "草稿保存失败：保存进程中断或未返回结果";
+  }
+
+  const rawMessage = String(draftResult.message || draftResult.error || draftResult.errorMsg || "").trim();
+  if (rawMessage && rawMessage !== "草稿保存失败") return rawMessage;
+
+  const step = String(draftResult.step || "").trim();
+  if (step === "submit") return "保存 Temu 草稿箱失败：创建草稿接口未返回具体原因";
+  if (step === "draft_save") return "Temu 草稿内容保存失败：保存接口未返回具体原因";
+  if (step === "draft_verify") return "草稿已创建，但保存后的内容校验未通过";
+  if (step === "category") return "类目处理完成后保存草稿失败";
+  if (step === "images") return "商品图片准备完成后保存草稿失败";
+  return "草稿保存失败：Temu 未返回具体原因";
+}
+
 async function refreshMaterialUploadSession(page, reason = "") {
   if (!page || page.isClosed()) {
     return false;
@@ -11786,10 +11803,15 @@ async function generateWorkflowPackImages(params = {}) {
             rowResult.productId = draftResult?.productId || "";
             rowResult.skcId = draftResult?.skcId || "";
             rowResult.skuId = draftResult?.skuId || "";
+            rowResult.draftStep = draftResult?.step || "";
+            rowResult.errorCode = draftResult?.errorCode || "";
+            rowResult.debugFile = draftResult?.debugFile || "";
+            rowResult.draftSaved = Boolean(draftResult?.draftSaved);
+            rowResult.verificationReason = draftResult?.verificationReason || "";
             rowResult.success = Boolean(draftResult?.success);
             rowResult.message = draftResult?.success
               ? (draftResult.message || "商品已保存到Temu草稿箱")
-              : (draftResult?.message || "草稿保存失败");
+              : getDraftFailureMessage(draftResult);
             rowResult.errorCategory = draftResult?.success ? "" : classifyAutoPricingError("draft", rowResult.message);
             logWorkflowPack(taskId, `row=${rowNumber} draft ${draftResult?.success ? "ok" : "failed"} ${rowResult.draftId || rowResult.message}`);
           }

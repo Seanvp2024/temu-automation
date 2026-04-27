@@ -266,9 +266,20 @@ function normalizeBatchReason(messageText: string, errorCategory?: string) {
   if (/登录|authentication|seller-login/i.test(text)) return "登录状态已失效，请重新登录后再试";
   if (/quota|额度|403/i.test(text)) return "当前图片生成额度不足，请稍后再试";
   if (/图片|image|upload/i.test(text) && /失败|error/i.test(text)) return "图片处理未完成，请稍后重试";
-  if (/草稿|draft/i.test(text) && /失败|error/i.test(text)) return text === "草稿保存失败" ? "草稿保存未完成，请稍后重试" : text;
+  if (/草稿|draft/i.test(text) && /失败|error/i.test(text)) {
+    return text === "草稿保存失败" ? "草稿保存失败：Temu 未返回具体原因，请重新登录后重试" : text;
+  }
 
   return text;
+}
+
+function getResultFailureMeta(record: any) {
+  const meta: string[] = [];
+  if (record?.errorCode) meta.push(`错误码 ${record.errorCode}`);
+  if (record?.draftStep) meta.push(`阶段 ${record.draftStep}`);
+  if (record?.verificationReason) meta.push(`校验 ${record.verificationReason}`);
+  if (record?.debugFile) meta.push(`调试文件 ${record.debugFile}`);
+  return meta;
 }
 
 function getUserFacingTaskMessage(progressInfo: any, count: number) {
@@ -1028,7 +1039,12 @@ function BatchCreate() {
   const validation = previewData?.validation || null;
   const validationBlockingCount = validation?.blockingIssues.reduce((sum, item) => sum + item.count, 0) || 0;
   const validationWarningCount = validation?.warningIssues.reduce((sum, item) => sum + item.count, 0) || 0;
-  const taskStepText = [progressInfo?.step, progressInfo?.current, progressInfo?.message].filter(Boolean).join(" · ");
+  const taskStatusParts = [progressInfo?.step, progressInfo?.current, progressInfo?.message]
+    .map((item) => String(item || "").trim())
+    .filter((item, index, list) => item && list.indexOf(item) === index);
+  const taskStepText = taskStatusParts.join(" · ");
+  const currentTaskStatusText = taskStepText || batchStatusMessage;
+  const progressUpdatedAtText = String(progressInfo?.updatedAt || progressInfo?.startedAt || "");
   const aiStageActive = Boolean(running && /(下载原图|AI生图|上传图片|生成标题)/.test(progressInfo?.step || ""));
   const draftStageActive = Boolean(running && /(保存草稿|草稿保存|开始处理|执行失败)/.test(progressInfo?.step || ""));
   const aiStageFailed = results.some((item: any) => !item.success && /^image_gen:|^image_upload:|^source_download:/.test(String(item?.errorCategory || "")));
@@ -1152,7 +1168,21 @@ function BatchCreate() {
       ellipsis: true,
       render: (value: string, record: any) => record.success
         ? <span style={{ color: SUCCESS_COLOR }}>{getResultSuccessDetail(record)}</span>
-        : <span style={{ color: "#ff4d4f" }} title={value || undefined}>{normalizeBatchReason(value || "请稍后重试", record?.errorCategory)}</span>,
+        : (() => {
+          const reason = normalizeBatchReason(value || "请稍后重试", record?.errorCategory);
+          const meta = getResultFailureMeta(record);
+          const title = [reason, ...meta].filter(Boolean).join("\n");
+          return (
+            <div title={title || undefined}>
+              <span style={{ color: "#ff4d4f" }}>{reason}</span>
+              {meta.length > 0 ? (
+                <div style={{ fontSize: 12, color: "var(--color-text-sec)", marginTop: 4, lineHeight: 1.5 }}>
+                  {meta.join(" · ")}
+                </div>
+              ) : null}
+            </div>
+          );
+        })(),
     },
   ];
 
@@ -1773,6 +1803,23 @@ function BatchCreate() {
               <Space wrap>
                 <Tag color={batchTagColor}>{batchStatusLabel}</Tag>
               </Space>
+            </div>
+
+            <div className="create-progress-current">
+              <div className="create-progress-current__item create-progress-current__item--wide">
+                <span className="create-progress-current__label">当前状态</span>
+                <span className="create-progress-current__value">{currentTaskStatusText}</span>
+              </div>
+              <div className="create-progress-current__item">
+                <span className="create-progress-current__label">任务状态</span>
+                <Tag color={batchTagColor}>{batchStatusLabel}</Tag>
+              </div>
+              {progressUpdatedAtText ? (
+                <div className="create-progress-current__item">
+                  <span className="create-progress-current__label">更新时间</span>
+                  <span className="create-progress-current__value">{progressUpdatedAtText}</span>
+                </div>
+              ) : null}
             </div>
 
             <Progress

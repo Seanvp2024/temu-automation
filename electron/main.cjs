@@ -240,22 +240,21 @@ const AUTO_PRICING_IP_PATTERNS = [
 
 const AUTO_PRICING_FILTER_EXTRA_KEYWORDS = {
   liquid: [
-    "水管", "花园水管", "软管", "水泵", "水枪", "喷水", "洒水", "喷淋", "花洒", "水龙头", "水槽", "水箱", "水杯", "水瓶",
-    "水壶", "水袋", "水桶", "水盆", "水刮", "水族", "鱼缸", "饮水", "吸水", "补水", "加湿", "除湿", "蒸汽", "雾化",
-    "冰块", "冰格", "冰模", "制冰", "冰球", "冷饮", "滤茶", "茶滤", "茶漏", "泡茶", "茶具", "咖啡滤", "漏斗",
-    "hose", "garden hose", "water hose", "sprinkler", "watering", "water pump", "water gun", "faucet", "tap",
-    "water bottle", "water cup", "hydration", "humidifier", "mist humidifier", "steam", "ice cube", "ice mold",
-    "ice tray", "tea strainer", "tea infuser", "tea filter", "coffee filter",
+    "喷水", "洒水", "喷淋", "花洒", "水龙头", "水槽", "水箱",
+    "水壶", "水袋", "水桶", "水盆", "水刮", "水族", "鱼缸", "饮水", "吸水", "补水", "除湿", "雾化",
+    "冰块", "制冰", "冰球", "冷饮", "茶漏", "泡茶", "茶具", "漏斗",
+    "sprinkler", "watering", "faucet", "tap",
+    "hydration", "ice cube",
   ],
   paste: [
     "膏", "霜", "泥", "胶状", "胶体", "粘土", "修复膏", "清洁膏", "抛光膏", "密封胶", "玻璃胶", "美缝剂",
     "caulk", "sealant", "polish paste", "cleaning paste", "repair paste", "putty", "slime",
   ],
   clothing: [
-    "女装", "男装", "童装", "宝宝衣", "婴儿衣", "儿童衣", "服装", "服饰", "衣裤", "裤", "裙", "鞋靴", "袜子", "帽子", "围巾",
-    "手套", "腰带", "皮带", "领带", "假领", "袖套", "护膝", "护腕", "围裙", "围兜", "披肩", "披风",
-    "apparel", "garment", "clothes", "clothing", "outfit", "costume", "uniform", "sock", "socks", "hat", "cap",
-    "scarf", "glove", "gloves", "belt", "apron", "bib", "shawl", "cape",
+    "女装", "男装", "童装", "宝宝衣", "婴儿衣", "儿童衣", "服装", "服饰", "衣裤", "裤", "裙", "鞋靴", "围巾",
+    "领带", "假领", "袖套", "护膝", "护腕", "围裙", "围兜", "披肩", "披风",
+    "apparel", "garment", "clothes", "clothing", "outfit", "costume", "uniform",
+    "scarf", "apron", "bib", "shawl", "cape",
   ],
 };
 

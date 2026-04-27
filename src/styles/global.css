@@ -1883,6 +1883,39 @@ body {
   background: #fbfcfe;
 }
 
+.create-progress-current {
+  display: grid;
+  grid-template-columns: minmax(260px, 2fr) minmax(120px, 1fr) minmax(160px, 1fr);
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid #edf1f5;
+  border-radius: 16px;
+  background: #fbfcfe;
+}
+
+.create-progress-current__item {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  align-content: start;
+}
+
+.create-progress-current__label {
+  font-size: 12px;
+  color: var(--color-text-sec);
+}
+
+.create-progress-current__value {
+  min-width: 0;
+  color: var(--color-text);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.create-progress-current__item--wide {
+  min-width: 0;
+}
+
 .create-history-list {
   display: grid;
   gap: 12px;
@@ -2407,6 +2440,10 @@ body {
   .app-form-grid,
   .app-toolbar,
   .app-toolbar--logs {
+    grid-template-columns: 1fr;
+  }
+
+  .create-progress-current {
     grid-template-columns: 1fr;
   }
 
