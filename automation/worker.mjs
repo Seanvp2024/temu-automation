@@ -10559,6 +10559,7 @@ async function autoPricingFromCSV(params) {
   const intervalMaxRaw = normalizeIntervalMinutes(params.intervalMax, DEFAULT_PRODUCT_INTERVAL_MAX);
   const intervalMax = Math.max(intervalMin, intervalMaxRaw);
   const uploadConcurrency = normalizeUploadConcurrency(params.uploadConcurrency, 3);
+  const generateAI = params.generateAI !== false;
   const results = [];
 
   // 支持 XLSX 和 CSV 两种格式
@@ -10816,72 +10817,94 @@ async function autoPricingFromCSV(params) {
         console.error(`[auto-pricing] Downloaded ${carouselLocalPaths.length} carousel images`);
       }
 
-      // Step 2: AI 生成 9 张详情图（原主图只做参考，不参与最终提交）
-      updateCurrentProgress({ step: "AI生图中..." });
-      console.error(`[auto-pricing] Generating AI images (${1 + carouselLocalPaths.length} source images)...`);
-      const aiResult = await generateImagesWithAI(sourceImagePath, productName, carouselLocalPaths);
-      if (!aiResult.success) {
-        const rawErr = aiResult.error || `图片不足${REQUIRED_AI_DETAIL_IMAGE_COUNT}张`;
-        results.push({
-          index: i,
-          name: productName.slice(0, 40),
-          success: false,
-          message: "AI生图失败: " + rawErr,
-          errorCategory: classifyAutoPricingError("image_gen", rawErr),
-        });
-        syncCurrentProgressResults(results, { current: `${itemNum}/${total} ${productName.slice(0, 30)}`, step: "AI生图失败" });
-        continue;
-      }
-
-      // Step 3: 保存 base64 图片到本地文件
+      let aiResult = null;
       const localImages = {};
-      for (const type of AI_DETAIL_IMAGE_TYPE_ORDER) {
-        if (aiResult.images[type]) {
-          const imgPath = path.join(tmpDir, `${i}_${type}_${Date.now()}.png`);
-          saveBase64Image(aiResult.images[type], imgPath);
-          localImages[type] = imgPath;
+      let orderedImageUrls = [];
+      let uploadErrors = {};
+
+      if (generateAI) {
+        // Step 2: AI 生成 9 张详情图（原主图只做参考，不参与最终提交）
+        updateCurrentProgress({ step: "AI生图中..." });
+        console.error(`[auto-pricing] Generating AI images (${1 + carouselLocalPaths.length} source images)...`);
+        aiResult = await generateImagesWithAI(sourceImagePath, productName, carouselLocalPaths);
+        if (!aiResult.success) {
+          const rawErr = aiResult.error || `图片不足${REQUIRED_AI_DETAIL_IMAGE_COUNT}张`;
+          results.push({
+            index: i,
+            name: productName.slice(0, 40),
+            success: false,
+            message: "AI生图失败: " + rawErr,
+            errorCategory: classifyAutoPricingError("image_gen", rawErr),
+          });
+          syncCurrentProgressResults(results, { current: `${itemNum}/${total} ${productName.slice(0, 30)}`, step: "AI生图失败" });
+          continue;
         }
+
+        // Step 3: 保存 base64 图片到本地文件
+        for (const type of AI_DETAIL_IMAGE_TYPE_ORDER) {
+          if (aiResult.images[type]) {
+            const imgPath = path.join(tmpDir, `${i}_${type}_${Date.now()}.png`);
+            saveBase64Image(aiResult.images[type], imgPath);
+            localImages[type] = imgPath;
+          }
+        }
+        console.error(`[auto-pricing] Saved ${Object.keys(localImages).length} AI images locally`);
+      } else {
+        updateCurrentProgress({ step: "准备表格图片" });
+        const directTypes = AI_DETAIL_IMAGE_TYPE_ORDER.slice(0, Math.max(1, Math.min(AI_DETAIL_IMAGE_TYPE_ORDER.length, 1 + carouselLocalPaths.length)));
+        localImages[directTypes[0]] = sourceImagePath;
+        carouselLocalPaths.slice(0, directTypes.length - 1).forEach((imgPath, index) => {
+          localImages[directTypes[index + 1]] = imgPath;
+        });
+        console.error(`[auto-pricing] Direct image mode: using ${Object.keys(localImages).length} table images`);
       }
-      console.error(`[auto-pricing] Saved ${Object.keys(localImages).length} images locally`);
 
       // Step 4: 上传到素材中心获取 kwcdn URL
-      updateCurrentProgress({ step: "上传图片..." });
+      updateCurrentProgress({ step: generateAI ? "上传AI图片..." : "上传表格图片..." });
       console.error(`[auto-pricing] Uploading to material center...`);
-      const { kwcdnUrls, uploadErrors } = await uploadImagesToKwcdnConcurrently(localImages, {
+      const uploadResult = await uploadImagesToKwcdnConcurrently(localImages, {
         concurrency: uploadConcurrency,
       });
+      const kwcdnUrls = uploadResult.kwcdnUrls || {};
+      uploadErrors = uploadResult.uploadErrors || {};
 
       // 按指定顺序排列图片 URL
-      const orderedImageUrls = AI_DETAIL_IMAGE_TYPE_ORDER
+      orderedImageUrls = AI_DETAIL_IMAGE_TYPE_ORDER
         .map(type => kwcdnUrls[type])
         .filter(Boolean);
 
       console.error(`[auto-pricing] Total uploaded: ${orderedImageUrls.length}`);
 
-      if (orderedImageUrls.length < REQUIRED_AI_DETAIL_IMAGE_COUNT) {
+      const minimumImageCount = generateAI ? REQUIRED_AI_DETAIL_IMAGE_COUNT : 1;
+      if (orderedImageUrls.length < minimumImageCount) {
         const uploadErrorSummary = Object.entries(uploadErrors)
           .slice(0, 3)
           .map(([type, error]) => `${type}: ${formatAutoPricingUserError(error).slice(0, 80)}`)
           .join("；");
         // 取第一条原始上传错误做分类（未包装前的原文更能命中 network/auth 关键词）
         const firstRawUploadErr = Object.values(uploadErrors)[0] || "";
+        const imageShortageMessage = generateAI
+          ? `上传图片不足${REQUIRED_AI_DETAIL_IMAGE_COUNT}张 (${orderedImageUrls.length})`
+          : "表格图片上传失败";
         results.push({
           index: i,
           name: productName.slice(0, 40),
           success: false,
-          message: `上传图片不足${REQUIRED_AI_DETAIL_IMAGE_COUNT}张 (${orderedImageUrls.length})${uploadErrorSummary ? `；${uploadErrorSummary}` : ""}`,
+          message: `${imageShortageMessage}${uploadErrorSummary ? `；${uploadErrorSummary}` : ""}`,
           errorCategory: classifyAutoPricingError("image_upload", firstRawUploadErr),
         });
         syncCurrentProgressResults(results, { current: `${itemNum}/${total} ${productName.slice(0, 30)}`, step: "图片上传失败" });
         continue;
       }
 
-      // Step 5: AI 生成中文标题（AI 失败时回退到原标题，但在结果中标记 warning 告知用户）
-      updateCurrentProgress({ step: "生成标题..." });
+      // Step 5: AI 模式生成中文标题；表格图片模式沿用表格标题
+      updateCurrentProgress({ step: generateAI ? "生成标题..." : "整理标题..." });
       let finalTitle = "";
-      let titleSource = "ai";
+      let titleSource = generateAI ? "ai" : "table";
       let titleWarning = "";
-      if (!aiResult.analysis) {
+      if (!generateAI) {
+        finalTitle = productName;
+      } else if (!aiResult?.analysis) {
         titleWarning = "AI 分析结果缺失，已使用原标题";
       } else {
         try {
@@ -10941,33 +10964,35 @@ async function autoPricingFromCSV(params) {
       }
 
       // 备份 AI 生成图到桌面 "AI自动化生图草稿/<标题>/"
-      try {
-        const desktopDir = path.join(os.homedir(), "Desktop", "AI自动化生图草稿");
-        const safeTitle = String(finalTitle || `untitled_${Date.now()}`)
-          .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 80) || `untitled_${Date.now()}`;
-        const subDir = path.join(desktopDir, safeTitle);
-        fs.mkdirSync(subDir, { recursive: true });
-        let copied = 0;
-        for (const type of AI_DETAIL_IMAGE_TYPE_ORDER) {
-          const src = localImages[type];
-          if (src && fs.existsSync(src)) {
-            try {
-              fs.copyFileSync(src, path.join(subDir, `${type}.png`));
-              copied++;
-            } catch (e) { console.error(`[auto-pricing] backup copy ${type} failed: ${e.message}`); }
+      if (generateAI) {
+        try {
+          const desktopDir = path.join(os.homedir(), "Desktop", "AI自动化生图草稿");
+          const safeTitle = String(finalTitle || `untitled_${Date.now()}`)
+            .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 80) || `untitled_${Date.now()}`;
+          const subDir = path.join(desktopDir, safeTitle);
+          fs.mkdirSync(subDir, { recursive: true });
+          let copied = 0;
+          for (const type of AI_DETAIL_IMAGE_TYPE_ORDER) {
+            const src = localImages[type];
+            if (src && fs.existsSync(src)) {
+              try {
+                fs.copyFileSync(src, path.join(subDir, `${type}.png`));
+                copied++;
+              } catch (e) { console.error(`[auto-pricing] backup copy ${type} failed: ${e.message}`); }
+            }
           }
+          console.error(`[auto-pricing] backup ${copied} images -> ${subDir}`);
+        } catch (e) {
+          console.error(`[auto-pricing] desktop backup failed: ${e.message}`);
         }
-        console.error(`[auto-pricing] backup ${copied} images -> ${subDir}`);
-      } catch (e) {
-        console.error(`[auto-pricing] desktop backup failed: ${e.message}`);
       }
 
       // Step 6: 保存草稿
       // 有表格类目时严格按表格类目走，避免被 AI/历史类目带偏
-      const aiCategory = aiResult.analysis?.category?.split("(")?.[0]?.trim() || ""; // 取中文部分，如 "家庭清洁用品"
+      const aiCategory = generateAI ? (aiResult?.analysis?.category?.split("(")?.[0]?.trim() || "") : ""; // 取中文部分，如 "家庭清洁用品"
       // 任一表格类目存在即进入 strict 模式，避免 AI 分析返回的猜测类目（如"钥匙扣/挂件"）
       // 覆盖掉表格里有效的前台分类。这样后台为空但前台有效时也能锁定。
       const categoryLockMode = (

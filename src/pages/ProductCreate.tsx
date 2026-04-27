@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import {
   Alert,
   Button,
@@ -32,6 +32,28 @@ const { Title, Text } = Typography;
 
 const api = window.electronAPI?.automation;
 const SUCCESS_COLOR = "var(--color-success)";
+
+type CreateMode = "ai" | "direct";
+
+const CREATE_MODE_OPTIONS: Array<{
+  value: CreateMode;
+  title: string;
+  description: string;
+  icon: ReactNode;
+}> = [
+  {
+    value: "ai",
+    title: "AI 生图上新",
+    description: "导入表格后自动下载原图，AI 生成详情图，再上传并保存 Temu 草稿。",
+    icon: <CloudUploadOutlined />,
+  },
+  {
+    value: "direct",
+    title: "表格图片上新",
+    description: "使用表格里的主图和轮播图，不走 AI 生图，直接上传并保存草稿。",
+    icon: <FileExcelOutlined />,
+  },
+];
 
 function extractCellTexts(value: any, seen = new WeakSet<object>()): string[] {
   if (value === null || value === undefined || value === "") return [];
@@ -253,7 +275,38 @@ type PreviewState = {
   detected: Record<string, number>;
 } | null;
 
-function BatchCreate() {
+function CreateModeSwitcher({
+  value,
+  onChange,
+}: {
+  value: CreateMode;
+  onChange: (mode: CreateMode) => void;
+}) {
+  return (
+    <div className="create-mode-switcher" aria-label="上新流程模式">
+      {CREATE_MODE_OPTIONS.map((option) => {
+        const active = option.value === value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            className={`create-mode-card${active ? " is-active" : ""}`}
+            onClick={() => onChange(option.value)}
+            aria-pressed={active}
+          >
+            <span className="create-mode-card__icon">{option.icon}</span>
+            <span>
+              <span className="create-mode-card__title">{option.title}</span>
+              <span className="create-mode-card__desc">{option.description}</span>
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function BatchCreate({ createMode }: { createMode: CreateMode }) {
   const [filePath, setFilePath] = useState("");
   const [preview, setPreview] = useState<PreviewState>(null);
   const [startRow, setStartRow] = useState(0);
@@ -563,7 +616,12 @@ function BatchCreate() {
     });
 
     try {
-      const response = await api?.autoPricing?.({ csvPath: filePath, startRow, count });
+      const response = await api?.autoPricing?.({
+        csvPath: filePath,
+        startRow,
+        count,
+        generateAI: createMode === "ai",
+      });
       if (!response?.accepted) {
         setRunning(false);
         setPaused(false);
@@ -626,6 +684,15 @@ function BatchCreate() {
   const progressPercent = progressTotal > 0 ? Math.round((completedCount / progressTotal) * 100) : 0;
   const pendingCount = Math.max(progressTotal - completedCount, 0);
   const previewData = preview;
+  const isAiMode = createMode === "ai";
+  const currentModeTitle = isAiMode ? "AI 生图上新" : "表格图片上新";
+  const currentModeDescription = isAiMode
+    ? "导入 Excel 或 CSV 后，系统会整理关键字段、过滤高风险商品，再自动 AI 生图并批量生成 Temu 草稿。"
+    : "导入 Excel 或 CSV 后，系统会整理关键字段、过滤高风险商品，使用表格图片直接批量生成 Temu 草稿。";
+  const startButtonText = isAiMode ? `开始 AI 生图上新（${count} 个）` : `开始表格图片上新（${count} 个）`;
+  const progressStageText = String(progressInfo?.step || (running ? "处理中" : batchStatusLabel) || "-");
+  const progressCurrentText = String(progressInfo?.current || "暂无进行中的商品");
+  const progressUpdatedAt = String(progressInfo?.updatedAt || progressInfo?.startedAt || "等待更新");
 
   const previewRows = hasPreview && previewData
     ? previewData.rows.map((row: any[], index: number) => {
@@ -704,10 +771,10 @@ function BatchCreate() {
     <Space direction="vertical" size="large" style={{ width: "100%" }}>
       <div className="create-flow-toolbar">
         <div className="create-flow-toolbar__summary">
-          <Text className="create-flow-toolbar__eyebrow">批量创建</Text>
+          <Text className="create-flow-toolbar__eyebrow">{currentModeTitle}</Text>
           <Title level={4} style={{ margin: 0 }}>上传商品表格</Title>
           <Text type="secondary" className="create-flow-toolbar__desc">
-            导入 Excel 或 CSV 后，系统会整理关键字段、可选过滤高风险商品，再批量生成 Temu 草稿。
+            {currentModeDescription}
           </Text>
           <Space wrap className="app-table-meta">
             <Tag color={batchTagColor}>{batchStatusLabel}</Tag>
@@ -753,7 +820,7 @@ function BatchCreate() {
               onClick={handleBatch}
               className="create-primary-button"
             >
-              {running ? "处理中..." : `开始批量创建（${count} 个）`}
+              {running ? "处理中..." : startButtonText}
             </Button>
             {running ? (
               <Button
@@ -875,8 +942,31 @@ function BatchCreate() {
                 </Text>
               </div>
               <Space wrap>
-                <Tag color={batchTagColor}>{batchStatusLabel}</Tag>
+                <Tag color={batchTagColor}>状态：{batchStatusLabel}</Tag>
               </Space>
+            </div>
+
+            <div className="create-status-strip">
+              <div className="create-status-item create-status-item--state">
+                <span className="create-status-label">状态</span>
+                <Tag color={batchTagColor}>{batchStatusLabel}</Tag>
+              </div>
+              <div className="create-status-item">
+                <span className="create-status-label">模式</span>
+                <span className="create-status-value">{currentModeTitle}</span>
+              </div>
+              <div className="create-status-item">
+                <span className="create-status-label">当前步骤</span>
+                <span className="create-status-value">{progressStageText}</span>
+              </div>
+              <div className="create-status-item">
+                <span className="create-status-label">当前商品</span>
+                <span className="create-status-value">{progressCurrentText}</span>
+              </div>
+              <div className="create-status-item">
+                <span className="create-status-label">更新时间</span>
+                <span className="create-status-value">{progressUpdatedAt}</span>
+              </div>
             </div>
 
             <Progress
@@ -985,20 +1075,23 @@ function BatchCreate() {
 }
 
 export default function ProductCreate() {
+  const [createMode, setCreateMode] = useState<CreateMode>("ai");
   const pageDescription = "导入表格后，系统会自动整理关键字段，可先过滤高风险商品，再批量生成商品草稿。";
 
   return (
     <div className="dashboard-shell product-create-shell">
       <PageHeader
         compact
-        eyebrow="商品创建"
-        title="上品管理"
+        eyebrow="商品上新"
+        title="上新流程"
         subtitle={pageDescription}
         actions={<Tag color="orange">批量创建</Tag>}
       />
 
+      <CreateModeSwitcher value={createMode} onChange={setCreateMode} />
+
       <div>
-        <BatchCreate />
+        <BatchCreate createMode={createMode} />
       </div>
     </div>
   );

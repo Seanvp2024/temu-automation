@@ -150,7 +150,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // 每次调用前显式切到对应 profile，保证普通版/GPT 版不会串用生图凭证。
   imageStudio: createImageStudioApi("default"),
-  imageStudio: createImageStudioApi("default"),
   imageStudioGpt: createImageStudioApi("gpt"),
 
   app: {

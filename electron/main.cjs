@@ -2771,7 +2771,7 @@ async function createWindow() {
 
   mainWindow = new BrowserWindow({
     width: 1280, height: 800,
-    title: "Temu 自动化运营工具",
+    title: "上新流程",
     show: false,
     backgroundColor: "#ffffff",
     autoHideMenuBar: true,
@@ -3089,15 +3089,16 @@ ipcMain.handle("automation:auto-pricing", async (_e, params) => {
     };
   }
 
-  // 优先尝试启动 AI 出图服务，但 runtime 缺失时不应该让整个批量上品任务无法启动。
-  // 单个商品在生图阶段失败会被任务内部记录为 failed，但 worker 仍能跑分类搜索/属性匹配/草稿提交等其他阶段。
-  let imageStudioUrl = "";
-  try {
-    const imageStudio = await ensureImageStudioService();
-    imageStudioUrl = imageStudio?.url || "";
-  } catch (err) {
-    console.error(`[Main] Image studio unavailable, auto-pricing will run without it: ${err?.message || err}`);
-    imageStudioUrl = workerAiImageServer || process.env.AI_IMAGE_SERVER || getImageStudioBaseUrl(imageStudioPort);
+  // AI 生图模式才预热生图服务；表格图片模式不需要启动这条链路。
+  const shouldUseImageStudio = params?.generateAI !== false;
+  let imageStudioUrl = workerAiImageServer || process.env.AI_IMAGE_SERVER || getImageStudioBaseUrl(imageStudioPort);
+  if (shouldUseImageStudio) {
+    try {
+      const imageStudio = await ensureImageStudioService();
+      imageStudioUrl = imageStudio?.url || imageStudioUrl;
+    } catch (err) {
+      console.error(`[Main] Image studio unavailable, auto-pricing will run without it: ${err?.message || err}`);
+    }
   }
   await ensureWorkerStarted({ aiImageServer: imageStudioUrl });
   const credentials = getActiveWorkerCredentials();
